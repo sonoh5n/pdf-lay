@@ -1,0 +1,66 @@
+//! `pdf-lay`: PDF Layout Analysis for Academic Papers.
+//!
+//! This crate re-exports the public API of [`pdf-lay-core`].
+//!
+//! # Quick Start
+//!
+//! ```rust,ignore
+//! use pdf_lay::{analyze_pdf, Config};
+//! use std::path::Path;
+//!
+//! let config = Config::default();
+//! let result = analyze_pdf(Path::new("paper.pdf"), &config).unwrap();
+//! let doc = result.document;
+//! println!("Pages: {}", doc.metadata.pages);
+//! println!("Sections: {}", doc.toc().len());
+//!
+//! let selector = doc.select_sections(&["METHODS"]);
+//! let markdown = selector.to_markdown(&Default::default());
+//! println!("{}", markdown);
+//! ```
+
+pub use pdf_lay_core::{
+    // Error types
+    AnalysisResult,
+    // Document types
+    BlockType,
+    // Config types
+    CaptionStyle,
+    Chunk,
+    ChunkConfig,
+    Config,
+    DocumentMetadata,
+    FigureInfo,
+    FigureTextFormat,
+    ImageFormat,
+    ImageInfo,
+    InsertionPoint,
+    LlmTextConfig,
+    // Selector types
+    LlmTextGenerator,
+    MarkdownConfig,
+    MathConfig,
+    MathRepresentationPreference,
+    PaperDocument,
+    PdfLayError,
+    PdfLayWarning,
+    Rect,
+    Section,
+    SectionEntry,
+    SectionHeader,
+    SectionSelector,
+    SplitStrategy,
+    TableConfig,
+    TableInfo,
+    TableRepresentation,
+    TextBlock,
+    TextLine,
+    TextSpan,
+    TocGenerator,
+    // Pipeline entry points
+    analyze_pdf,
+    analyze_pdf_bytes,
+};
+
+// Re-export output generators for CLI and advanced use cases.
+pub use pdf_lay_core::output::MarkdownGenerator;

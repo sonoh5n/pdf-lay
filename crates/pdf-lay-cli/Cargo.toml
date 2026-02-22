@@ -1,0 +1,16 @@
+[package]
+name = "pdf-lay-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "pdf-lay"
+path = "src/main.rs"
+
+[dependencies]
+pdf-lay = { path = "../pdf-lay" }
+clap = { workspace = true, features = ["derive"] }
+log.workspace = true
+env_logger.workspace = true

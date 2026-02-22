@@ -1,0 +1,17 @@
+[package]
+name = "pdf-lay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PDF Layout Analysis for Academic Papers"
+
+[dependencies]
+pdf-lay-core = { path = "../pdf-lay-core" }
+
+[dev-dependencies]
+pdf-lay-core = { path = "../pdf-lay-core" }
+serde_json = { workspace = true }
+
+[[test]]
+name = "integration"
+path = "../../tests/integration/smoke_test.rs"

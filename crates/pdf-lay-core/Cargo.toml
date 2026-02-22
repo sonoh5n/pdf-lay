@@ -1,0 +1,19 @@
+[package]
+name = "pdf-lay-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false   # internal crate, not published to crates.io
+
+[dependencies]
+serde.workspace      = true
+serde_json.workspace = true
+regex.workspace      = true
+thiserror.workspace  = true
+log.workspace        = true
+image.workspace      = true
+rayon.workspace      = true
+pdf_oxide.workspace  = true
+tempfile.workspace   = true
+
+[dev-dependencies]
