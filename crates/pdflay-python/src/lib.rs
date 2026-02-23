@@ -120,7 +120,17 @@ impl PyPaperDocument {
     ///     overlap: Number of overlap tokens between adjacent chunks.
     ///     strategy: One of ``"section"`` (default), ``"token"``, or ``"paragraph"``.
     #[pyo3(signature = (max_tokens = 4000, overlap = 200, strategy = "section"))]
-    fn to_chunks(&self, max_tokens: usize, overlap: usize, strategy: &str) -> Vec<PyChunk> {
+    fn to_chunks(
+        &self,
+        max_tokens: usize,
+        overlap: usize,
+        strategy: &str,
+    ) -> PyResult<Vec<PyChunk>> {
+        if max_tokens == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "max_tokens must be > 0",
+            ));
+        }
         let split_strategy = match strategy {
             "token" => SplitStrategy::TokenCount,
             "paragraph" => SplitStrategy::Paragraph,
@@ -132,11 +142,11 @@ impl PyPaperDocument {
             split_strategy,
             include_section_context: true,
         };
-        Chunker::new(config)
+        Ok(Chunker::new(config)
             .chunk(&self.inner)
             .into_iter()
             .map(|c| PyChunk { inner: c })
-            .collect()
+            .collect())
     }
 
     /// Return the table of contents as a list of :class:`PySectionEntry` objects.
@@ -207,6 +217,41 @@ impl PyPaperDocument {
             doc: self.inner.clone(),
             selected_indices: selector.selected_indices(),
         }
+    }
+
+    /// Select sections using a predicate function on section metadata.
+    ///
+    /// The predicate receives a :class:`PySectionEntry` and must return a ``bool``.
+    ///
+    /// Example::
+    ///
+    ///     sel = doc.select_sections_where(lambda e: e.estimated_tokens > 100)
+    ///
+    /// Args:
+    ///     predicate: A callable ``(PySectionEntry) -> bool``.
+    ///
+    /// Returns:
+    ///     A :class:`PySectionSelector` for the matched sections.
+    fn select_sections_where(&self, predicate: &Bound<'_, PyAny>) -> PyResult<PySectionSelector> {
+        let toc = TocGenerator::generate(&self.inner);
+        let flat_sections = flatten_sections(&self.inner.sections);
+        let flat_entries = flatten_entries(&toc);
+
+        let mut selected_indices = Vec::new();
+        for (i, entry) in flat_entries.iter().enumerate() {
+            let py_entry = PySectionEntry {
+                inner: (*entry).clone(),
+            };
+            let result = predicate.call1((py_entry,))?;
+            if result.is_truthy()? && i < flat_sections.len() {
+                selected_indices.push(i);
+            }
+        }
+
+        Ok(PySectionSelector {
+            doc: self.inner.clone(),
+            selected_indices,
+        })
     }
 
     fn __repr__(&self) -> String {
@@ -316,18 +361,24 @@ impl PySectionSelector {
     ///     max_tokens: Maximum tokens per chunk.
     ///     overlap: Number of overlap tokens between adjacent chunks.
     #[pyo3(signature = (max_tokens = 4000, overlap = 200))]
-    fn to_chunks(&self, max_tokens: usize, overlap: usize) -> Vec<PyChunk> {
+    fn to_chunks(&self, max_tokens: usize, overlap: usize) -> PyResult<Vec<PyChunk>> {
+        if max_tokens == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "max_tokens must be > 0",
+            ));
+        }
         let config = ChunkConfig {
             max_tokens,
             overlap_tokens: overlap,
             split_strategy: SplitStrategy::SectionBoundary,
             include_section_context: true,
         };
-        self.rebuild_selector()
+        Ok(self
+            .rebuild_selector()
             .to_chunks(&config)
             .into_iter()
             .map(|c| PyChunk { inner: c })
-            .collect()
+            .collect())
     }
 
     fn __repr__(&self) -> String {
@@ -661,6 +712,30 @@ impl PyChunk {
 }
 
 // ---------------------------------------------------------------------------
+// Helper functions
+// ---------------------------------------------------------------------------
+
+/// Recursively flatten sections into a depth-first ordered list.
+fn flatten_sections(sections: &[Section]) -> Vec<&Section> {
+    let mut result = Vec::new();
+    for section in sections {
+        result.push(section);
+        result.extend(flatten_sections(&section.children));
+    }
+    result
+}
+
+/// Recursively flatten section entries into a depth-first ordered list.
+fn flatten_entries(entries: &[SectionEntry]) -> Vec<&SectionEntry> {
+    let mut result = Vec::new();
+    for entry in entries {
+        result.push(entry);
+        result.extend(flatten_entries(&entry.children));
+    }
+    result
+}
+
+// ---------------------------------------------------------------------------
 // Top-level functions
 // ---------------------------------------------------------------------------
 
@@ -695,9 +770,9 @@ fn analyze(
     let AnalysisResult { document, warnings } = analyze_pdf(Path::new(path), &config)
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
-    // Log non-fatal warnings to stderr.
+    // Log non-fatal warnings to stderr (uses Display to omit PDF-derived text).
     for w in &warnings {
-        eprintln!("[pdflay warning] {:?}", w);
+        eprintln!("[pdflay warning] {}", w);
     }
 
     Ok(PyPaperDocument { inner: document })

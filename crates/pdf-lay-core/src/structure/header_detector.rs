@@ -63,6 +63,21 @@ impl HeaderDetector {
         }
     }
 
+    /// Create a new detector with the given body font size and custom thresholds.
+    pub fn with_config(
+        body_font_size: f64,
+        min_score: u32,
+        max_chars: usize,
+        max_lines: usize,
+    ) -> Self {
+        Self {
+            min_score,
+            max_chars,
+            max_lines,
+            ..Self::new(body_font_size)
+        }
+    }
+
     /// Detect section headers from a slice of blocks.
     ///
     /// Only blocks that score >= `min_score` (default 4) are returned.

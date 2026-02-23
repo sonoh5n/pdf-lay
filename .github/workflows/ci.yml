@@ -7,6 +7,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  PYO3_NO_PYTHON: "1"
 
 jobs:
   check:
@@ -27,7 +28,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target/
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.toml') }}
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -35,5 +36,30 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Test
-        run: cargo test --all
+      - name: Test (Rust)
+        run: cargo test --workspace
+
+  python:
+    name: Python bindings
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install maturin
+        run: pip install maturin
+
+      - name: Build Python wheel
+        run: maturin build --release -m crates/pdflay-python/Cargo.toml
+
+      - name: Install and smoke-test
+        run: |
+          pip install target/wheels/*.whl
+          python -c "import pdflay; print('pdflay imported successfully')"

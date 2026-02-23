@@ -68,7 +68,7 @@ pub fn analyze_pdf(path: &Path, config: &Config) -> Result<AnalysisResult, PdfLa
     let line_reconstructor = LineReconstructor::new();
     let lines = line_reconstructor.reconstruct(&spans);
 
-    let column_detector = ColumnDetector::new();
+    let column_detector = ColumnDetector::new().with_bin_width(config.column_detection_bin_width);
     let layouts: Vec<_> = page_dims_list
         .iter()
         .map(|dims| column_detector.detect(&lines, dims))
@@ -117,12 +117,20 @@ pub fn analyze_pdf(path: &Path, config: &Config) -> Result<AnalysisResult, PdfLa
 
     // ---- Phase 4: Structure ----
 
-    let mut blocks = BlockGrouper::new().group(&lines, &layouts);
+    let mut blocks = BlockGrouper::new()
+        .with_gap_multiplier(config.block_gap_multiplier)
+        .group(&lines, &layouts);
 
     let classifier = BlockClassifier::from_blocks(&blocks);
     classifier.classify_all(&mut blocks);
 
-    let headers = HeaderDetector::new(classifier.body_font_size).detect(&blocks);
+    let headers = HeaderDetector::with_config(
+        classifier.body_font_size,
+        config.header_detection.min_score,
+        config.header_detection.max_chars,
+        config.header_detection.max_lines,
+    )
+    .detect(&blocks);
 
     // ---- Phase 5: Figure Matching ----
 
@@ -159,10 +167,9 @@ pub fn analyze_pdf(path: &Path, config: &Config) -> Result<AnalysisResult, PdfLa
         .unwrap_or("unknown")
         .to_string();
 
-    let all_figures: Vec<_> = sections
-        .iter()
-        .flat_map(|s| s.figures.iter().cloned())
-        .collect();
+    let all_figures: Vec<_> = collect_all_figures(&sections);
+
+    let all_tables: Vec<_> = collect_all_tables(&sections);
 
     let document = PaperDocument {
         paper_id,
@@ -173,10 +180,30 @@ pub fn analyze_pdf(path: &Path, config: &Config) -> Result<AnalysisResult, PdfLa
         },
         sections,
         all_figures,
-        all_tables: Vec::new(),
+        all_tables,
     };
 
     Ok(AnalysisResult { document, warnings })
+}
+
+/// Recursively collect all figures from sections and their children.
+fn collect_all_figures(sections: &[crate::types::text::Section]) -> Vec<crate::types::FigureInfo> {
+    let mut result = Vec::new();
+    for section in sections {
+        result.extend(section.figures.iter().cloned());
+        result.extend(collect_all_figures(&section.children));
+    }
+    result
+}
+
+/// Recursively collect all tables from sections and their children.
+fn collect_all_tables(sections: &[crate::types::text::Section]) -> Vec<crate::types::TableInfo> {
+    let mut result = Vec::new();
+    for section in sections {
+        result.extend(section.tables.iter().cloned());
+        result.extend(collect_all_tables(&section.children));
+    }
+    result
 }
 
 /// Analyze PDF from bytes (for use by Python bindings or in-memory workflows).

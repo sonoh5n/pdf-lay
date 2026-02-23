@@ -16,6 +16,9 @@ use crate::types::{FontInfo, PageDimensions, PathObject, Rect, TextSpan};
 /// receive `Vec<TextSpan>` / `Vec<ImageInfo>` from this reader.
 pub struct PdfReader {
     inner: PdfDocument,
+    /// Holds the temporary file alive when created via `from_bytes()`.
+    /// The file is automatically cleaned up when the `PdfReader` is dropped.
+    _temp_file: Option<tempfile::NamedTempFile>,
 }
 
 impl PdfReader {
@@ -26,13 +29,18 @@ impl PdfReader {
         }
         let inner =
             PdfDocument::open(path).map_err(|e| PdfLayError::PdfParseError(e.to_string()))?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            _temp_file: None,
+        })
     }
 
     /// Open a PDF from an in-memory byte slice.
     ///
     /// Writes the bytes to a temporary file then opens it with pdf_oxide, since
-    /// `pdf_oxide::PdfDocument` requires a file-backed reader.
+    /// `pdf_oxide::PdfDocument` requires a file-backed reader.  The temporary
+    /// file is kept alive for the lifetime of this `PdfReader` and automatically
+    /// cleaned up when it is dropped.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, PdfLayError> {
         use std::io::Write;
         let mut tmp = tempfile::NamedTempFile::new()?;
@@ -41,12 +49,10 @@ impl PdfReader {
         let path = tmp.path().to_path_buf();
         let inner =
             PdfDocument::open(&path).map_err(|e| PdfLayError::PdfParseError(e.to_string()))?;
-        // Keep the temp file alive by leaking the NamedTempFile — the OS will clean it up
-        // when the process exits or when the file handle is eventually dropped.
-        // For long-running processes a more careful approach (e.g., storing the handle in
-        // PdfReader) would be preferable, but for now this is sufficient.
-        let _ = tmp.keep();
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            _temp_file: Some(tmp),
+        })
     }
 
     /// Number of pages in the document (0-based indexing used throughout).

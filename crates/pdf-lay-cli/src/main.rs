@@ -111,7 +111,7 @@ fn run_analysis(common: &CommonArgs) -> pdf_lay::AnalysisResult {
     match analyze_pdf(&common.path, &config) {
         Ok(result) => {
             for w in &result.warnings {
-                eprintln!("[warning] {w:?}");
+                eprintln!("[warning] {w}");
             }
             result
         }

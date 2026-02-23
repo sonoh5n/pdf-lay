@@ -80,6 +80,29 @@ pub enum PdfLayWarning {
     },
 }
 
+impl std::fmt::Display for PdfLayWarning {
+    /// Display format that omits PDF-derived text content to prevent information leakage.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnmatchedCaption { page, .. } => {
+                write!(f, "unmatched caption on page {page}")
+            }
+            Self::UnmatchedImage { page, .. } => {
+                write!(f, "unmatched image on page {page}")
+            }
+            Self::CoordinateFallback { page, scale_used } => {
+                write!(
+                    f,
+                    "coordinate normalization fallback on page {page} (scale={scale_used:.3})"
+                )
+            }
+            Self::PageSkipped { page, reason } => {
+                write!(f, "page {page} skipped: {reason}")
+            }
+        }
+    }
+}
+
 /// The result of a full PDF analysis, including any non-fatal warnings.
 #[derive(Debug)]
 pub struct AnalysisResult {

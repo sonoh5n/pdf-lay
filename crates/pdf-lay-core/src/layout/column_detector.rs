@@ -33,6 +33,12 @@ impl ColumnDetector {
         Self::default()
     }
 
+    /// Override the histogram bin width in points.
+    pub fn with_bin_width(mut self, bin_width: f64) -> Self {
+        self.bin_width = bin_width;
+        self
+    }
+
     /// Detect the column layout for a single page.
     pub fn detect(&self, lines: &[TextLine], page_dims: &PageDimensions) -> PageLayout {
         // Filter to lines on this page.

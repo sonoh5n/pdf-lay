@@ -212,10 +212,11 @@ impl Chunker {
         }
         // Take characters from the end of text proportional to overlap_tokens.
         let target_chars = self.config.overlap_tokens * 4; // approximate
-        if text.len() <= target_chars {
+        let char_count = text.chars().count();
+        if char_count <= target_chars {
             text.to_string()
         } else {
-            text[text.len() - target_chars..].to_string()
+            text.chars().skip(char_count - target_chars).collect()
         }
     }
 
@@ -230,10 +231,17 @@ impl Chunker {
             .collect::<Vec<_>>()
             .join("\n\n");
 
+        if all_text.is_empty() {
+            return vec![];
+        }
+
+        // Guard against max_tokens == 0 which would cause an infinite loop.
+        let effective_max_tokens = self.config.max_tokens.max(1);
+
         let mut chunks = Vec::new();
         let mut chunk_id = 0;
         let chars: Vec<char> = all_text.chars().collect();
-        let max_chars = self.config.max_tokens * 4;
+        let max_chars = effective_max_tokens * 4;
         let overlap_chars = self.config.overlap_tokens * 4;
         let mut start = 0;
 
@@ -258,7 +266,9 @@ impl Chunker {
             if end >= chars.len() {
                 break;
             }
-            start = end.saturating_sub(overlap_chars);
+            // Ensure forward progress: advance by at least 1 character.
+            let advance = max_chars.saturating_sub(overlap_chars).max(1);
+            start += advance;
         }
 
         chunks
@@ -417,5 +427,37 @@ mod tests {
         let doc = make_doc_with_sections(vec![make_section("SEC", "Some text.", 1)]);
         let chunks = chunker.chunk(&doc);
         assert!(!chunks.last().unwrap().has_continuation);
+    }
+
+    #[test]
+    fn extract_overlap_handles_non_ascii() {
+        // Verify extract_overlap works with multibyte UTF-8 characters.
+        let config = ChunkConfig {
+            max_tokens: 10,
+            overlap_tokens: 2, // 2 * 4 = 8 target chars
+            split_strategy: SplitStrategy::SectionBoundary,
+            include_section_context: true,
+        };
+        let chunker = Chunker::new(config);
+        // 10 Japanese characters (3 bytes each in UTF-8).
+        let text = "あいうえおかきくけこ";
+        let overlap = chunker.extract_overlap(text);
+        // Should take last 8 chars: "うえおかきくけこ"
+        assert_eq!(overlap, "うえおかきくけこ");
+    }
+
+    #[test]
+    fn token_count_strategy_zero_max_tokens_does_not_loop() {
+        let config = ChunkConfig {
+            max_tokens: 0,
+            overlap_tokens: 0,
+            split_strategy: SplitStrategy::TokenCount,
+            include_section_context: true,
+        };
+        let chunker = Chunker::new(config);
+        let doc = make_doc_with_sections(vec![make_section("SEC", "Hello world.", 1)]);
+        // Should complete without infinite loop (max_tokens clamped to 1).
+        let chunks = chunker.chunk(&doc);
+        assert!(!chunks.is_empty());
     }
 }
