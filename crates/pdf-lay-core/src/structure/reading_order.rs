@@ -8,40 +8,41 @@ pub struct ReadingOrderSorter;
 impl ReadingOrderSorter {
     /// Sort `blocks` in-place into reading order.
     ///
-    /// Full-width elements (width >= 60% of page width) are interleaved with
-    /// column elements at their Y position.
+    /// Ordering key (lexicographic):
+    /// 1. page asc
+    /// 2. Y desc (top first)
+    /// 3. full-width before non-full when Y ties
+    /// 4. column index asc for non-full ties
+    /// 5. left X asc
+    /// 6. global index asc
+    ///
+    /// This comparator is a total order and avoids panics from non-transitive
+    /// pairwise rules.
     pub fn sort(blocks: &mut [TextBlock], layouts: &[PageLayout]) {
         blocks.sort_by(|a, b| {
-            // 1. Page order.
-            let page_cmp = a.page.cmp(&b.page);
-            if page_cmp != std::cmp::Ordering::Equal {
-                return page_cmp;
-            }
-
             let a_full = Self::is_full_width(a, layouts);
             let b_full = Self::is_full_width(b, layouts);
 
-            // 2. Full-width elements: sorted purely by Y (descending = top first).
-            if a_full || b_full {
-                return b
-                    .bbox
-                    .top
-                    .partial_cmp(&a.bbox.top)
-                    .unwrap_or(std::cmp::Ordering::Equal);
-            }
-
-            // 3. Same column -> Y order (descending).
-            let col_cmp = a.column_index.cmp(&b.column_index);
-            if col_cmp == std::cmp::Ordering::Equal {
-                return b
-                    .bbox
-                    .top
-                    .partial_cmp(&a.bbox.top)
-                    .unwrap_or(std::cmp::Ordering::Equal);
-            }
-
-            // 4. Different column -> left column first.
-            col_cmp
+            a.page
+                .cmp(&b.page)
+                // Higher Y first.
+                .then_with(|| b.bbox.top.total_cmp(&a.bbox.top))
+                // If Y ties, place full-width block first.
+                .then_with(|| match (a_full, b_full) {
+                    (true, false) => std::cmp::Ordering::Less,
+                    (false, true) => std::cmp::Ordering::Greater,
+                    _ => std::cmp::Ordering::Equal,
+                })
+                // Only meaningful when both are non-full and Y is tied.
+                .then_with(|| {
+                    if !a_full && !b_full {
+                        a.column_index.cmp(&b.column_index)
+                    } else {
+                        std::cmp::Ordering::Equal
+                    }
+                })
+                .then_with(|| a.bbox.left.total_cmp(&b.bbox.left))
+                .then_with(|| a.global_index.cmp(&b.global_index))
         });
     }
 
@@ -127,5 +128,22 @@ mod tests {
         // After sort: y=700 first, then y=600 full-width, then y=500
         assert!(blocks[0].bbox.top >= blocks[1].bbox.top);
         assert!(blocks[1].bbox.top >= blocks[2].bbox.top);
+    }
+
+    #[test]
+    fn mixed_full_and_columns_is_total_order() {
+        // Previously, this pattern could trigger a non-transitive comparator:
+        // full-width block compared by Y, while non-full blocks compared by column.
+        let layout = two_col_layout(0);
+        let mut blocks = vec![
+            make_block(0, 40.0, 200.0, 0), // left column, lower
+            make_block(1, 60.0, 200.0, 0), // right column, higher
+            make_block(0, 50.0, 612.0, 0), // full-width, middle
+        ];
+
+        ReadingOrderSorter::sort(&mut blocks, &[layout]);
+
+        let tops: Vec<f64> = blocks.iter().map(|b| b.bbox.top).collect();
+        assert_eq!(tops, vec![60.0, 50.0, 40.0]);
     }
 }
