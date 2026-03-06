@@ -1,0 +1,5 @@
+[env]
+# When building with plain `cargo build`, skip Python interpreter discovery.
+# Python extension builds use `maturin develop` or `maturin build` instead.
+# Override with PYO3_PYTHON=/path/to/python if you need Python-linked builds.
+PYO3_NO_PYTHON = { value = "1", force = false }

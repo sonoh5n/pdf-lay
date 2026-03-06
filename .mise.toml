@@ -1,0 +1,18 @@
+[tools]
+python = "3.12"
+uv = "latest"
+rust = "latest"
+
+[env]
+# uvの管理する仮想環境を優先的に参照
+VIRTUAL_ENV = "{{config_root}}/.venv"
+PATH = "{{config_root}}/.venv/bin"
+
+[tasks]
+# uv add --dev で開発用依存関係として追加し、環境を同期
+setup = "uv init --lib && uv add --dev maturin pytest && uv sync"
+
+# 以降のタスクは前回同様
+develop = "maturin develop"
+build = "maturin build --release"
+test = { depends = ["develop"], run = "cargo test && pytest" }
