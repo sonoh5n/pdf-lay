@@ -6,10 +6,11 @@ use crate::{
     config::Config,
     error::{AnalysisResult, PdfLayError, PdfLayWarning},
     extract::{CoordinateNormalizer, ImageExtractor, PdfReader, SpanBuilder},
-    figure::{CaptionDetector, CaptionType, ImageMatcher},
+    figure::{CaptionDetector, CaptionInfo, CaptionType, ImageMatcher},
     layout::{ColumnDetector, LineReconstructor},
-    structure::{BlockClassifier, BlockGrouper, HeaderDetector, SectionBuilder},
-    types::{DocumentMetadata, PaperDocument},
+    structure::{BlockClassifier, BlockGrouper, HeaderDetector, MetadataExtractor, SectionBuilder},
+    table::{GridBuilder, TableDetector, TableRegion, TableTextConverter},
+    types::{InsertionPoint, PaperDocument, TableInfo, TextBlock},
 };
 
 /// Analyze a PDF file and return a structured `PaperDocument`.
@@ -155,9 +156,56 @@ pub fn analyze_pdf(path: &Path, config: &Config) -> Result<AnalysisResult, PdfLa
         }
     }
 
+    // ---- Phase 5.5: Table Detection ----
+    // Must happen before Section Assembly because SectionBuilder::build consumes `blocks`.
+
+    let tables = if config.detect_tables {
+        let paths = reader.extract_all_paths()?;
+        let table_detector = TableDetector::new(config.table_config.clone());
+        let table_captions: Vec<&CaptionInfo> = captions
+            .iter()
+            .filter(|c| c.caption_type == CaptionType::Table)
+            .collect();
+        let regions = table_detector.detect(&blocks, &paths, &table_captions);
+
+        let mut table_infos = Vec::new();
+        for region in &regions {
+            let grid = GridBuilder::build(
+                &region.block_indices,
+                &blocks,
+                &region.bbox,
+                region.has_rules,
+            );
+            let repr = TableTextConverter::to_markdown(
+                &grid,
+                region.caption.as_ref().map(|c| c.full_text.as_str()),
+            );
+
+            let table_number = region.caption.as_ref().and_then(|c| c.number);
+            let table_id = format!("Table {}", table_number.unwrap_or(0));
+
+            table_infos.push(TableInfo {
+                table_id,
+                table_number,
+                caption: region.caption.as_ref().map(|c| c.full_text.clone()),
+                representation: repr,
+                insertion_point: determine_table_insertion(region, &blocks),
+                page: region.page,
+            });
+        }
+        table_infos
+    } else {
+        vec![]
+    };
+
+    // ---- Metadata Extraction ----
+    // Must happen before Section Assembly because SectionBuilder::build consumes `blocks`.
+
+    let metadata = MetadataExtractor::extract(&blocks, page_count);
+
     // ---- Phase 6: Section Assembly ----
 
-    let sections = SectionBuilder::build(blocks, &headers, figures, vec![], &layouts);
+    let sections = SectionBuilder::build(blocks, &headers, figures, tables, &layouts);
 
     // ---- Assembly ----
 
@@ -174,10 +222,7 @@ pub fn analyze_pdf(path: &Path, config: &Config) -> Result<AnalysisResult, PdfLa
     let document = PaperDocument {
         paper_id,
         source_file: path.to_path_buf(),
-        metadata: DocumentMetadata {
-            pages: page_count,
-            ..Default::default()
-        },
+        metadata,
         sections,
         all_figures,
         all_tables,
@@ -204,6 +249,26 @@ fn collect_all_tables(sections: &[crate::types::text::Section]) -> Vec<crate::ty
         result.extend(collect_all_tables(&section.children));
     }
     result
+}
+
+/// Determine the insertion point for a table region.
+///
+/// Uses the last block index in the region to compute the position after which the table
+/// should be inserted in the output stream.
+fn determine_table_insertion(region: &TableRegion, _blocks: &[TextBlock]) -> InsertionPoint {
+    if let Some(&last_idx) = region.block_indices.last() {
+        InsertionPoint {
+            page: region.page,
+            after_block_index: Some(last_idx),
+            y_position: region.bbox.bottom,
+        }
+    } else {
+        InsertionPoint {
+            page: region.page,
+            after_block_index: None,
+            y_position: region.bbox.bottom,
+        }
+    }
 }
 
 /// Analyze PDF from bytes (for use by Python bindings or in-memory workflows).

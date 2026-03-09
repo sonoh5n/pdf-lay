@@ -32,6 +32,8 @@ pub use pdf_lay_core::{
     DocumentMetadata,
     FigureInfo,
     FigureTextFormat,
+    // Table processing types
+    GridBuilder,
     ImageFormat,
     ImageInfo,
     InsertionPoint,
@@ -40,6 +42,12 @@ pub use pdf_lay_core::{
     LlmTextGenerator,
     MarkdownConfig,
     MathConfig,
+    // Math processing types
+    MathContext,
+    MathConverter,
+    MathDetector,
+    MathFormatter,
+    MathRegion,
     MathRepresentationPreference,
     PaperDocument,
     PdfLayError,
@@ -51,8 +59,11 @@ pub use pdf_lay_core::{
     SectionSelector,
     SplitStrategy,
     TableConfig,
+    TableDetector,
+    TableGrid,
     TableInfo,
     TableRepresentation,
+    TableTextConverter,
     TextBlock,
     TextLine,
     TextSpan,
@@ -60,6 +71,9 @@ pub use pdf_lay_core::{
     // Pipeline entry points
     analyze_pdf,
     analyze_pdf_bytes,
+    math_symbols,
+    to_latex_map,
+    to_unicode_map,
 };
 
 // Re-export output generators for CLI and advanced use cases.

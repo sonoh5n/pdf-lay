@@ -9,6 +9,8 @@ pub mod error;
 pub mod types;
 
 pub mod figure;
+pub mod math;
+pub mod table;
 
 // Extraction layer:
 pub mod extract;
@@ -36,8 +38,13 @@ pub use config::{
     MathRepresentationPreference, SplitStrategy, TableConfig,
 };
 pub use error::{AnalysisResult, PdfLayError, PdfLayWarning};
+pub use math::{
+    MathContext, MathConverter, MathDetector, MathFormatter, MathRegion, math_symbols,
+    to_latex_map, to_unicode_map,
+};
 pub use pipeline::{analyze_pdf, analyze_pdf_bytes};
 pub use selector::{LlmTextGenerator, SectionEntry, SectionSelector, TocGenerator};
+pub use table::{GridBuilder, TableDetector, TableGrid, TableTextConverter};
 pub use types::{
     BlockType, Chunk, DocumentMetadata, FigureInfo, ImageFormat, ImageInfo, InsertionPoint,
     PaperDocument, Rect, Section, SectionHeader, TableInfo, TableRepresentation, TextBlock,

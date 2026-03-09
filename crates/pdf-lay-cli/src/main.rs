@@ -184,6 +184,7 @@ fn cmd_markdown(args: &MarkdownArgs) {
         include_metadata_header: false,
         table_as_image: false,
         figure_caption_style: CaptionStyle::Italic,
+        math_config: None,
     };
 
     let output = if args.sections.is_empty() {

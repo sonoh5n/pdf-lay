@@ -100,6 +100,7 @@ impl PyPaperDocument {
             include_metadata_header: false,
             table_as_image: false,
             figure_caption_style: CaptionStyle::Italic,
+            math_config: None,
         };
         MarkdownGenerator::new(config).generate(&self.inner)
     }
@@ -312,6 +313,7 @@ impl PySectionSelector {
             include_metadata_header: false,
             table_as_image: false,
             figure_caption_style: CaptionStyle::Italic,
+            math_config: None,
         };
         self.rebuild_selector().to_markdown(&config)
     }

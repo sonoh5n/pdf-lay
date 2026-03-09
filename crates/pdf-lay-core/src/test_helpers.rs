@@ -3,7 +3,11 @@
 //! Used throughout unit tests across all modules.
 //! Only compiled under `#[cfg(test)]`.
 
-use crate::types::{BlockType, Rect, TextBlock, TextLine, TextSpan};
+use crate::figure::{CaptionInfo, CaptionType};
+use crate::types::{
+    BlockType, InsertionPoint, PathObject, PathType, Rect, TableInfo, TableRepresentation,
+    TextBlock, TextLine, TextSpan,
+};
 
 /// Build a minimal TextSpan for use in tests.
 pub fn make_span(text: &str, left: f64, top: f64, font_size: f64) -> TextSpan {
@@ -72,6 +76,107 @@ pub fn make_block_from_line(line: TextLine, global_index: usize) -> TextBlock {
         page,
         column_index: 0,
         block_type: BlockType::BodyText,
+    }
+}
+
+/// Build a minimal TableInfo for use in tests.
+pub fn make_table_info(id: &str, number: u32, markdown: &str) -> TableInfo {
+    TableInfo {
+        table_id: id.to_string(),
+        table_number: Some(number),
+        caption: Some(format!("Table {number}")),
+        representation: TableRepresentation::Markdown {
+            header: vec!["Col1".to_string(), "Col2".to_string()],
+            rows: vec![vec!["a".to_string(), "b".to_string()]],
+            caption: Some(format!("Table {number}")),
+            markdown_text: markdown.to_string(),
+        },
+        insertion_point: InsertionPoint {
+            page: 0,
+            after_block_index: Some(0),
+            y_position: 0.0,
+        },
+        page: 0,
+    }
+}
+
+/// Build a TextSpan representing a math character with the given font.
+pub fn make_math_span(
+    text: &str,
+    font_name: &str,
+    left: f64,
+    top: f64,
+    font_size: f64,
+) -> TextSpan {
+    let width = text.len() as f64 * font_size * 0.5;
+    TextSpan {
+        text: text.to_string(),
+        font_name: font_name.to_string(),
+        font_size,
+        is_bold: false,
+        is_italic: true,
+        bbox: Rect {
+            left,
+            top,
+            right: left + width,
+            bottom: top - font_size,
+        },
+        page: 0,
+    }
+}
+
+/// Build a minimal PathObject for use in tests.
+pub fn make_path_object(
+    page: u32,
+    left: f64,
+    top: f64,
+    right: f64,
+    bottom: f64,
+    path_type: PathType,
+) -> PathObject {
+    PathObject {
+        bbox: Rect {
+            left,
+            top,
+            right,
+            bottom,
+        },
+        page,
+        path_type,
+        line_width: 0.5,
+    }
+}
+
+/// Build a minimal CaptionInfo for use in tests.
+pub fn make_caption_info(
+    block_index: usize,
+    caption_type: CaptionType,
+    number: u32,
+    text: &str,
+    page: u32,
+) -> CaptionInfo {
+    let prefix = match caption_type {
+        CaptionType::Figure => format!("Fig. {number}"),
+        CaptionType::Table => format!("Table {number}"),
+    };
+    let type_label = match caption_type {
+        CaptionType::Figure => format!("Fig. {number}."),
+        CaptionType::Table => format!("Table {number}."),
+    };
+    CaptionInfo {
+        block_index,
+        caption_type,
+        prefix,
+        number: Some(number),
+        description: text.to_string(),
+        full_text: format!("{type_label} {text}"),
+        page,
+        bbox: Rect {
+            left: 0.0,
+            top: 100.0,
+            right: 200.0,
+            bottom: 90.0,
+        },
     }
 }
 

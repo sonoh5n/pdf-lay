@@ -34,6 +34,7 @@ fn default_markdown_config() -> MarkdownConfig {
         include_metadata_header: false,
         table_as_image: false,
         figure_caption_style: CaptionStyle::Italic,
+        math_config: None,
     }
 }
 
@@ -149,7 +150,7 @@ fn nonexistent_pdf_returns_error() {
 fn config_defaults_are_sane() {
     let cfg = Config::default();
     assert!(cfg.extract_images, "extract_images should default to true");
-    assert!(!cfg.detect_tables, "detect_tables should default to false");
+    assert!(cfg.detect_tables, "detect_tables should default to true");
     assert!(
         cfg.caption_max_gap_pt > 0.0,
         "caption_max_gap_pt should be positive"
@@ -792,6 +793,555 @@ fn ieee_paper_all_strategies_produce_chunks() {
             "Last chunk should never have continuation"
         );
     }
+}
+
+// ---- P2-10: Table integration tests ----------------------------------------
+
+/// Build a PaperDocument with a table in a section.
+fn make_doc_with_table() -> pdf_lay::PaperDocument {
+    use pdf_lay::{
+        BlockType, DocumentMetadata, InsertionPoint, PaperDocument, Rect, SectionHeader, TableInfo,
+        TableRepresentation, TextBlock,
+    };
+    use pdf_lay_core::types::{Section, TextLine};
+    use std::path::PathBuf;
+
+    let markdown_text = "| Name | Value |\n| --- | --- |\n| α | 0.5 |\n".to_string();
+    let table = TableInfo {
+        table_id: "Table 1".to_string(),
+        table_number: Some(1),
+        caption: Some("Table 1. Results".to_string()),
+        representation: TableRepresentation::Markdown {
+            header: vec!["Name".into(), "Value".into()],
+            rows: vec![vec!["α".into(), "0.5".into()]],
+            caption: Some("Table 1. Results".into()),
+            markdown_text: markdown_text.clone(),
+        },
+        insertion_point: InsertionPoint {
+            page: 0,
+            after_block_index: Some(0),
+            y_position: 500.0,
+        },
+        page: 0,
+    };
+
+    PaperDocument {
+        paper_id: "table_test".to_string(),
+        source_file: PathBuf::from("test.pdf"),
+        metadata: DocumentMetadata {
+            title: Some("Table Test Paper".to_string()),
+            authors: vec!["Author A".to_string()],
+            doi: None,
+            pages: 2,
+        },
+        sections: vec![Section {
+            header: Some(SectionHeader {
+                text: "I. RESULTS".to_string(),
+                clean_text: "RESULTS".to_string(),
+                level: 1,
+                numbering: Some("I.".to_string()),
+                page: 0,
+                bbox: Rect::new(72.0, 700.0, 540.0, 690.0),
+                block_index: 0,
+            }),
+            level: 1,
+            blocks: vec![TextBlock {
+                global_index: 0,
+                lines: vec![TextLine {
+                    spans: vec![],
+                    text: "We present our results in Table 1.".to_string(),
+                    bbox: Rect::new(72.0, 680.0, 540.0, 670.0),
+                    page: 0,
+                    baseline_y: 670.0,
+                    primary_font_size: 10.0,
+                    primary_font_name: "Times".to_string(),
+                    is_bold: false,
+                }],
+                text: "We present our results in Table 1.".to_string(),
+                bbox: Rect::new(72.0, 680.0, 540.0, 670.0),
+                page: 0,
+                column_index: 0,
+                block_type: BlockType::BodyText,
+            }],
+            figures: vec![],
+            tables: vec![table.clone()],
+            children: vec![],
+            page_range: (0, 1),
+        }],
+        all_figures: vec![],
+        all_tables: vec![table],
+    }
+}
+
+/// Verify that a section's table appears in Markdown output.
+#[test]
+fn test_table_in_markdown_output() {
+    let doc = make_doc_with_table();
+    let md_gen = pdf_lay::MarkdownGenerator::new(default_markdown_config());
+    let md = md_gen.generate(&doc);
+
+    assert!(!md.is_empty(), "Markdown output should not be empty");
+    // Caption should be bolded above the table.
+    assert!(
+        md.contains("Table 1. Results"),
+        "Markdown output should contain table caption"
+    );
+    // Markdown table rows should be present.
+    assert!(
+        md.contains("| Name | Value |"),
+        "Markdown output should contain table header row"
+    );
+    assert!(
+        md.contains("| α | 0.5 |"),
+        "Markdown output should contain table data row"
+    );
+    // Section heading should still be present.
+    assert!(
+        md.contains("RESULTS"),
+        "Section heading should still appear"
+    );
+}
+
+/// Verify that a section's table appears in LLM text output.
+#[test]
+fn test_table_in_llm_text_output() {
+    let doc = make_doc_with_table();
+    let sections: Vec<&Section> = doc.sections.iter().collect();
+    let llm_gen = LlmTextGenerator::new(default_llm_config());
+    let text = llm_gen.generate(&sections);
+
+    assert!(!text.is_empty(), "LLM text output should not be empty");
+    // Caption should appear.
+    assert!(
+        text.contains("Table 1. Results"),
+        "LLM text should contain table caption"
+    );
+    // Table markdown content should appear.
+    assert!(
+        text.contains("| Name | Value |"),
+        "LLM text should contain table header row"
+    );
+    assert!(
+        text.contains("| α | 0.5 |"),
+        "LLM text should contain table data row"
+    );
+}
+
+/// Verify that tables are omitted when include_tables is false.
+#[test]
+fn test_table_excluded_when_include_tables_false() {
+    use pdf_lay::{FigureTextFormat, MathRepresentationPreference};
+
+    let doc = make_doc_with_table();
+    let sections: Vec<&Section> = doc.sections.iter().collect();
+
+    let no_table_config = LlmTextConfig {
+        include_tables: false,
+        include_figures: false,
+        include_section_headers: true,
+        figure_format: FigureTextFormat::Placeholder,
+        math_representation: MathRepresentationPreference::Auto,
+    };
+    let llm_gen = LlmTextGenerator::new(no_table_config);
+    let text = llm_gen.generate(&sections);
+
+    // Table markdown should NOT appear.
+    assert!(
+        !text.contains("| Name | Value |"),
+        "Table should be excluded when include_tables is false"
+    );
+    // Body text should still appear.
+    assert!(
+        text.contains("results in Table 1"),
+        "Body text should still appear"
+    );
+}
+
+// ---- P2-19: Math integration tests ------------------------------------------
+
+/// Build a TextBlock containing a mixed line (plain text + CMMI10 math span).
+fn make_mixed_math_block_for_integration() -> pdf_lay::TextBlock {
+    use pdf_lay::{BlockType, Rect, TextBlock, TextLine, TextSpan};
+
+    let plain_span = TextSpan {
+        text: "where ".to_string(),
+        font_name: "TimesNewRoman".to_string(),
+        font_size: 10.0,
+        is_bold: false,
+        is_italic: false,
+        bbox: Rect::new(50.0, 700.0, 95.0, 690.0),
+        page: 0,
+    };
+    let math_span = TextSpan {
+        text: "α".to_string(),
+        font_name: "CMMI10".to_string(),
+        font_size: 10.0,
+        is_bold: false,
+        is_italic: true,
+        bbox: Rect::new(100.0, 700.0, 110.0, 690.0),
+        page: 0,
+    };
+    let line = TextLine {
+        text: "where α".to_string(),
+        spans: vec![plain_span, math_span],
+        bbox: Rect::new(50.0, 700.0, 110.0, 690.0),
+        page: 0,
+        baseline_y: 690.0,
+        primary_font_size: 10.0,
+        primary_font_name: "TimesNewRoman".to_string(),
+        is_bold: false,
+    };
+    TextBlock {
+        global_index: 0,
+        lines: vec![line],
+        text: "where α".to_string(),
+        bbox: Rect::new(50.0, 700.0, 110.0, 690.0),
+        page: 0,
+        column_index: 0,
+        block_type: BlockType::BodyText,
+    }
+}
+
+/// Build a PaperDocument whose first section contains a math-font block.
+fn make_doc_with_math() -> pdf_lay::PaperDocument {
+    use pdf_lay::{DocumentMetadata, PaperDocument, Rect, SectionHeader};
+    use pdf_lay_core::types::Section;
+    use std::path::PathBuf;
+
+    let math_block = make_mixed_math_block_for_integration();
+
+    PaperDocument {
+        paper_id: "math_test".to_string(),
+        source_file: PathBuf::from("test.pdf"),
+        metadata: DocumentMetadata {
+            title: Some("Math Test Paper".to_string()),
+            authors: vec!["Author B".to_string()],
+            doi: None,
+            pages: 1,
+        },
+        sections: vec![Section {
+            header: Some(SectionHeader {
+                text: "I. ANALYSIS".to_string(),
+                clean_text: "ANALYSIS".to_string(),
+                level: 1,
+                numbering: Some("I.".to_string()),
+                page: 0,
+                bbox: Rect::new(72.0, 720.0, 540.0, 710.0),
+                block_index: 0,
+            }),
+            level: 1,
+            blocks: vec![math_block],
+            figures: vec![],
+            tables: vec![],
+            children: vec![],
+            page_range: (0, 0),
+        }],
+        all_figures: vec![],
+        all_tables: vec![],
+    }
+}
+
+/// Verify that inline math (CMMI10 font + plain text prefix) produces $...$ in Markdown.
+#[test]
+fn test_math_in_markdown_output() {
+    use pdf_lay::MathConfig;
+
+    let doc = make_doc_with_math();
+
+    let md_config = pdf_lay::MarkdownConfig {
+        math_config: Some(MathConfig {
+            representation: pdf_lay::MathRepresentationPreference::LaTeX,
+            ..MathConfig::default()
+        }),
+        ..default_markdown_config()
+    };
+    let md_gen = pdf_lay::MarkdownGenerator::new(md_config);
+    let md = md_gen.generate(&doc);
+
+    assert!(!md.is_empty(), "Markdown output should not be empty");
+    // The mixed block has a plain-text prefix ("where ") followed by a CMMI10 span → Inline math.
+    assert!(
+        md.contains("$\\alpha$") || md.contains("$α$"),
+        "Markdown should contain inline math delimiters for the CMMI10 span; got:\n{md}"
+    );
+    // Section heading should still be present.
+    assert!(
+        md.contains("ANALYSIS"),
+        "Section heading should still appear"
+    );
+}
+
+/// Verify that without math_config, CMMI10 text is passed through unchanged.
+#[test]
+fn test_math_passthrough_without_config() {
+    let doc = make_doc_with_math();
+
+    // No math_config → plain passthrough.
+    let md_gen = pdf_lay::MarkdownGenerator::new(default_markdown_config());
+    let md = md_gen.generate(&doc);
+
+    // There should be no $ delimiters.
+    assert!(
+        !md.contains("$\\alpha$"),
+        "Without math_config there should be no LaTeX delimiters"
+    );
+    // The raw text of the block should appear.
+    assert!(
+        md.contains("where α") || md.contains("α"),
+        "Raw block text should appear when math_config is None"
+    );
+}
+
+// ---- P2-25: Full pipeline integration tests ---------------------------------
+
+/// Build a comprehensive PaperDocument with metadata, tables, and math spans.
+fn make_comprehensive_doc() -> pdf_lay::PaperDocument {
+    use pdf_lay::{
+        BlockType, DocumentMetadata, InsertionPoint, PaperDocument, Rect, SectionHeader, TableInfo,
+        TableRepresentation, TextBlock, TextLine, TextSpan,
+    };
+    use pdf_lay_core::types::Section;
+    use std::path::PathBuf;
+
+    let table = TableInfo {
+        table_id: "Table 1".to_string(),
+        table_number: Some(1),
+        caption: Some("Table 1. Experimental Results".to_string()),
+        representation: TableRepresentation::Markdown {
+            header: vec!["Method".into(), "Accuracy".into()],
+            rows: vec![
+                vec!["Baseline".into(), "0.72".into()],
+                vec!["Proposed".into(), "0.91".into()],
+            ],
+            caption: Some("Table 1. Experimental Results".into()),
+            markdown_text:
+                "| Method | Accuracy |\n| --- | --- |\n| Baseline | 0.72 |\n| Proposed | 0.91 |\n"
+                    .to_string(),
+        },
+        insertion_point: InsertionPoint {
+            page: 1,
+            after_block_index: Some(1),
+            y_position: 400.0,
+        },
+        page: 1,
+    };
+
+    let math_span = TextSpan {
+        text: "α".to_string(),
+        font_name: "CMMI10".to_string(),
+        font_size: 10.0,
+        is_bold: false,
+        is_italic: true,
+        bbox: Rect::new(100.0, 650.0, 110.0, 640.0),
+        page: 0,
+    };
+    let plain_span = TextSpan {
+        text: "The parameter ".to_string(),
+        font_name: "TimesNewRoman".to_string(),
+        font_size: 10.0,
+        is_bold: false,
+        is_italic: false,
+        bbox: Rect::new(50.0, 650.0, 95.0, 640.0),
+        page: 0,
+    };
+    let math_line = TextLine {
+        text: "The parameter α".to_string(),
+        spans: vec![plain_span, math_span],
+        bbox: Rect::new(50.0, 650.0, 110.0, 640.0),
+        page: 0,
+        baseline_y: 640.0,
+        primary_font_size: 10.0,
+        primary_font_name: "TimesNewRoman".to_string(),
+        is_bold: false,
+    };
+
+    PaperDocument {
+        paper_id: "comprehensive_test".to_string(),
+        source_file: PathBuf::from("comprehensive.pdf"),
+        metadata: DocumentMetadata {
+            title: Some("A Comprehensive Test Paper".to_string()),
+            authors: vec!["Alice Smith".to_string(), "Bob Jones".to_string()],
+            doi: Some("10.1234/test.2024".to_string()),
+            pages: 4,
+        },
+        sections: vec![
+            Section {
+                header: Some(SectionHeader {
+                    text: "I. INTRODUCTION".to_string(),
+                    clean_text: "INTRODUCTION".to_string(),
+                    level: 1,
+                    numbering: Some("I.".to_string()),
+                    page: 0,
+                    bbox: Rect::new(72.0, 700.0, 540.0, 690.0),
+                    block_index: 0,
+                }),
+                level: 1,
+                blocks: vec![TextBlock {
+                    global_index: 0,
+                    lines: vec![math_line],
+                    text: "The parameter α".to_string(),
+                    bbox: Rect::new(50.0, 650.0, 110.0, 640.0),
+                    page: 0,
+                    column_index: 0,
+                    block_type: BlockType::BodyText,
+                }],
+                figures: vec![],
+                tables: vec![],
+                children: vec![],
+                page_range: (0, 0),
+            },
+            Section {
+                header: Some(SectionHeader {
+                    text: "II. EXPERIMENTS".to_string(),
+                    clean_text: "EXPERIMENTS".to_string(),
+                    level: 1,
+                    numbering: Some("II.".to_string()),
+                    page: 1,
+                    bbox: Rect::new(72.0, 700.0, 540.0, 690.0),
+                    block_index: 1,
+                }),
+                level: 1,
+                blocks: vec![TextBlock {
+                    global_index: 1,
+                    lines: vec![],
+                    text: "We conducted extensive experiments on standard benchmarks.".to_string(),
+                    bbox: Rect::new(72.0, 680.0, 540.0, 670.0),
+                    page: 1,
+                    column_index: 0,
+                    block_type: BlockType::BodyText,
+                }],
+                figures: vec![],
+                tables: vec![table.clone()],
+                children: vec![],
+                page_range: (1, 2),
+            },
+        ],
+        all_figures: vec![],
+        all_tables: vec![table],
+    }
+}
+
+/// Verify that metadata fields appear correctly in JSON output.
+#[test]
+fn test_metadata_in_json_output() {
+    use pdf_lay_core::output::JsonGenerator;
+
+    let doc = make_comprehensive_doc();
+    let json = JsonGenerator::generate(&doc).expect("JSON serialization should succeed");
+
+    assert!(!json.is_empty(), "JSON output should not be empty");
+
+    let parsed: serde_json::Value =
+        serde_json::from_str(&json).expect("Output should be valid JSON");
+
+    // paper_id
+    assert_eq!(
+        parsed["paper_id"], "comprehensive_test",
+        "JSON should contain correct paper_id"
+    );
+
+    // metadata.title
+    assert_eq!(
+        parsed["metadata"]["title"], "A Comprehensive Test Paper",
+        "JSON should contain the correct title"
+    );
+
+    // metadata.authors
+    let authors = parsed["metadata"]["authors"]
+        .as_array()
+        .expect("authors should be a JSON array");
+    assert!(
+        authors.iter().any(|a| a == "Alice Smith"),
+        "JSON should contain author Alice Smith"
+    );
+    assert!(
+        authors.iter().any(|a| a == "Bob Jones"),
+        "JSON should contain author Bob Jones"
+    );
+
+    // metadata.doi
+    assert_eq!(
+        parsed["metadata"]["doi"], "10.1234/test.2024",
+        "JSON should contain the DOI"
+    );
+
+    // metadata.pages
+    assert_eq!(
+        parsed["metadata"]["pages"], 4,
+        "JSON should contain correct page count"
+    );
+
+    // sections array
+    let sections = parsed["sections"]
+        .as_array()
+        .expect("sections should be a JSON array");
+    assert_eq!(sections.len(), 2, "JSON should contain two sections");
+}
+
+/// Verify full pipeline: document with tables, math, and metadata produces correct Markdown.
+#[test]
+fn test_full_doc_with_tables_math_metadata() {
+    use pdf_lay::MathConfig;
+
+    let doc = make_comprehensive_doc();
+
+    // Markdown with math and front matter enabled.
+    let md_config = pdf_lay::MarkdownConfig {
+        include_metadata_header: true,
+        math_config: Some(MathConfig {
+            representation: pdf_lay::MathRepresentationPreference::LaTeX,
+            ..MathConfig::default()
+        }),
+        ..default_markdown_config()
+    };
+    let md_gen = pdf_lay::MarkdownGenerator::new(md_config);
+    let md = md_gen.generate(&doc);
+
+    assert!(!md.is_empty(), "Markdown output should not be empty");
+
+    // Front matter with metadata.
+    assert!(
+        md.starts_with("---"),
+        "Output should begin with YAML front matter"
+    );
+    assert!(
+        md.contains("A Comprehensive Test Paper"),
+        "Front matter should contain the title"
+    );
+    assert!(
+        md.contains("Alice Smith"),
+        "Front matter should contain author Alice Smith"
+    );
+
+    // Section headings.
+    assert!(
+        md.contains("INTRODUCTION"),
+        "Markdown should contain INTRODUCTION section"
+    );
+    assert!(
+        md.contains("EXPERIMENTS"),
+        "Markdown should contain EXPERIMENTS section"
+    );
+
+    // Math (inline, CMMI10 span with plain-text prefix).
+    assert!(
+        md.contains("$\\alpha$") || md.contains("$α$"),
+        "Markdown should contain LaTeX math delimiters for α; got:\n{md}"
+    );
+
+    // Table content.
+    assert!(
+        md.contains("Table 1. Experimental Results"),
+        "Markdown should contain table caption"
+    );
+    assert!(
+        md.contains("| Method | Accuracy |"),
+        "Markdown should contain table header row"
+    );
+    assert!(
+        md.contains("| Proposed | 0.91 |"),
+        "Markdown should contain table data row"
+    );
 }
 
 /// End-to-end: analyze_pdf + toc + select + markdown + json + chunks, all chained.

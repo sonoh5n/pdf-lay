@@ -9,9 +9,9 @@ use pdf_lay::{
 fn config_defaults_compile() {
     let config = Config::default();
     // Verify the Config type and its fields are accessible via the public API.
-    // The default has extract_images = true and detect_tables = false.
+    // The default has extract_images = true and detect_tables = true.
     assert!(config.extract_images);
-    assert!(!config.detect_tables);
+    assert!(config.detect_tables);
 }
 
 #[test]
@@ -23,6 +23,7 @@ fn markdown_config_compiles() {
         include_metadata_header: false,
         table_as_image: false,
         figure_caption_style: CaptionStyle::Italic,
+        math_config: None,
     };
     assert_eq!(config.heading_offset, 1);
 }
