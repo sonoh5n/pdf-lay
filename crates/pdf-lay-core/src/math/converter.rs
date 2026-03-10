@@ -467,8 +467,10 @@ mod tests {
 
     #[test]
     fn test_convert_respects_latex_preference() {
-        let mut config = MathConfig::default();
-        config.representation = MathRepresentationPreference::LaTeX;
+        let config = MathConfig {
+            representation: MathRepresentationPreference::LaTeX,
+            ..Default::default()
+        };
         let c = MathConverter::new(config);
         let span = make_math_span("α", "Symbol", 0.0, 100.0, 10.0);
         let result = c.convert("α", &[span]);
@@ -480,8 +482,10 @@ mod tests {
 
     #[test]
     fn test_convert_respects_unicode_preference() {
-        let mut config = MathConfig::default();
-        config.representation = MathRepresentationPreference::UnicodeMath;
+        let config = MathConfig {
+            representation: MathRepresentationPreference::UnicodeMath,
+            ..Default::default()
+        };
         let c = MathConverter::new(config);
         // Plain '2' with no sub/super stays '2' in unicode mode
         let span = make_math_span("2", "Symbol", 0.0, 100.0, 10.0);
