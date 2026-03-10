@@ -185,6 +185,87 @@ print(len(chunks))
 - `PyPaperDocument.select_sections(...)`
 - `PySectionSelector.to_markdown()/to_json()/to_llm_text()/to_chunks()`
 
+## AI Agent Skills
+
+pdf-lay ships with pre-built agent skills in `.claude/skills/` for seamless
+integration with Claude Code and OpenAI Codex CLI.
+
+### Available Skills
+
+| Skill | Command | Description |
+|-------|---------|-------------|
+| `pdf` | `/pdf paper.pdf` | Extract structured content (Markdown, JSON, TOC) |
+| `pdf-qa` | `/pdf-qa paper.pdf "What method was used?"` | Answer questions grounded in the paper |
+| `pdf-summary` | `/pdf-summary paper.pdf` | Generate a structured summary |
+| `pdf-to-llm` | `/pdf-to-llm paper.pdf` | Convert to LLM-optimized chunks for RAG |
+
+### Setup for Claude Code
+
+Skills are auto-detected when Claude Code runs inside the pdf-lay repository.
+
+```bash
+# 1. Build the CLI binary
+cargo build -p pdf-lay-cli --release
+
+# 2. (Optional) Add to PATH for global access
+cp target/release/pdf-lay /usr/local/bin/
+
+# 3. Open Claude Code in the pdf-lay directory
+cd /path/to/pdf-lay
+claude
+
+# 4. Use skills directly
+#   /pdf paper.pdf
+#   /pdf-qa paper.pdf "What are the main contributions?"
+#   /pdf-summary paper.pdf --lang ja
+#   /pdf-to-llm paper.pdf --max-tokens 2000
+```
+
+To use skills from **another project**, copy the `.claude/skills/` directory:
+
+```bash
+cp -r /path/to/pdf-lay/.claude/skills/ /your/project/.claude/skills/
+```
+
+Make sure `pdf-lay` CLI is in your PATH or the skills will fall back to
+`cargo run` (requires the pdf-lay source tree).
+
+### Setup for OpenAI Codex CLI
+
+Codex CLI reads agent skills from the `.claude/skills/` directory in the same
+format. Setup:
+
+```bash
+# 1. Build the CLI binary and add to PATH
+cargo build -p pdf-lay-cli --release
+cp target/release/pdf-lay /usr/local/bin/
+
+# 2. Copy skills into your project
+cp -r /path/to/pdf-lay/.claude/skills/ /your/project/.claude/skills/
+
+# 3. Use with Codex CLI
+codex "Analyze this paper" # Codex will discover and use the pdf skill
+```
+
+### Skill Examples
+
+```bash
+# Extract table of contents with token estimates
+/pdf paper.pdf --format toc
+
+# Extract only the Methods section as Markdown
+/pdf paper.pdf --section "Methods"
+
+# Ask a specific question about the paper
+/pdf-qa paper.pdf "What dataset was used for evaluation?"
+
+# Summarize in Japanese
+/pdf-summary paper.pdf --lang ja
+
+# Generate RAG-ready chunks
+/pdf-to-llm paper.pdf --max-tokens 2000 --strategy paragraph
+```
+
 ## End-to-End Local Verification
 
 ```bash
