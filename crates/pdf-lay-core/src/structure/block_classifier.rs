@@ -61,6 +61,126 @@ impl BlockClassifier {
         }
     }
 
+    /// Detect repeated text patterns across pages as running headers/footers.
+    ///
+    /// Scans all blocks across pages and classifies them as `RunningHeader` or
+    /// `RunningFooter` when the same normalised text (trimmed, lowercased) appears
+    /// on **3 or more pages** in the same vertical zone:
+    ///
+    /// - **Top 10%** of page height → `RunningHeader`
+    /// - **Bottom 10%** of page height → `RunningFooter`
+    ///
+    /// Blocks already classified as `PageNumber` are never upgraded to a running
+    /// header/footer.
+    ///
+    /// This method is intended to be called **after** `classify_all` has been run
+    /// on the same slice.
+    pub fn detect_repeated_headers_footers(blocks: &mut [TextBlock]) {
+        if blocks.is_empty() {
+            return;
+        }
+
+        // --- Step 1: Infer page height for each page from the maximum `top` value
+        //             seen among all blocks on that page.
+        let mut page_heights: HashMap<u32, f64> = HashMap::new();
+        for block in blocks.iter() {
+            let entry = page_heights.entry(block.page).or_insert(0.0_f64);
+            if block.bbox.top > *entry {
+                *entry = block.bbox.top;
+            }
+        }
+
+        // Threshold: 10% of page height.
+        const ZONE_FRACTION: f64 = 0.10;
+
+        // --- Step 2: For every block decide whether it falls into the header zone
+        //             (top 10%) or footer zone (bottom 10%) of its page.
+        //             Collect (normalized_text, zone, page) triples.
+        #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+        enum Zone {
+            Header,
+            Footer,
+        }
+
+        // Map (normalized_text, zone) -> set of page indices that contain it.
+        let mut occurrences: HashMap<(String, Zone), std::collections::HashSet<u32>> =
+            HashMap::new();
+
+        for block in blocks.iter() {
+            // Blocks already identified as page numbers are exempt.
+            if block.block_type == BlockType::PageNumber {
+                continue;
+            }
+
+            let page_height = match page_heights.get(&block.page) {
+                Some(&h) if h > 0.0 => h,
+                _ => continue,
+            };
+
+            let threshold = page_height * ZONE_FRACTION;
+            let normalized = block.text.trim().to_lowercase();
+            if normalized.is_empty() {
+                continue;
+            }
+
+            let zone = if block.bbox.bottom >= page_height - threshold {
+                // Block sits in the top 10% (high Y values).
+                Some(Zone::Header)
+            } else if block.bbox.top <= threshold {
+                // Block sits in the bottom 10% (low Y values).
+                Some(Zone::Footer)
+            } else {
+                None
+            };
+
+            if let Some(z) = zone {
+                occurrences
+                    .entry((normalized, z))
+                    .or_default()
+                    .insert(block.page);
+            }
+        }
+
+        // --- Step 3: Collect keys that appear on 3+ distinct pages.
+        let repeated: std::collections::HashSet<(String, Zone)> = occurrences
+            .into_iter()
+            .filter(|(_, pages)| pages.len() >= 3)
+            .map(|(key, _)| key)
+            .collect();
+
+        if repeated.is_empty() {
+            return;
+        }
+
+        // --- Step 4: Re-visit every block and reclassify matches.
+        for block in blocks.iter_mut() {
+            if block.block_type == BlockType::PageNumber {
+                continue;
+            }
+
+            let page_height = match page_heights.get(&block.page) {
+                Some(&h) if h > 0.0 => h,
+                _ => continue,
+            };
+
+            let threshold = page_height * ZONE_FRACTION;
+            let normalized = block.text.trim().to_lowercase();
+            if normalized.is_empty() {
+                continue;
+            }
+
+            if block.bbox.bottom >= page_height - threshold
+                && repeated.contains(&(normalized.clone(), Zone::Header))
+            {
+                block.block_type = BlockType::RunningHeader;
+            } else if block.bbox.top <= threshold
+                && repeated.contains(&(normalized.clone(), Zone::Footer))
+            {
+                block.block_type = BlockType::RunningFooter;
+            }
+        }
+    }
+
     /// Classify a single block.
     pub fn classify(&self, block: &TextBlock) -> BlockType {
         let text = block.text.trim();
@@ -209,6 +329,52 @@ mod tests {
         }
     }
 
+    /// Build a block with explicit page and bbox for testing repeated-header detection.
+    ///
+    /// `page_height` is used to set the tallest block on the page so the zone
+    /// threshold is derived correctly.  Pass `top` and `bottom` in PDF coordinates
+    /// (Y-up, so top > bottom).
+    fn make_block_at(
+        text: &str,
+        page: u32,
+        top: f64,
+        bottom: f64,
+        block_type: BlockType,
+    ) -> TextBlock {
+        let font_size = top - bottom;
+        let line = TextLine {
+            spans: vec![],
+            text: text.to_string(),
+            bbox: Rect::new(72.0, top, 540.0, bottom),
+            page,
+            baseline_y: bottom,
+            primary_font_size: font_size,
+            primary_font_name: "Regular".to_string(),
+            is_bold: false,
+        };
+        TextBlock {
+            global_index: 0,
+            lines: vec![line],
+            text: text.to_string(),
+            bbox: Rect::new(72.0, top, 540.0, bottom),
+            page,
+            column_index: 0,
+            block_type,
+        }
+    }
+
+    /// Sentinel block that anchors the page height (bbox.top == page_height).
+    fn make_anchor_block(page: u32, page_height: f64) -> TextBlock {
+        // A tall block whose top edge equals the page height.
+        make_block_at(
+            "anchor body text paragraph",
+            page,
+            page_height,
+            100.0,
+            BlockType::BodyText,
+        )
+    }
+
     #[test]
     fn caption_detected() {
         let classifier = BlockClassifier::with_body_size(10.0);
@@ -282,5 +448,164 @@ mod tests {
         // The key is that it's NOT Caption or PageNumber.
         let t = classifier.classify(&block);
         assert!(!matches!(t, BlockType::Caption | BlockType::PageNumber));
+    }
+
+    /// The same header text appearing in the top 10% of a 792pt page on 3+ pages
+    /// must be reclassified as RunningHeader.
+    #[test]
+    fn test_repeated_header_detected() {
+        // Page height = 792 pt (US Letter).  Top 10% threshold = 79.2 pt from the top,
+        // i.e. blocks with bottom >= 792 - 79.2 = 712.8.
+        let page_height = 792.0_f64;
+        let header_text = "Journal of Rust Research";
+
+        // Three pages each with:
+        //   • an anchor block that pins page_height
+        //   • a header block in the top 10%
+        //   • a body block in the middle (should NOT be reclassified)
+        let mut blocks: Vec<TextBlock> = Vec::new();
+        for p in 0u32..3 {
+            // Anchor: top == page_height, bottom well below the header zone.
+            blocks.push(make_anchor_block(p, page_height));
+            // Header candidate: lives in the top 10% (bottom >= 712.8).
+            blocks.push(make_block_at(
+                header_text,
+                p,
+                page_height,         // top = 792
+                page_height - 12.0,  // bottom = 780  (well inside top 10%)
+                BlockType::BodyText, // initially unclassified
+            ));
+            // Body block: sits in the middle of the page.
+            blocks.push(make_block_at(
+                "Some body paragraph.",
+                p,
+                400.0,
+                380.0,
+                BlockType::BodyText,
+            ));
+        }
+
+        BlockClassifier::detect_repeated_headers_footers(&mut blocks);
+
+        // Every block with `header_text` should now be RunningHeader.
+        let header_blocks: Vec<_> = blocks.iter().filter(|b| b.text == header_text).collect();
+        assert_eq!(header_blocks.len(), 3, "Expected 3 header blocks");
+        for b in &header_blocks {
+            assert_eq!(
+                b.block_type,
+                BlockType::RunningHeader,
+                "Block on page {} should be RunningHeader",
+                b.page
+            );
+        }
+
+        // Body blocks must remain BodyText.
+        let body_blocks: Vec<_> = blocks
+            .iter()
+            .filter(|b| b.text == "Some body paragraph.")
+            .collect();
+        for b in &body_blocks {
+            assert_eq!(b.block_type, BlockType::BodyText);
+        }
+    }
+
+    /// Page-number blocks ("42", "43", "44") must never be upgraded to RunningHeader
+    /// even when they appear in the top zone on 3+ pages.
+    #[test]
+    fn test_page_number_not_header() {
+        let page_height = 792.0_f64;
+
+        let mut blocks: Vec<TextBlock> = Vec::new();
+        for (p, num) in [(0u32, "42"), (1, "43"), (2, "44")] {
+            blocks.push(make_anchor_block(p, page_height));
+            blocks.push(make_block_at(
+                num,
+                p,
+                page_height,
+                page_height - 12.0,
+                BlockType::PageNumber, // already classified
+            ));
+        }
+
+        BlockClassifier::detect_repeated_headers_footers(&mut blocks);
+
+        // All "4x" blocks must stay PageNumber.
+        for b in blocks
+            .iter()
+            .filter(|b| b.block_type != BlockType::BodyText)
+        {
+            assert_eq!(
+                b.block_type,
+                BlockType::PageNumber,
+                "Block '{}' on page {} should remain PageNumber",
+                b.text,
+                b.page
+            );
+        }
+    }
+
+    /// A running footer appearing in the bottom 10% of 3+ pages is classified
+    /// as RunningFooter.
+    #[test]
+    fn test_repeated_footer_detected() {
+        let page_height = 792.0_f64;
+        // Bottom 10% threshold = 79.2 pt.  Blocks with top <= 79.2 are in footer zone.
+        let footer_text = "© 2024 The Authors";
+
+        let mut blocks: Vec<TextBlock> = Vec::new();
+        for p in 0u32..3 {
+            blocks.push(make_anchor_block(p, page_height));
+            // Footer block: lives in the bottom 10% (top <= 79.2).
+            blocks.push(make_block_at(
+                footer_text,
+                p,
+                60.0, // top = 60, well inside bottom 10%
+                48.0, // bottom = 48
+                BlockType::BodyText,
+            ));
+        }
+
+        BlockClassifier::detect_repeated_headers_footers(&mut blocks);
+
+        let footer_blocks: Vec<_> = blocks.iter().filter(|b| b.text == footer_text).collect();
+        assert_eq!(footer_blocks.len(), 3);
+        for b in &footer_blocks {
+            assert_eq!(
+                b.block_type,
+                BlockType::RunningFooter,
+                "Block on page {} should be RunningFooter",
+                b.page
+            );
+        }
+    }
+
+    /// Text appearing on only 2 pages must NOT be reclassified.
+    #[test]
+    fn test_two_pages_not_enough() {
+        let page_height = 792.0_f64;
+        let header_text = "Rare Header";
+
+        let mut blocks: Vec<TextBlock> = Vec::new();
+        for p in 0u32..2 {
+            blocks.push(make_anchor_block(p, page_height));
+            blocks.push(make_block_at(
+                header_text,
+                p,
+                page_height,
+                page_height - 12.0,
+                BlockType::BodyText,
+            ));
+        }
+
+        BlockClassifier::detect_repeated_headers_footers(&mut blocks);
+
+        for b in blocks.iter().filter(|b| b.text == header_text) {
+            assert_eq!(
+                b.block_type,
+                BlockType::BodyText,
+                "Block on page {} should remain BodyText (only 2 pages)",
+                b.page
+            );
+        }
     }
 }

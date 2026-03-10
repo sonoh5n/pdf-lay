@@ -35,7 +35,7 @@ impl Default for Config {
             image_output_dir: PathBuf::from("images"),
             image_format: ImageOutputFormat::Png,
             extract_images: true,
-            detect_tables: false, // enabled in Phase 2
+            detect_tables: true,
             table_config: TableConfig::default(),
             math_config: MathConfig::default(),
             caption_max_gap_pt: 50.0,
@@ -72,6 +72,9 @@ pub struct MarkdownConfig {
     pub table_as_image: bool,
     /// How to style figure captions in the Markdown output.
     pub figure_caption_style: CaptionStyle,
+    /// Optional math configuration for converting math spans at render time.
+    /// When `None`, math spans are output as plain `block.text` without conversion.
+    pub math_config: Option<MathConfig>,
 }
 
 impl Default for MarkdownConfig {
@@ -83,6 +86,7 @@ impl Default for MarkdownConfig {
             include_metadata_header: false,
             table_as_image: false,
             figure_caption_style: CaptionStyle::Italic,
+            math_config: None,
         }
     }
 }
@@ -273,7 +277,7 @@ mod tests {
         assert!((cfg.block_gap_multiplier - 1.8).abs() < f64::EPSILON);
         assert_eq!(cfg.column_detection_bin_width, 10.0);
         assert!(cfg.extract_images);
-        assert!(!cfg.detect_tables);
+        assert!(cfg.detect_tables);
     }
 
     #[test]

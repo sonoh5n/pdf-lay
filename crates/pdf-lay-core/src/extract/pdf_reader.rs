@@ -8,7 +8,7 @@ use std::path::Path;
 use pdf_oxide::document::PdfDocument;
 
 use crate::error::PdfLayError;
-use crate::types::{FontInfo, PageDimensions, PathObject, Rect, TextSpan};
+use crate::types::{FontInfo, PageDimensions, PathObject, PathType, Rect, TextSpan};
 
 /// A handle to an opened PDF document.
 ///
@@ -131,14 +131,52 @@ impl PdfReader {
 
     /// Extract path objects (lines and rectangles) for table rule detection.
     ///
-    /// Returns an empty `Vec` for now. Full implementation is Phase 2.
+    /// Reads vector graphics paths from the page content stream and converts them
+    /// into `PathObject` values with bounding boxes and type classifications.
+    ///
+    /// # PathType classification
+    ///
+    /// - `Horizontal`: height < 2.0 and width > 5.0 (horizontal rule)
+    /// - `Vertical`: width < 2.0 and height > 5.0 (vertical rule)
+    /// - `Rectangle`: width > 5.0 and height > 5.0 (potential table cell border)
+    /// - `Other`: everything else
     pub fn extract_paths(&mut self, page: u32) -> Result<Vec<PathObject>, PdfLayError> {
         let total = self.page_count();
         if page >= total {
             return Err(PdfLayError::PageOutOfRange(page, total));
         }
-        log::debug!("extract_paths: stub — returning empty for page {page}");
-        Ok(Vec::new())
+
+        let raw_paths = match self.inner.extract_paths(page as usize) {
+            Ok(paths) => paths,
+            Err(e) => {
+                log::warn!("extract_paths: failed for page {page}: {e}");
+                return Ok(Vec::new());
+            }
+        };
+
+        let mut result = Vec::with_capacity(raw_paths.len());
+        for raw in raw_paths {
+            if let Some(obj) = convert_path(raw, page) {
+                result.push(obj);
+            }
+        }
+
+        log::debug!(
+            "extract_paths: page {page} — {} path objects extracted",
+            result.len()
+        );
+        Ok(result)
+    }
+
+    /// Extract path objects from all pages.
+    ///
+    /// Pages that fail to extract are logged as warnings and skipped.
+    pub fn extract_all_paths(&mut self) -> Result<Vec<PathObject>, PdfLayError> {
+        let mut all = Vec::new();
+        for page in 0..self.page_count() {
+            all.extend(self.extract_paths(page)?);
+        }
+        Ok(all)
     }
 
     /// Returns a mutable reference to the underlying pdf_oxide document.
@@ -210,6 +248,88 @@ fn convert_span(raw: pdf_oxide::layout::TextSpan, page: u32) -> Option<TextSpan>
         bbox,
         page,
     })
+}
+
+/// Convert a single pdf_oxide `PathContent` to our `PathObject`.
+///
+/// Returns `None` for paths whose bounding box has non-positive dimensions
+/// or non-finite coordinates (degenerate paths that cannot be classified).
+///
+/// # Coordinate mapping
+///
+/// pdf_oxide stores path bounding boxes in PDF native coordinates (Y-up, origin at
+/// lower-left corner of the page).  The `Rect` fields are:
+///   - `x`      — left edge
+///   - `y`      — lower edge (bottom of bounding box in Y-up space)
+///   - `width`  — horizontal extent (always positive)
+///   - `height` — vertical extent (always positive, going up)
+///
+/// Our `Rect` uses the same Y-up convention and requires `top > bottom`:
+///   - `left`   = raw `x`
+///   - `right`  = raw `x + width`
+///   - `top`    = raw `y + height`  (upper edge, larger Y)
+///   - `bottom` = raw `y`           (lower edge, smaller Y)
+///
+/// # PathType classification
+///
+/// - `Horizontal`: height < 2.0 and width > 5.0
+/// - `Vertical`: width < 2.0 and height > 5.0
+/// - `Rectangle`: width > 5.0 and height > 5.0
+/// - `Other`: everything else
+fn convert_path(raw: pdf_oxide::elements::PathContent, page: u32) -> Option<PathObject> {
+    let ox = raw.bbox.x as f64;
+    let oy = raw.bbox.y as f64;
+    let ow = raw.bbox.width as f64;
+    let oh = raw.bbox.height as f64;
+
+    // Guard against non-finite or degenerate bboxes.
+    if !ox.is_finite() || !oy.is_finite() || !ow.is_finite() || !oh.is_finite() {
+        log::debug!("convert_path: skipping path with non-finite bbox on page {page}");
+        return None;
+    }
+    if ow < 0.0 || oh < 0.0 {
+        log::debug!("convert_path: skipping path with negative dimensions on page {page}");
+        return None;
+    }
+
+    // Map to our Y-up Rect.  When width or height is zero (a degenerate line),
+    // use max() to avoid violating the top >= bottom / right >= left invariant.
+    let left = ox;
+    let bottom = oy;
+    let right = (ox + ow).max(ox);
+    let top = (oy + oh).max(oy);
+
+    let bbox = Rect::new(left, top, right, bottom);
+    let width = bbox.width();
+    let height = bbox.height();
+
+    let path_type = classify_path(width, height);
+    let line_width = raw.stroke_width as f64;
+
+    Some(PathObject {
+        bbox,
+        page,
+        path_type,
+        line_width,
+    })
+}
+
+/// Classify a path based on its bounding box dimensions.
+///
+/// - `Horizontal`: height < 2.0 and width > 5.0
+/// - `Vertical`: width < 2.0 and height > 5.0
+/// - `Rectangle`: width > 5.0 and height > 5.0
+/// - `Other`: everything else
+fn classify_path(width: f64, height: f64) -> PathType {
+    if height < 2.0 && width > 5.0 {
+        PathType::Horizontal
+    } else if width < 2.0 && height > 5.0 {
+        PathType::Vertical
+    } else if width > 5.0 && height > 5.0 {
+        PathType::Rectangle
+    } else {
+        PathType::Other
+    }
 }
 
 #[cfg(test)]
@@ -337,5 +457,117 @@ mod tests {
         assert!(s.bbox.width() > 0.0);
         assert!(s.bbox.height() > 0.0);
         assert!(s.bbox.top > s.bbox.bottom);
+    }
+
+    // ---- convert_path / classify_path tests ----
+
+    fn make_path_content(
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        stroke_width: f32,
+    ) -> pdf_oxide::elements::PathContent {
+        pdf_oxide::elements::PathContent {
+            bbox: pdf_oxide::geometry::Rect::new(x, y, w, h),
+            operations: Vec::new(),
+            stroke_color: Some(pdf_oxide::layout::Color::new(0.0, 0.0, 0.0)),
+            fill_color: None,
+            stroke_width,
+            line_cap: pdf_oxide::elements::LineCap::Butt,
+            line_join: pdf_oxide::elements::LineJoin::Miter,
+            reading_order: None,
+        }
+    }
+
+    #[test]
+    fn classify_path_horizontal() {
+        // wide and thin → Horizontal
+        assert!(matches!(classify_path(100.0, 1.0), PathType::Horizontal));
+        // exactly at boundary: height == 1.9, width == 5.1
+        assert!(matches!(classify_path(5.1, 1.9), PathType::Horizontal));
+    }
+
+    #[test]
+    fn classify_path_vertical() {
+        // tall and thin → Vertical
+        assert!(matches!(classify_path(1.0, 100.0), PathType::Vertical));
+        // exactly at boundary: width == 1.9, height == 5.1
+        assert!(matches!(classify_path(1.9, 5.1), PathType::Vertical));
+    }
+
+    #[test]
+    fn classify_path_rectangle() {
+        // both dimensions large → Rectangle
+        assert!(matches!(classify_path(50.0, 20.0), PathType::Rectangle));
+        // at boundary: width == 5.1, height == 5.1
+        assert!(matches!(classify_path(5.1, 5.1), PathType::Rectangle));
+    }
+
+    #[test]
+    fn classify_path_other() {
+        // tiny square → Other
+        assert!(matches!(classify_path(2.0, 2.0), PathType::Other));
+        // zero dimensions → Other
+        assert!(matches!(classify_path(0.0, 0.0), PathType::Other));
+    }
+
+    #[test]
+    fn convert_path_horizontal_rule() {
+        // x=50, y=300, width=200, height=1 → horizontal line
+        let raw = make_path_content(50.0, 300.0, 200.0, 1.0, 0.5);
+        let obj = convert_path(raw, 2).expect("Should produce a PathObject");
+        assert_eq!(obj.page, 2);
+        assert_eq!(obj.bbox.left, 50.0);
+        assert_eq!(obj.bbox.right, 250.0);
+        assert_eq!(obj.bbox.bottom, 300.0);
+        assert_eq!(obj.bbox.top, 301.0);
+        assert!(obj.bbox.top >= obj.bbox.bottom, "top must be >= bottom");
+        assert!(matches!(obj.path_type, PathType::Horizontal));
+        assert_eq!(obj.line_width, 0.5);
+    }
+
+    #[test]
+    fn convert_path_vertical_rule() {
+        // x=100, y=200, width=1, height=100 → vertical line
+        let raw = make_path_content(100.0, 200.0, 1.0, 100.0, 1.0);
+        let obj = convert_path(raw, 0).expect("Should produce a PathObject");
+        assert_eq!(obj.bbox.left, 100.0);
+        assert_eq!(obj.bbox.right, 101.0);
+        assert_eq!(obj.bbox.bottom, 200.0);
+        assert_eq!(obj.bbox.top, 300.0);
+        assert!(matches!(obj.path_type, PathType::Vertical));
+    }
+
+    #[test]
+    fn convert_path_rectangle() {
+        // x=10, y=50, width=100, height=50 → rectangle
+        let raw = make_path_content(10.0, 50.0, 100.0, 50.0, 1.0);
+        let obj = convert_path(raw, 1).expect("Should produce a PathObject");
+        assert_eq!(obj.bbox.left, 10.0);
+        assert_eq!(obj.bbox.right, 110.0);
+        assert_eq!(obj.bbox.bottom, 50.0);
+        assert_eq!(obj.bbox.top, 100.0);
+        assert!(obj.bbox.top > obj.bbox.bottom, "top must exceed bottom");
+        assert!(matches!(obj.path_type, PathType::Rectangle));
+    }
+
+    #[test]
+    fn convert_path_degenerate_negative_dims_returns_none() {
+        // Negative width — should be skipped.
+        let raw = make_path_content(10.0, 10.0, -5.0, 10.0, 1.0);
+        assert!(convert_path(raw, 0).is_none());
+    }
+
+    #[test]
+    fn convert_path_zero_height_degenerate_line() {
+        // Zero height — a degenerate horizontal line (point on a line).
+        // Should still produce a PathObject (classified as Other since width may be > 5
+        // but height == 0 < 2 so Horizontal if width > 5).
+        let raw = make_path_content(10.0, 100.0, 50.0, 0.0, 1.0);
+        let obj = convert_path(raw, 0).expect("Should produce a PathObject for zero-height path");
+        assert_eq!(obj.bbox.top, obj.bbox.bottom); // degenerate
+        // width=50 > 5.0 and height=0 < 2.0 → Horizontal
+        assert!(matches!(obj.path_type, PathType::Horizontal));
     }
 }

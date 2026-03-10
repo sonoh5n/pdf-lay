@@ -2,8 +2,89 @@
 
 use std::collections::VecDeque;
 
-use crate::config::{CaptionStyle, MarkdownConfig};
-use crate::types::{BlockType, FigureInfo, PaperDocument, Section, TableInfo, TableRepresentation};
+use crate::config::{CaptionStyle, MarkdownConfig, MathConfig};
+use crate::math::{MathContext, MathConverter, MathDetector, MathFormatter};
+use crate::types::{
+    BlockType, FigureInfo, PaperDocument, Section, TableInfo, TableRepresentation, TextBlock,
+};
+
+/// Convert a block's text, replacing contiguous math spans with formatted math notation.
+///
+/// For each line in the block, math regions are detected using `detector`.
+/// Non-math spans are output as-is; math spans are converted via `converter` and
+/// wrapped with [`MathFormatter::format_for_markdown`].
+///
+/// When no math regions are found in a line, the line's span texts are concatenated
+/// without modification.
+fn convert_block_text_with_math(
+    block: &TextBlock,
+    detector: &MathDetector,
+    converter: &MathConverter,
+    config: &MathConfig,
+) -> String {
+    let mut result = String::new();
+
+    for (line_idx, line) in block.lines.iter().enumerate() {
+        if line_idx > 0 {
+            result.push('\n');
+        }
+
+        let math_regions = detector.detect_in_line(line);
+
+        if math_regions.is_empty() {
+            // No math in this line — concatenate span texts directly.
+            let line_text: String = line.spans.iter().map(|s| s.text.as_str()).collect();
+            result.push_str(&line_text);
+        } else {
+            // Rebuild the line, substituting math regions with formatted math.
+            let mut span_idx = 0usize;
+
+            for region in &math_regions {
+                // Output non-math spans that precede this region.
+                while span_idx < line.spans.len() {
+                    let span = &line.spans[span_idx];
+                    // Check whether this span is the start of the current region.
+                    let is_region_start = region
+                        .spans
+                        .first()
+                        .is_some_and(|rs| rs.bbox.left == span.bbox.left && rs.text == span.text);
+                    if is_region_start {
+                        break;
+                    }
+                    result.push_str(&span.text);
+                    span_idx += 1;
+                }
+
+                // Convert and format the math region.
+                let converted = converter.convert(&region.text, &region.spans);
+                let is_display = region.context == MathContext::Display;
+                let formatted = MathFormatter::format_for_markdown(
+                    &converted,
+                    is_display,
+                    region.equation_number.as_deref(),
+                    config,
+                );
+                result.push_str(&formatted);
+
+                // Advance past the math spans belonging to this region.
+                span_idx += region.spans.len();
+            }
+
+            // Output any remaining non-math spans after the last region.
+            while span_idx < line.spans.len() {
+                result.push_str(&line.spans[span_idx].text);
+                span_idx += 1;
+            }
+        }
+    }
+
+    // Fall back to block.text if lines are empty (defensive).
+    if result.is_empty() && !block.text.is_empty() {
+        return block.text.clone();
+    }
+
+    result
+}
 
 /// Generates Markdown from a [`PaperDocument`].
 pub struct MarkdownGenerator {
@@ -69,6 +150,14 @@ impl MarkdownGenerator {
             md.push_str(&format!("<!-- page {} -->\n\n", section.page_range.0));
         }
 
+        // Prepare math detector/converter if math_config is set.
+        let math_components = self.config.math_config.as_ref().map(|mc| {
+            (
+                MathDetector::new(mc.clone()),
+                MathConverter::new(mc.clone()),
+            )
+        });
+
         // Iterate blocks; insert figures/tables at their insertion_point.
         let mut figure_queue: VecDeque<&FigureInfo> = section.figures.iter().collect();
         let mut table_queue: VecDeque<&TableInfo> = section.tables.iter().collect();
@@ -81,7 +170,17 @@ impl MarkdownGenerator {
                 | BlockType::RunningHeader
                 | BlockType::RunningFooter => continue,
                 _ => {
-                    md.push_str(&block.text);
+                    let text = if let Some((ref detector, ref converter)) = math_components {
+                        let mc = self
+                            .config
+                            .math_config
+                            .as_ref()
+                            .expect("math_config present");
+                        convert_block_text_with_math(block, detector, converter, mc)
+                    } else {
+                        block.text.clone()
+                    };
+                    md.push_str(&text);
                     md.push_str("\n\n");
                 }
             }
@@ -179,10 +278,10 @@ impl MarkdownGenerator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{CaptionStyle, MarkdownConfig};
+    use crate::config::{CaptionStyle, MarkdownConfig, MathConfig, MathRepresentationPreference};
     use crate::types::{
         BlockType, DocumentMetadata, FigureInfo, ImageFormat, ImageInfo, InsertionPoint,
-        PaperDocument, Rect, Section, SectionHeader, TextBlock,
+        PaperDocument, Rect, Section, SectionHeader, TextBlock, TextLine,
     };
     use std::path::PathBuf;
 
@@ -194,6 +293,7 @@ mod tests {
             include_metadata_header: false,
             table_as_image: false,
             figure_caption_style: CaptionStyle::Italic,
+            math_config: None,
         }
     }
 
@@ -338,6 +438,160 @@ mod tests {
             output.contains("### Child"),
             "Expected '### Child' in:\n{}",
             output
+        );
+    }
+
+    // ---- Math integration tests -------------------------------------------
+
+    /// Build a TextBlock that contains a single line with one CM-font (math) span.
+    fn make_math_block(math_text: &str, font_name: &str) -> TextBlock {
+        use crate::types::TextSpan;
+
+        let span = TextSpan {
+            text: math_text.to_string(),
+            font_name: font_name.to_string(),
+            font_size: 10.0,
+            is_bold: false,
+            is_italic: true,
+            bbox: Rect::new(100.0, 700.0, 150.0, 690.0),
+            page: 0,
+        };
+        let line = TextLine {
+            text: math_text.to_string(),
+            spans: vec![span],
+            bbox: Rect::new(100.0, 700.0, 150.0, 690.0),
+            page: 0,
+            baseline_y: 690.0,
+            primary_font_size: 10.0,
+            primary_font_name: font_name.to_string(),
+            is_bold: false,
+        };
+        TextBlock {
+            global_index: 0,
+            lines: vec![line],
+            text: math_text.to_string(),
+            bbox: Rect::new(100.0, 700.0, 150.0, 690.0),
+            page: 0,
+            column_index: 0,
+            block_type: BlockType::BodyText,
+        }
+    }
+
+    /// Build a TextBlock with a mixed line: one plain text span followed by one CM math span.
+    fn make_mixed_block(plain_text: &str, math_text: &str, math_font: &str) -> TextBlock {
+        use crate::types::TextSpan;
+
+        let plain_span = TextSpan {
+            text: plain_text.to_string(),
+            font_name: "TimesNewRoman".to_string(),
+            font_size: 10.0,
+            is_bold: false,
+            is_italic: false,
+            bbox: Rect::new(50.0, 700.0, 95.0, 690.0),
+            page: 0,
+        };
+        let math_span = TextSpan {
+            text: math_text.to_string(),
+            font_name: math_font.to_string(),
+            font_size: 10.0,
+            is_bold: false,
+            is_italic: true,
+            bbox: Rect::new(100.0, 700.0, 145.0, 690.0),
+            page: 0,
+        };
+        let full_text = format!("{plain_text}{math_text}");
+        let line = TextLine {
+            text: full_text.clone(),
+            spans: vec![plain_span, math_span],
+            bbox: Rect::new(50.0, 700.0, 145.0, 690.0),
+            page: 0,
+            baseline_y: 690.0,
+            primary_font_size: 10.0,
+            primary_font_name: "TimesNewRoman".to_string(),
+            is_bold: false,
+        };
+        TextBlock {
+            global_index: 0,
+            lines: vec![line],
+            text: full_text,
+            bbox: Rect::new(50.0, 700.0, 145.0, 690.0),
+            page: 0,
+            column_index: 0,
+            block_type: BlockType::BodyText,
+        }
+    }
+
+    /// A section that holds a pre-built block.
+    fn section_with_block(block: TextBlock) -> Section {
+        Section {
+            header: None,
+            level: 1,
+            blocks: vec![block],
+            figures: vec![],
+            tables: vec![],
+            children: vec![],
+            page_range: (0, 0),
+        }
+    }
+
+    #[test]
+    fn test_math_inline_in_markdown() {
+        // A block with a mixed line: plain text span + CM math font span.
+        // The math span is Inline (not all-math), so the output should contain `$\alpha$`.
+        let mut config = default_config();
+        config.math_config = Some(MathConfig {
+            representation: MathRepresentationPreference::LaTeX,
+            ..MathConfig::default()
+        });
+        let mdgen = MarkdownGenerator::new(config);
+        // Mixed block: "where " (plain) + "α" (CMMI10 math) → Inline context.
+        let block = make_mixed_block("where ", "α", "CMMI10");
+        let section = section_with_block(block);
+        let output = mdgen.generate_for_sections(&[&section]);
+        assert!(
+            output.contains("$\\alpha$"),
+            "Expected inline math '$\\alpha$' in:\n{output}"
+        );
+    }
+
+    #[test]
+    fn test_math_display_in_markdown() {
+        // A block whose single line contains only CM math spans — the whole
+        // line is classified as Display math, so the output should use `$$`.
+        let mut config = default_config();
+        config.math_config = Some(MathConfig {
+            representation: MathRepresentationPreference::LaTeX,
+            ..MathConfig::default()
+        });
+        let mdgen = MarkdownGenerator::new(config);
+        // Pure-math block (all spans CM → Display context).
+        let block = make_math_block("α", "CMMI10");
+        let section = section_with_block(block);
+        let output = mdgen.generate_for_sections(&[&section]);
+        // All-math single-span line → Display → $$ delimiters.
+        assert!(
+            output.contains("$$"),
+            "Expected display math '$$' delimiters in:\n{output}"
+        );
+    }
+
+    #[test]
+    fn test_no_math_passthrough() {
+        // When math_config is None the block text should be passed through unchanged.
+        let config = default_config(); // math_config is None
+        let mdgen = MarkdownGenerator::new(config);
+        let block = make_mixed_block("where ", "α", "TimesNewRoman");
+        let expected_text = block.text.clone();
+        let section = section_with_block(block);
+        let output = mdgen.generate_for_sections(&[&section]);
+        assert!(
+            output.contains(&expected_text),
+            "Expected plain text passthrough '{expected_text}' in:\n{output}"
+        );
+        // No math delimiters when math_config is None.
+        assert!(
+            !output.contains("$\\alpha$"),
+            "Should not contain math delimiters when math_config is None"
         );
     }
 }
