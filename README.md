@@ -79,7 +79,7 @@ To install a specific version or to a custom directory:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/sonoh5n/pdf-lay/main/scripts/install.sh \
-  | sh -s -- --version v0.1.0-rc.1 --dir /usr/local/bin
+  | sh -s -- --version v0.1.0-rc.2 --dir /usr/local/bin
 ```
 
 ### CLI (from source)

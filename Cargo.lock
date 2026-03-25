@@ -1197,7 +1197,7 @@ checksum = "35fb2e5f958ec131621fdd531e9fc186ed768cbe395337403ae56c17a74c68ec"
 
 [[package]]
 name = "pdf-lay"
-version = "0.1.0-rc.1"
+version = "0.1.0-rc.2"
 dependencies = [
  "pdf-lay-core",
  "serde_json",
@@ -1205,7 +1205,7 @@ dependencies = [
 
 [[package]]
 name = "pdf-lay-cli"
-version = "0.1.0-rc.1"
+version = "0.1.0-rc.2"
 dependencies = [
  "clap",
  "env_logger",
@@ -1215,7 +1215,7 @@ dependencies = [
 
 [[package]]
 name = "pdf-lay-core"
-version = "0.1.0-rc.1"
+version = "0.1.0-rc.2"
 dependencies = [
  "image 0.25.9",
  "log",
@@ -1271,7 +1271,7 @@ dependencies = [
 
 [[package]]
 name = "pdflay-python"
-version = "0.1.0-rc.1"
+version = "0.1.0-rc.2"
 dependencies = [
  "pdf-lay-core",
  "pyo3",

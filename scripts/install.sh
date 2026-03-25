@@ -13,7 +13,7 @@ Usage:
   install.sh [--version <tag>] [--dir <path>]
 
 Options:
-  --version <tag>  Install a specific tag like v0.1.0-rc.1.
+  --version <tag>  Install a specific tag like v0.1.0-rc.2.
                    Defaults to the latest release.
   --dir <path>     Destination directory for the binary.
                    Defaults to $PDF_LAY_INSTALL_DIR or $HOME/.local/bin.
