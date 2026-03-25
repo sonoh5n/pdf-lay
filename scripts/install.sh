@@ -87,6 +87,17 @@ need_cmd tar
 need_cmd mktemp
 need_cmd install
 
+verify_checksum() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    (cd "$1" && sha256sum -c "$2")
+  elif command -v shasum >/dev/null 2>&1; then
+    (cd "$1" && shasum -a 256 -c "$2")
+  else
+    log "Warning: no sha256sum or shasum found, skipping checksum verification"
+    return 0
+  fi
+}
+
 TARGET=$(detect_target)
 ARCHIVE="${BIN_NAME}-${TARGET}.tar.gz"
 
@@ -96,7 +107,7 @@ else
   DOWNLOAD_URL="https://github.com/${OWNER_REPO}/releases/latest/download/${ARCHIVE}"
 fi
 
-TMP_DIR=$(mktemp -d)
+TMP_DIR=$(mktemp -d 2>/dev/null || mktemp -d -t pdf-lay)
 cleanup() {
   rm -rf "$TMP_DIR"
 }
@@ -104,8 +115,22 @@ trap cleanup EXIT INT TERM
 
 mkdir -p "$INSTALL_DIR"
 
+CHECKSUM_FILE="${ARCHIVE}.sha256"
+if [ -n "$VERSION" ]; then
+  CHECKSUM_URL="https://github.com/${OWNER_REPO}/releases/download/${VERSION}/${CHECKSUM_FILE}"
+else
+  CHECKSUM_URL="https://github.com/${OWNER_REPO}/releases/latest/download/${CHECKSUM_FILE}"
+fi
+
 log "Downloading ${DOWNLOAD_URL}"
 curl -fL "$DOWNLOAD_URL" -o "$TMP_DIR/$ARCHIVE"
+
+if curl -fsSL "$CHECKSUM_URL" -o "$TMP_DIR/$CHECKSUM_FILE" 2>/dev/null; then
+  log "Verifying checksum"
+  verify_checksum "$TMP_DIR" "$CHECKSUM_FILE" || fail "checksum verification failed"
+else
+  log "Warning: checksum file not found, skipping verification"
+fi
 
 log "Extracting ${ARCHIVE}"
 tar -xzf "$TMP_DIR/$ARCHIVE" -C "$TMP_DIR"

@@ -1,6 +1,6 @@
 # pdf-lay
 
-![ovewview](./assets/overview.png)
+![overview](./assets/overview.png)
 
 `pdf-lay` is a Rust-first PDF layout analysis tool for academic papers.
 It extracts section structure, figures, tables, and metadata, then converts
@@ -8,9 +8,9 @@ them into representations that are easier to use in LLM and RAG pipelines.
 
 This repository contains:
 
-- `pdf-lay`: public Rust library
-- `pdf-lay`: CLI binary
-- `pdflay`: Python binding built with PyO3
+- `pdf-lay` Rust library crate
+- `pdf-lay-cli` crate providing the `pdf-lay` CLI binary
+- `pdflay` Python package: bindings to `pdf-lay` built with PyO3
 
 > Status: under active development. The CLI is still experimental, and command
 > names or options may change. The current documented commands are `toc` and
@@ -67,16 +67,29 @@ modeling and machine translation.
 - Python 3.9+ for `pdflay`
 - `maturin` or `uvx maturin` for the Python binding
 
-### CLI
+### CLI (prebuilt binary)
 
-Install the current CLI from source:
+Download and install the latest release with the install script:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sonoh5n/pdf-lay/main/scripts/install.sh | sh
+```
+
+To install a specific version or to a custom directory:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/sonoh5n/pdf-lay/main/scripts/install.sh \
+  | sh -s -- --version v0.1.0-rc.1 --dir /usr/local/bin
+```
+
+### CLI (from source)
 
 ```bash
 cargo install --path crates/pdf-lay-cli
 pdf-lay --help
 ```
 
-Run it without installing:
+Run without installing:
 
 ```bash
 cargo run -p pdf-lay-cli -- --help

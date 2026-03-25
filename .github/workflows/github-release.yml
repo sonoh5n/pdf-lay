@@ -65,6 +65,13 @@ jobs:
       - name: List release assets
         run: ls -lhR dist/
 
+      - name: Generate checksums
+        run: |
+          cd dist
+          for f in *.tar.gz *.zip; do
+            [ -f "$f" ] && sha256sum "$f" > "${f}.sha256"
+          done
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
