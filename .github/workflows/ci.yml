@@ -76,7 +76,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Install maturin
-        run: pip install maturin
+        run: pip install maturin==1.8.3
 
       - name: Build Python wheel
         run: maturin build --release -m crates/pdflay-python/Cargo.toml

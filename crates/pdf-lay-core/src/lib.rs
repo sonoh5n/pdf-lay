@@ -35,7 +35,7 @@ pub mod test_helpers;
 
 pub use config::{
     CaptionStyle, ChunkConfig, Config, FigureTextFormat, LlmTextConfig, MarkdownConfig, MathConfig,
-    MathRepresentationPreference, SplitStrategy, TableConfig,
+    MathRepresentationPreference, ResourceLimits, SplitStrategy, TableConfig,
 };
 pub use error::{AnalysisResult, PdfLayError, PdfLayWarning};
 pub use math::{
