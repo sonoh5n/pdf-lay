@@ -1197,7 +1197,7 @@ checksum = "35fb2e5f958ec131621fdd531e9fc186ed768cbe395337403ae56c17a74c68ec"
 
 [[package]]
 name = "pdf-lay"
-version = "0.1.0"
+version = "0.1.0-rc.1"
 dependencies = [
  "pdf-lay-core",
  "serde_json",
@@ -1205,7 +1205,7 @@ dependencies = [
 
 [[package]]
 name = "pdf-lay-cli"
-version = "0.1.0"
+version = "0.1.0-rc.1"
 dependencies = [
  "clap",
  "env_logger",
@@ -1215,7 +1215,7 @@ dependencies = [
 
 [[package]]
 name = "pdf-lay-core"
-version = "0.1.0"
+version = "0.1.0-rc.1"
 dependencies = [
  "image 0.25.9",
  "log",
@@ -1271,7 +1271,7 @@ dependencies = [
 
 [[package]]
 name = "pdflay-python"
-version = "0.1.0"
+version = "0.1.0-rc.1"
 dependencies = [
  "pdf-lay-core",
  "pyo3",
@@ -1443,6 +1443,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94f6cbe86ef3bf18998d9df6e0f3fc1050a8c5efa409bf712e661a4366e010fb"
 dependencies = [
  "once_cell",
+ "python3-dll-a",
  "target-lexicon",
 ]
 
@@ -1479,6 +1480,15 @@ dependencies = [
  "pyo3-build-config",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "python3-dll-a"
+version = "0.2.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d381ef313ae70b4da5f95f8a4de773c6aa5cd28f73adec4b4a31df70b66780d8"
+dependencies = [
+ "cc",
 ]
 
 [[package]]
