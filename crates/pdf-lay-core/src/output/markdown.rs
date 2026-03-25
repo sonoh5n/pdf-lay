@@ -279,19 +279,17 @@ impl MarkdownGenerator {
 
         match self.config.figure_caption_style {
             CaptionStyle::Italic => {
-                md.push_str(&format!("*{}*\n\n", escape_for_markdown_text(&fig.caption_text)));
+                let safe = escape_for_markdown_text(&fig.caption_text);
+                md.push_str(&format!("*{safe}*\n\n"));
             }
             CaptionStyle::Bold => {
                 // Bold the figure_id prefix, remainder as plain text.
-                let description = fig.caption_description();
-                md.push_str(&format!(
-                    "**{}** {}\n\n",
-                    safe_id,
-                    escape_for_markdown_text(description)
-                ));
+                let safe_desc = escape_for_markdown_text(fig.caption_description());
+                md.push_str(&format!("**{safe_id}** {safe_desc}\n\n"));
             }
             CaptionStyle::PlainText => {
-                md.push_str(&format!("{}\n\n", escape_for_markdown_text(&fig.caption_text)));
+                let safe = escape_for_markdown_text(&fig.caption_text);
+                md.push_str(&format!("{safe}\n\n"));
             }
         }
     }
