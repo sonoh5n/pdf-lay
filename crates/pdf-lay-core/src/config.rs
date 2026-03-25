@@ -27,6 +27,8 @@ pub struct Config {
     pub block_gap_multiplier: f64,
     /// Configuration for section header detection scoring.
     pub header_detection: HeaderDetectionConfig,
+    /// Resource limits to guard against excessively large inputs.
+    pub resource_limits: ResourceLimits,
 }
 
 impl Default for Config {
@@ -42,6 +44,7 @@ impl Default for Config {
             column_detection_bin_width: 10.0,
             block_gap_multiplier: 1.8,
             header_detection: HeaderDetectionConfig::default(),
+            resource_limits: ResourceLimits::default(),
         }
     }
 }
@@ -185,6 +188,24 @@ impl Default for HeaderDetectionConfig {
             min_score: 4,
             max_chars: 120,
             max_lines: 3,
+        }
+    }
+}
+
+/// Resource limits to guard against excessively large PDF inputs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ResourceLimits {
+    /// Maximum input file size in bytes (default: 200 MB).
+    pub max_file_size: u64,
+    /// Maximum number of pages to process (default: 2000).
+    pub max_pages: u32,
+}
+
+impl Default for ResourceLimits {
+    fn default() -> Self {
+        Self {
+            max_file_size: 200 * 1024 * 1024, // 200 MB
+            max_pages: 2000,
         }
     }
 }

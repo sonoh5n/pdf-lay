@@ -28,8 +28,30 @@ pub fn analyze_pdf(path: &Path, config: &Config) -> Result<AnalysisResult, PdfLa
 
     // ---- Phase 1: Extract ----
 
+    // ---- Resource limit checks ----
+
+    let file_size = std::fs::metadata(path)
+        .map_err(|_| PdfLayError::FileNotFound(path.to_path_buf()))?
+        .len();
+    if file_size > config.resource_limits.max_file_size {
+        return Err(PdfLayError::ResourceLimitExceeded {
+            limit: format!(
+                "max file size {} bytes",
+                config.resource_limits.max_file_size
+            ),
+            actual: format!("{file_size} bytes"),
+        });
+    }
+
     let mut reader = PdfReader::open(path)?;
     let page_count = reader.page_count();
+
+    if page_count > config.resource_limits.max_pages {
+        return Err(PdfLayError::ResourceLimitExceeded {
+            limit: format!("max pages {}", config.resource_limits.max_pages),
+            actual: format!("{page_count} pages"),
+        });
+    }
 
     // Extract all text spans.
     let raw_spans = reader.extract_all_text_spans()?;
@@ -275,6 +297,17 @@ fn determine_table_insertion(region: &TableRegion, _blocks: &[TextBlock]) -> Ins
 ///
 /// Writes the bytes to a temporary file then delegates to [`analyze_pdf`].
 pub fn analyze_pdf_bytes(bytes: &[u8], config: &Config) -> Result<AnalysisResult, PdfLayError> {
+    let byte_len = bytes.len() as u64;
+    if byte_len > config.resource_limits.max_file_size {
+        return Err(PdfLayError::ResourceLimitExceeded {
+            limit: format!(
+                "max file size {} bytes",
+                config.resource_limits.max_file_size
+            ),
+            actual: format!("{byte_len} bytes"),
+        });
+    }
+
     use std::io::Write as _;
     let mut tmp = tempfile::NamedTempFile::new()?;
     tmp.write_all(bytes)?;
@@ -313,5 +346,24 @@ mod tests {
         for s in &doc.sections {
             println!("  [L{}] {}", s.level, s.header_text());
         }
+    }
+
+    #[test]
+    fn analyze_pdf_bytes_rejects_oversized_input() {
+        use crate::config::ResourceLimits;
+
+        let config = Config {
+            resource_limits: ResourceLimits {
+                max_file_size: 10, // 10 bytes
+                max_pages: 2000,
+            },
+            ..Default::default()
+        };
+        let big_bytes = vec![0u8; 100];
+        let result = analyze_pdf_bytes(&big_bytes, &config);
+        assert!(
+            matches!(result, Err(PdfLayError::ResourceLimitExceeded { .. })),
+            "Expected ResourceLimitExceeded, got: {result:?}"
+        );
     }
 }

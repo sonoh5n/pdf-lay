@@ -16,6 +16,11 @@ use crate::types::{
 ///
 /// When no math regions are found in a line, the line's span texts are concatenated
 /// without modification.
+/// Convert a block's text, replacing contiguous math spans with formatted math notation.
+///
+/// Non-math spans are sanitized via [`escape_for_markdown_text`] so that PDF-derived
+/// text cannot inject HTML or Markdown structures, while math regions are left
+/// unescaped so that `$...$` / `$$...$$` delimiters and LaTeX commands remain valid.
 fn convert_block_text_with_math(
     block: &TextBlock,
     detector: &MathDetector,
@@ -32,15 +37,15 @@ fn convert_block_text_with_math(
         let math_regions = detector.detect_in_line(line);
 
         if math_regions.is_empty() {
-            // No math in this line — concatenate span texts directly.
+            // No math in this line — concatenate span texts and sanitize.
             let line_text: String = line.spans.iter().map(|s| s.text.as_str()).collect();
-            result.push_str(&line_text);
+            result.push_str(&escape_for_markdown_text(&line_text));
         } else {
             // Rebuild the line, substituting math regions with formatted math.
             let mut span_idx = 0usize;
 
             for region in &math_regions {
-                // Output non-math spans that precede this region.
+                // Output non-math spans that precede this region (sanitized).
                 while span_idx < line.spans.len() {
                     let span = &line.spans[span_idx];
                     // Check whether this span is the start of the current region.
@@ -51,11 +56,12 @@ fn convert_block_text_with_math(
                     if is_region_start {
                         break;
                     }
-                    result.push_str(&span.text);
+                    result.push_str(&escape_for_markdown_text(&span.text));
                     span_idx += 1;
                 }
 
-                // Convert and format the math region.
+                // Convert and format the math region (NOT escaped — math content
+                // must preserve LaTeX operators like < > &).
                 let converted = converter.convert(&region.text, &region.spans);
                 let is_display = region.context == MathContext::Display;
                 let formatted = MathFormatter::format_for_markdown(
@@ -70,9 +76,9 @@ fn convert_block_text_with_math(
                 span_idx += region.spans.len();
             }
 
-            // Output any remaining non-math spans after the last region.
+            // Output any remaining non-math spans after the last region (sanitized).
             while span_idx < line.spans.len() {
-                result.push_str(&line.spans[span_idx].text);
+                result.push_str(&escape_for_markdown_text(&line.spans[span_idx].text));
                 span_idx += 1;
             }
         }
@@ -80,10 +86,38 @@ fn convert_block_text_with_math(
 
     // Fall back to block.text if lines are empty (defensive).
     if result.is_empty() && !block.text.is_empty() {
-        return block.text.clone();
+        return escape_for_markdown_text(&block.text);
     }
 
     result
+}
+
+/// Escape a string for use inside a double-quoted YAML value.
+///
+/// Handles `"`, `\`, and control characters that could break YAML parsing.
+fn escape_for_yaml_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+/// Escape a string for safe inclusion in Markdown body text or headings.
+///
+/// Neutralizes HTML tags (`<` / `>`) and Markdown link injection (`](`).
+fn escape_for_markdown_text(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace("](", "]\\(")
 }
 
 /// Generates Markdown from a [`PaperDocument`].
@@ -124,12 +158,12 @@ impl MarkdownGenerator {
     fn generate_front_matter(&self, metadata: &crate::types::DocumentMetadata) -> String {
         let mut fm = String::from("---\n");
         if let Some(title) = &metadata.title {
-            fm.push_str(&format!("title: \"{}\"\n", title.replace('"', "\\\"")));
+            fm.push_str(&format!("title: \"{}\"\n", escape_for_yaml_value(title)));
         }
         if !metadata.authors.is_empty() {
             fm.push_str("authors:\n");
             for author in &metadata.authors {
-                fm.push_str(&format!("  - \"{}\"\n", author.replace('"', "\\\"")));
+                fm.push_str(&format!("  - \"{}\"\n", escape_for_yaml_value(author)));
             }
         }
         fm.push_str("---\n\n");
@@ -142,7 +176,11 @@ impl MarkdownGenerator {
             let raw_level = (header.level as usize) + (self.config.heading_offset as usize);
             let level = raw_level.clamp(1, 6);
             let prefix = "#".repeat(level);
-            md.push_str(&format!("{} {}\n\n", prefix, header.clean_text));
+            md.push_str(&format!(
+                "{} {}\n\n",
+                prefix,
+                escape_for_markdown_text(&header.clean_text)
+            ));
         }
 
         // Optional page number comment.
@@ -176,9 +214,11 @@ impl MarkdownGenerator {
                             .math_config
                             .as_ref()
                             .expect("math_config present");
+                        // Escaping is applied inside convert_block_text_with_math
+                        // to non-math spans only, preserving math delimiters.
                         convert_block_text_with_math(block, detector, converter, mc)
                     } else {
-                        block.text.clone()
+                        escape_for_markdown_text(&block.text)
                     };
                     md.push_str(&text);
                     md.push_str("\n\n");
@@ -234,26 +274,29 @@ impl MarkdownGenerator {
             format!("{}/{}", self.config.image_base_path, filename)
         };
 
-        md.push_str(&format!("![{}]({})\n\n", fig.figure_id, path));
+        let safe_id = escape_for_markdown_text(&fig.figure_id);
+        md.push_str(&format!("![{}]({})\n\n", safe_id, path));
 
         match self.config.figure_caption_style {
             CaptionStyle::Italic => {
-                md.push_str(&format!("*{}*\n\n", fig.caption_text));
+                let safe = escape_for_markdown_text(&fig.caption_text);
+                md.push_str(&format!("*{safe}*\n\n"));
             }
             CaptionStyle::Bold => {
                 // Bold the figure_id prefix, remainder as plain text.
-                let description = fig.caption_description();
-                md.push_str(&format!("**{}** {}\n\n", fig.figure_id, description));
+                let safe_desc = escape_for_markdown_text(fig.caption_description());
+                md.push_str(&format!("**{safe_id}** {safe_desc}\n\n"));
             }
             CaptionStyle::PlainText => {
-                md.push_str(&format!("{}\n\n", fig.caption_text));
+                let safe = escape_for_markdown_text(&fig.caption_text);
+                md.push_str(&format!("{safe}\n\n"));
             }
         }
     }
 
     fn write_table(&self, md: &mut String, table: &TableInfo) {
         if let Some(caption) = &table.caption {
-            md.push_str(&format!("**{}**\n\n", caption));
+            md.push_str(&format!("**{}**\n\n", escape_for_markdown_text(caption)));
         }
 
         match &table.representation {
@@ -592,6 +635,156 @@ mod tests {
         assert!(
             !output.contains("$\\alpha$"),
             "Should not contain math delimiters when math_config is None"
+        );
+    }
+
+    // ---- Sanitization tests ---------------------------------------------------
+
+    #[test]
+    fn escape_yaml_value_handles_special_chars() {
+        assert_eq!(
+            escape_for_yaml_value(r#"A "title" with \ and tabs	"#),
+            r#"A \"title\" with \\ and tabs\t"#
+        );
+        assert_eq!(escape_for_yaml_value("line1\nline2"), "line1\\nline2");
+    }
+
+    #[test]
+    fn escape_markdown_text_neutralizes_html() {
+        assert_eq!(
+            escape_for_markdown_text("<script>alert(1)</script>"),
+            "&lt;script&gt;alert(1)&lt;/script&gt;"
+        );
+    }
+
+    #[test]
+    fn escape_markdown_text_prevents_link_injection() {
+        assert_eq!(
+            escape_for_markdown_text("click [here](http://evil.com)"),
+            "click [here]\\(http://evil.com)"
+        );
+    }
+
+    #[test]
+    fn front_matter_escapes_yaml_injection() {
+        let mut config = default_config();
+        config.include_metadata_header = true;
+        let mdgen = MarkdownGenerator::new(config);
+        let doc = PaperDocument {
+            paper_id: "test".to_string(),
+            source_file: PathBuf::from("test.pdf"),
+            metadata: DocumentMetadata {
+                pages: 1,
+                title: Some("evil\"\n  injected: true".to_string()),
+                authors: vec![],
+                ..Default::default()
+            },
+            sections: vec![],
+            all_figures: vec![],
+            all_tables: vec![],
+        };
+        let output = mdgen.generate(&doc);
+        // The raw newline must be escaped so "injected: true" stays inside the
+        // YAML string value rather than becoming a separate key.
+        assert!(
+            output.contains(r#"title: "evil\"#),
+            "Quotes should be escaped in YAML value:\n{output}"
+        );
+        // The literal two-char sequence \n should appear instead of a real newline
+        // between "evil..." and "injected".
+        assert!(
+            output.contains("\\n"),
+            "Newlines should be escaped:\n{output}"
+        );
+        // The value must remain on one line (no raw newline inside the title field)
+        for line in output.lines() {
+            if line.trim_start().starts_with("title:") {
+                assert!(
+                    line.contains("injected: true"),
+                    "Injected text should be contained within the title value, not a separate key:\n{output}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn body_text_escapes_html_tags() {
+        let mdgen = MarkdownGenerator::new(default_config());
+        let section = make_section("SEC", "Hello <img src=x onerror=alert(1)>", 1);
+        let output = mdgen.generate_for_sections(&[&section]);
+        assert!(
+            !output.contains("<img"),
+            "HTML tags should be escaped:\n{output}"
+        );
+        assert!(output.contains("&lt;img"));
+    }
+
+    #[test]
+    fn section_header_escapes_html() {
+        let mdgen = MarkdownGenerator::new(default_config());
+        let section = make_section("<script>alert(1)</script>", "Body.", 1);
+        let output = mdgen.generate_for_sections(&[&section]);
+        assert!(
+            !output.contains("<script>"),
+            "Script tags in headers should be escaped:\n{output}"
+        );
+    }
+
+    #[test]
+    fn escape_markdown_text_handles_ampersand() {
+        assert_eq!(escape_for_markdown_text("A & B"), "A &amp; B");
+    }
+
+    #[test]
+    fn math_delimiters_not_escaped_in_mixed_block() {
+        // When math_config is enabled, the `$...$` delimiters and LaTeX
+        // operators like `<` inside math must NOT be HTML-escaped.
+        let mut config = default_config();
+        config.math_config = Some(MathConfig {
+            representation: MathRepresentationPreference::LaTeX,
+            ..MathConfig::default()
+        });
+        let mdgen = MarkdownGenerator::new(config);
+        // Mixed block: "where " (plain) + "α" (CMMI10 math) → Inline context.
+        let block = make_mixed_block("where ", "α", "CMMI10");
+        let section = section_with_block(block);
+        let output = mdgen.generate_for_sections(&[&section]);
+        // Math should remain intact — $ delimiters should not be mangled.
+        assert!(
+            output.contains("$\\alpha$"),
+            "Math delimiters must not be escaped:\n{output}"
+        );
+        // But non-math text should still be there.
+        assert!(
+            output.contains("where "),
+            "Non-math text should be preserved:\n{output}"
+        );
+    }
+
+    #[test]
+    fn html_in_non_math_span_escaped_with_math_enabled() {
+        // Even with math enabled, non-math text must be sanitized.
+        let mut config = default_config();
+        config.math_config = Some(MathConfig {
+            representation: MathRepresentationPreference::LaTeX,
+            ..MathConfig::default()
+        });
+        let mdgen = MarkdownGenerator::new(config);
+        let block = make_mixed_block("<script>evil</script> ", "α", "CMMI10");
+        let section = section_with_block(block);
+        let output = mdgen.generate_for_sections(&[&section]);
+        assert!(
+            !output.contains("<script>"),
+            "HTML in non-math text must be escaped even with math enabled:\n{output}"
+        );
+        assert!(
+            output.contains("&lt;script&gt;"),
+            "HTML should be entity-escaped:\n{output}"
+        );
+        // Math part should still work.
+        assert!(
+            output.contains("$\\alpha$"),
+            "Math should still be rendered:\n{output}"
         );
     }
 }

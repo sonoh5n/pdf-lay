@@ -1,116 +1,157 @@
 # pdf-lay
 
-`pdf-lay` is a Rust-first PDF layout analysis library for academic papers.
-It extracts text, sections, figures, tables, and metadata into a structured
-intermediate representation suitable for LLM pipelines.
+![overview](./assets/overview.png)
 
-This repository provides:
+`pdf-lay` is a Rust-first PDF layout analysis tool for academic papers.
+It extracts section structure, figures, tables, and metadata, then converts
+them into representations that are easier to use in LLM and RAG pipelines.
 
-- Rust library crate: `pdf-lay`
-- CLI binary: `pdf-lay`
-- Python extension module (PyO3): `pdflay`
+This repository contains:
 
-## Workspace Layout
+- `pdf-lay` Rust library crate
+- `pdf-lay-cli` crate providing the `pdf-lay` CLI binary
+- `pdflay` Python package: bindings to `pdf-lay` built with PyO3
+
+> Status: under active development. The CLI is still experimental, and command
+> names or options may change. The current documented commands are `toc` and
+> `markdown`.
+
+### Example Output
+
+Using the sample paper [`arxiv.org - 1706.03762v7`](https://arxiv.org/abs/1706.03762),
+`pdf-lay` converts a PDF into a structured table of contents and Markdown.
+
+Example TOC output:
 
 ```text
-crates/pdf-lay-core     internal core crate
-crates/pdf-lay          public Rust API (re-export facade)
-crates/pdf-lay-cli      CLI binary
-crates/pdflay-python    Python bindings (maturin)
-tests/                  integration tests and fixtures
+[1] Attention Is All You Need  p.1-1  ~102 tokens
+[1] Abstract  p.1-1  ~564 tokens
+[1] 1 Introduction  p.2-2  ~475 tokens
+[1] 2 Background  p.2-3  ~970 tokens
+  [2] Attention  p.3-4  ~478 tokens
+    [3] Multi-Head Attention  p.4-5  ~815 tokens
+[1] 6 Results  p.8-8  ~0 tokens
+  [2] Machine Translation  p.8-10  ~1456 tokens  tab:3
+[1] 7 Conclusion  p.10-10  ~303 tokens
 ```
 
-## Prerequisites
+Example Markdown output:
 
-- Rust toolchain (edition 2024; rustc 1.75+)
-- Python 3.9+
-- `uv` (recommended for `maturin`) or `maturin` installed directly
+```md
+## Abstract
 
-## Build and Test
+<!-- page 0 -->
+
+The dominant sequence transduction models are based on complex recurrent or
+convolutional neural networks that include an encoder and a decoder. The best
+performing models also connect the encoder and decoder through an attention
+mechanism. We propose a new simple network architecture, the Transformer,
+based solely on attention mechanisms, dispensing with recurrence and
+convolutions entirely.
+
+## 1 Introduction
+
+<!-- page 1 -->
+
+Recurrent neural networks, long short-term memory and gated recurrent neural
+networks in particular, have been firmly established as state of the art
+approaches in sequence modeling and transduction problems such as language
+modeling and machine translation.
+```
+
+## Installation
+
+### Requirements
+
+- Rust 1.75+
+- Python 3.9+ for `pdflay`
+- `maturin` or `uvx maturin` for the Python binding
+
+### CLI (prebuilt binary)
+
+Download and install the latest release with the install script:
 
 ```bash
-# Build all crates
-cargo build
-
-# Rust tests
-cargo test
-cargo test -p pdf-lay-core
-cargo test -p pdf-lay
-
-# Lint/format
-cargo fmt --all
-cargo clippy --all-targets -- -D warnings
+curl -fsSL https://raw.githubusercontent.com/sonoh5n/pdf-lay/main/scripts/install.sh | sh
 ```
 
-Note: some integration tests require local fixture PDFs in `tests/fixtures/`.
+To install a specific version or to a custom directory:
 
-## Rust Crate Usage (`pdf-lay`)
+```bash
+curl -fsSL https://raw.githubusercontent.com/sonoh5n/pdf-lay/main/scripts/install.sh \
+  | sh -s -- --version v0.1.0-rc.1 --dir /usr/local/bin
+```
 
-### Add Dependency
+### CLI (from source)
 
-From another local project:
+```bash
+cargo install --path crates/pdf-lay-cli
+pdf-lay --help
+```
+
+Run without installing:
+
+```bash
+cargo run -p pdf-lay-cli -- --help
+```
+
+### Rust Library
+
+Use the workspace crate from another local Rust project:
 
 ```toml
 [dependencies]
 pdf-lay = { path = "/absolute/path/to/pdf-lay/crates/pdf-lay" }
 ```
 
-### Minimal Example
+### Python Binding
 
-```rust
-use pdf_lay::{analyze_pdf, Config, MarkdownConfig, MarkdownGenerator, TocGenerator};
-use std::path::Path;
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = Config {
-        extract_images: true,
-        image_output_dir: "./images".into(),
-        ..Default::default()
-    };
-
-    let result = analyze_pdf(Path::new("paper.pdf"), &config)?;
-    let doc = &result.document;
-
-    println!("pages: {}", doc.metadata.pages);
-    println!("top-level sections: {}", TocGenerator::generate(doc).len());
-
-    let md = MarkdownGenerator::new(MarkdownConfig::default()).generate(doc);
-    println!("{}", md);
-    Ok(())
-}
-```
-
-### Useful APIs
-
-- `analyze_pdf(path, &Config) -> Result<AnalysisResult, PdfLayError>`
-- `PaperDocument::toc()`
-- `PaperDocument::select_sections(&["METHODS", "RESULTS"])`
-- `SectionSelector::to_markdown(...)`
-- `SectionSelector::to_llm_text(...)`
-- `SectionSelector::to_chunks(...)`
-
-## CLI Usage (`pdf-lay`)
-
-### Run Without Installing
+Install the Python module into a local virtual environment:
 
 ```bash
-cargo run -p pdf-lay-cli -- --help
+python3 -m venv .venv
+source .venv/bin/activate
+uvx maturin develop -m crates/pdflay-python/Cargo.toml
 ```
 
-### Commands
+If you already have `maturin` installed:
 
 ```bash
-# Print table of contents
-cargo run -p pdf-lay-cli -- toc /path/to/paper.pdf
+maturin develop -m crates/pdflay-python/Cargo.toml
+```
 
-# TOC entries that contain figures
-cargo run -p pdf-lay-cli -- toc /path/to/paper.pdf --figures-only
+## Usage
 
-# Convert whole PDF to Markdown (stdout)
-cargo run -p pdf-lay-cli -- markdown /path/to/paper.pdf
+### CLI
 
-# Convert selected sections and write file
-cargo run -p pdf-lay-cli -- markdown /path/to/paper.pdf \
+Show help:
+
+```bash
+pdf-lay --help
+```
+
+Print the table of contents:
+
+```bash
+pdf-lay toc /path/to/paper.pdf
+```
+
+Show only sections that contain figures:
+
+```bash
+pdf-lay toc /path/to/paper.pdf --figures-only
+```
+
+Convert the full PDF to Markdown:
+
+```bash
+pdf-lay markdown /path/to/paper.pdf
+```
+
+Convert selected sections and write them to a file:
+
+```bash
+pdf-lay markdown /path/to/paper.pdf \
   --section METHODS \
   --section RESULTS \
   --image-dir ./images \
@@ -118,38 +159,21 @@ cargo run -p pdf-lay-cli -- markdown /path/to/paper.pdf \
   --output paper.md
 ```
 
-### Build Installable Binary
+### Rust
 
-```bash
-cargo build -p pdf-lay-cli --release
-./target/release/pdf-lay --help
+```rust
+use pdf_lay::{Config, analyze_pdf};
+use std::path::Path;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let result = analyze_pdf(Path::new("paper.pdf"), &Config::default())?;
+    println!("pages: {}", result.document.metadata.pages);
+    println!("top-level sections: {}", result.document.toc().len());
+    Ok(())
+}
 ```
 
-## Python Usage (`pdflay`)
-
-The Python package is built as a wheel via `maturin`.
-
-### Build Wheel
-
-```bash
-uvx maturin build --release -m crates/pdflay-python/Cargo.toml
-```
-
-Wheel output:
-
-```text
-target/wheels/pdflay-<version>-cp39-abi3-<platform>.whl
-```
-
-### Install Wheel
-
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install target/wheels/pdflay-*.whl
-```
-
-### Quick Python Example
+### Python
 
 ```python
 import pdflay
@@ -161,131 +185,6 @@ doc = pdflay.analyze(
     detect_tables=True,
 )
 
-print(doc.paper_id, doc.pages)
-print(len(doc.toc()))
-
-md = doc.to_markdown(image_base_path="./images")
-print(md[:500])
-
-sel = doc.select_sections(["methods", "results"])
-print(sel.total_estimated_tokens())
-print(sel.to_llm_text())
-
-chunks = doc.to_chunks(max_tokens=2000, overlap=200, strategy="section")
-print(len(chunks))
+print(doc.toc())
+print(doc.to_markdown(image_base_path="./images")[:500])
 ```
-
-### Python API Highlights
-
-- `pdflay.analyze(path, image_dir="./images", extract_images=True, detect_tables=True)`
-- `PyPaperDocument.to_markdown(...)`
-- `PyPaperDocument.to_json()`
-- `PyPaperDocument.to_chunks(...)`
-- `PyPaperDocument.toc()`
-- `PyPaperDocument.select_sections(...)`
-- `PySectionSelector.to_markdown()/to_json()/to_llm_text()/to_chunks()`
-
-## AI Agent Skills
-
-pdf-lay ships with pre-built agent skills in `.claude/skills/` for seamless
-integration with Claude Code and OpenAI Codex CLI.
-
-### Available Skills
-
-| Skill | Command | Description |
-|-------|---------|-------------|
-| `pdf` | `/pdf paper.pdf` | Extract structured content (Markdown, JSON, TOC) |
-| `pdf-qa` | `/pdf-qa paper.pdf "What method was used?"` | Answer questions grounded in the paper |
-| `pdf-summary` | `/pdf-summary paper.pdf` | Generate a structured summary |
-| `pdf-to-llm` | `/pdf-to-llm paper.pdf` | Convert to LLM-optimized chunks for RAG |
-
-### Setup for Claude Code
-
-Skills are auto-detected when Claude Code runs inside the pdf-lay repository.
-
-```bash
-# 1. Build the CLI binary
-cargo build -p pdf-lay-cli --release
-
-# 2. (Optional) Add to PATH for global access
-cp target/release/pdf-lay /usr/local/bin/
-
-# 3. Open Claude Code in the pdf-lay directory
-cd /path/to/pdf-lay
-claude
-
-# 4. Use skills directly
-#   /pdf paper.pdf
-#   /pdf-qa paper.pdf "What are the main contributions?"
-#   /pdf-summary paper.pdf --lang ja
-#   /pdf-to-llm paper.pdf --max-tokens 2000
-```
-
-To use skills from **another project**, copy the `.claude/skills/` directory:
-
-```bash
-cp -r /path/to/pdf-lay/.claude/skills/ /your/project/.claude/skills/
-```
-
-Make sure `pdf-lay` CLI is in your PATH or the skills will fall back to
-`cargo run` (requires the pdf-lay source tree).
-
-### Setup for OpenAI Codex CLI
-
-Codex CLI reads agent skills from the `.claude/skills/` directory in the same
-format. Setup:
-
-```bash
-# 1. Build the CLI binary and add to PATH
-cargo build -p pdf-lay-cli --release
-cp target/release/pdf-lay /usr/local/bin/
-
-# 2. Copy skills into your project
-cp -r /path/to/pdf-lay/.claude/skills/ /your/project/.claude/skills/
-
-# 3. Use with Codex CLI
-codex "Analyze this paper" # Codex will discover and use the pdf skill
-```
-
-### Skill Examples
-
-```bash
-# Extract table of contents with token estimates
-/pdf paper.pdf --format toc
-
-# Extract only the Methods section as Markdown
-/pdf paper.pdf --section "Methods"
-
-# Ask a specific question about the paper
-/pdf-qa paper.pdf "What dataset was used for evaluation?"
-
-# Summarize in Japanese
-/pdf-summary paper.pdf --lang ja
-
-# Generate RAG-ready chunks
-/pdf-to-llm paper.pdf --max-tokens 2000 --strategy paragraph
-```
-
-## End-to-End Local Verification
-
-```bash
-# Rust library and integration (fixture-dependent tests are ignored by default)
-cargo test -p pdf-lay
-
-# CLI
-cargo run -p pdf-lay-cli -- --help
-
-# Python wheel build + local install test
-uvx maturin build --release -m crates/pdflay-python/Cargo.toml
-python3 -m venv /tmp/pdflay_venv
-source /tmp/pdflay_venv/bin/activate
-pip install target/wheels/pdflay-*.whl
-python -c "import pdflay; print(hasattr(pdflay, 'analyze'))"
-```
-
-## Notes
-
-- `pdf-lay-core` is internal (`publish = false`).
-- `pdf-lay` is the public Rust API crate.
-- Python distribution is wheel-based from this repository; publishing to PyPI
-  is a separate release step.

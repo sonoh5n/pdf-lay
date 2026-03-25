@@ -124,9 +124,16 @@ impl TableTextConverter {
         }
     }
 
-    /// Escape pipe characters and newlines for Markdown table cells.
+    /// Escape a cell value for safe inclusion in a Markdown table.
+    ///
+    /// Neutralizes pipe characters, newlines, HTML tags, and Markdown link injection.
     pub fn escape_pipe(s: &str) -> String {
-        s.replace('|', "\\|").replace('\n', " ")
+        s.replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace("](", "]\\(")
+            .replace('|', "\\|")
+            .replace('\n', " ")
     }
 
     /// Escape a cell value for CSV output.
@@ -234,6 +241,22 @@ mod tests {
         assert_eq!(
             TableTextConverter::escape_pipe("line1\nline2"),
             "line1 line2"
+        );
+    }
+
+    #[test]
+    fn test_escape_pipe_neutralizes_html() {
+        assert_eq!(
+            TableTextConverter::escape_pipe("<script>alert(1)</script>"),
+            "&lt;script&gt;alert(1)&lt;/script&gt;"
+        );
+    }
+
+    #[test]
+    fn test_escape_pipe_prevents_link_injection() {
+        assert_eq!(
+            TableTextConverter::escape_pipe("[click](http://evil.com)"),
+            "[click]\\(http://evil.com)"
         );
     }
 

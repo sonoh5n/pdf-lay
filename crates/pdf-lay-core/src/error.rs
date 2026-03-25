@@ -43,6 +43,15 @@ pub enum PdfLayError {
     /// JSON serialization or deserialization failed.
     #[error("JSON serialization error: {0}")]
     JsonError(#[from] serde_json::Error),
+
+    /// A resource limit was exceeded (file size, page count, etc.).
+    #[error("Resource limit exceeded: {limit} (actual: {actual})")]
+    ResourceLimitExceeded {
+        /// Description of the limit that was exceeded.
+        limit: String,
+        /// The actual value that exceeded the limit.
+        actual: String,
+    },
 }
 
 /// Non-fatal issues that allow analysis to continue.
