@@ -6,6 +6,7 @@ __pycache__/
 dist/
 *.egg-info/
 .pytest_cache/
+example/out/
 
 # Created by https://www.toptal.com/developers/gitignore/api/python
 # Edit at https://www.toptal.com/developers/gitignore?templates=python
