@@ -24,6 +24,8 @@ fn markdown_config_compiles() {
         table_as_image: false,
         figure_caption_style: CaptionStyle::Italic,
         math_config: None,
+        image_dir: None,
+        output_dir: None,
     };
     assert_eq!(config.heading_offset, 1);
 }

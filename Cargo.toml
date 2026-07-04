@@ -36,3 +36,4 @@ clap        = { version = "4", features = ["derive"] }
 tempfile    = "3"
 
 pdf_oxide = "0.3.8"
+pathdiff  = "0.2"

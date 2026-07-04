@@ -298,15 +298,17 @@ Markdown without page annotations."
     /// Base path used for image links in the generated Markdown.
     #[arg(
         long,
-        default_value = "./images",
         value_name = "PATH",
         help = "Base path written into Markdown image links.",
         long_help = "Base path written into Markdown image links.\n\n\
-This string is prefixed to extracted image filenames when pdf-lay emits \
-Markdown image links such as `![Fig. 1](PATH/p000_img000.png)`. It does not \
-control where image files are saved; use `--image-dir` for that."
+When set, this string is prefixed to extracted image filenames in Markdown image \
+links such as `![Fig. 1](PATH/p000_img000.png)`. When omitted, and output is \
+written to a file with `-o`, pdf-lay instead computes the link path relative to \
+that output file's directory using `--image-dir`, so links resolve no matter \
+where the .md is written. This option does not control where image files are \
+saved; use `--image-dir` for that."
     )]
-    image_base: String,
+    image_base: Option<String>,
 
     /// Write output to a file instead of stdout.
     #[arg(
@@ -442,14 +444,37 @@ fn cmd_markdown(args: &MarkdownArgs) {
     let result = run_analysis(&args.common);
     let doc = &result.document;
 
+    // If --image-base was given explicitly, honor it (prefix behavior). Otherwise
+    // compute image links relative to the output file's directory when writing to
+    // a file, so links resolve regardless of where the .md lives.
+    let image_base_explicit = args.image_base.is_some();
+    let image_base_path = args
+        .image_base
+        .clone()
+        .unwrap_or_else(|| "./images".to_string());
+    let (image_dir, output_dir) = if image_base_explicit {
+        (None, None)
+    } else {
+        let output_dir = args.output.as_ref().and_then(|p| p.parent()).map(|par| {
+            if par.as_os_str().is_empty() {
+                PathBuf::from(".")
+            } else {
+                par.to_path_buf()
+            }
+        });
+        (Some(args.common.image_dir.clone()), output_dir)
+    };
+
     let md_config = MarkdownConfig {
-        image_base_path: args.image_base.clone(),
+        image_base_path,
         include_page_numbers: !args.no_page_numbers,
         heading_offset: args.heading_offset,
         include_metadata_header: false,
         table_as_image: false,
         figure_caption_style: CaptionStyle::Italic,
         math_config: math_config_from_flag(&args.math_format),
+        image_dir,
+        output_dir,
     };
 
     let output = if args.sections.is_empty() {

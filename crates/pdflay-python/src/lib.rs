@@ -103,6 +103,8 @@ impl PyPaperDocument {
             table_as_image: false,
             figure_caption_style: CaptionStyle::Italic,
             math_config: math_config_from_str(math_format),
+            image_dir: None,
+            output_dir: None,
         };
         MarkdownGenerator::new(config).generate(&self.inner)
     }
@@ -316,6 +318,8 @@ impl PySectionSelector {
             table_as_image: false,
             figure_caption_style: CaptionStyle::Italic,
             math_config: math_config_from_str(math_format),
+            image_dir: None,
+            output_dir: None,
         };
         self.rebuild_selector().to_markdown(&config)
     }
