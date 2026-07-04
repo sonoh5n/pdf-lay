@@ -325,7 +325,14 @@ pub fn analyze_pdf(path: &Path, config: &Config) -> Result<AnalysisResult, PdfLa
 }
 
 /// Recursively sum the characters that reach the output: each section's body
-/// text plus its header text.
+/// text, header text, and figure/table captions.
+///
+/// Figure and table captions are rendered in the output but are excluded from
+/// [`Section::full_text`] (they are `Caption`-type blocks), so they are counted
+/// here to keep the coverage ratio aligned with the actual output reach. Table
+/// cell text is already counted via `full_text` body blocks, so the table
+/// representation itself is intentionally not added again (doing so would
+/// double-count the cells and inflate the ratio).
 fn emitted_char_count(sections: &[Section]) -> usize {
     sections
         .iter()
@@ -335,7 +342,22 @@ fn emitted_char_count(sections: &[Section]) -> usize {
                 .as_ref()
                 .map(|h| h.clean_text.chars().count())
                 .unwrap_or(0);
-            header_chars + s.full_text().chars().count() + emitted_char_count(&s.children)
+            let figure_caption_chars: usize = s
+                .figures
+                .iter()
+                .map(|f| f.caption_text.chars().count())
+                .sum();
+            let table_caption_chars: usize = s
+                .tables
+                .iter()
+                .filter_map(|t| t.caption.as_ref())
+                .map(|c| c.chars().count())
+                .sum();
+            header_chars
+                + s.full_text().chars().count()
+                + figure_caption_chars
+                + table_caption_chars
+                + emitted_char_count(&s.children)
         })
         .sum()
 }
@@ -438,6 +460,55 @@ mod tests {
         };
         // header "Intro" (5) + body "hello" (5) = 10.
         assert_eq!(emitted_char_count(&[section]), 10);
+    }
+
+    #[test]
+    fn emitted_char_count_includes_figure_caption() {
+        use crate::types::{
+            FigureInfo, ImageFormat, ImageInfo, InsertionPoint, Rect, Section, TextBlock,
+        };
+
+        let block = TextBlock {
+            global_index: 0,
+            lines: vec![],
+            text: "abc".to_string(), // 3 chars
+            bbox: Rect::new(0.0, 0.0, 0.0, 0.0),
+            page: 0,
+            column_index: 0,
+            block_type: BlockType::BodyText,
+        };
+        let figure = FigureInfo {
+            figure_id: "Fig. 1".to_string(),
+            figure_number: Some(1),
+            caption_text: "Fig. 1: X".to_string(), // 9 chars
+            image: ImageInfo {
+                path: std::path::PathBuf::from("images/p000_img000.png"),
+                page: 0,
+                raw_bbox: Rect::new(0.0, 0.0, 0.0, 0.0),
+                normalized_bbox: Rect::new(0.0, 0.0, 0.0, 0.0),
+                width_px: 1,
+                height_px: 1,
+                format: ImageFormat::Png,
+            },
+            context_text: String::new(),
+            insertion_point: InsertionPoint {
+                page: 0,
+                after_block_index: None,
+                y_position: 0.0,
+            },
+        };
+        let section = Section {
+            header: None,
+            level: 1,
+            blocks: vec![block],
+            figures: vec![figure],
+            tables: vec![],
+            children: vec![],
+            page_range: (0, 0),
+        };
+        // body "abc" (3) + figure caption "Fig. 1: X" (9) = 12; the caption is
+        // excluded from full_text() but rendered in the output.
+        assert_eq!(emitted_char_count(&[section]), 12);
     }
 
     #[test]
