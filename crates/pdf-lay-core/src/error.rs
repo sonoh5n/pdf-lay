@@ -96,6 +96,12 @@ pub enum PdfLayWarning {
         /// `"letter-default"` (612 × 792).
         method: &'static str,
     },
+    /// The fraction of extracted text that reached the output fell below the
+    /// configured threshold, suggesting content was lost during analysis.
+    LowCoverage {
+        /// Ratio of emitted characters to extracted characters, in `[0, 1]`.
+        ratio: f64,
+    },
 }
 
 impl std::fmt::Display for PdfLayWarning {
@@ -120,8 +126,34 @@ impl std::fmt::Display for PdfLayWarning {
             Self::PageDimensionsFallback { page, method } => {
                 write!(f, "page {page} dimensions fallback ({method})")
             }
+            Self::LowCoverage { ratio } => {
+                write!(
+                    f,
+                    "low text coverage: {:.1}% of extracted text reached the output",
+                    ratio * 100.0
+                )
+            }
         }
     }
+}
+
+/// Text-coverage metrics for one analysis run.
+///
+/// A ratio well below 1.0 indicates that a meaningful fraction of the extracted
+/// text did not reach the output (e.g. due to misclassification or layout
+/// issues). Used as a regression guard for the "No Silent Drop" principle.
+#[derive(Debug, Clone, Copy)]
+pub struct Coverage {
+    /// Total characters across all extracted text spans.
+    pub extracted_chars: usize,
+    /// Characters that reached the output (section body text plus headers).
+    pub emitted_chars: usize,
+    /// Number of blocks classified into render-skipped types (caption, page
+    /// number, running header/footer).
+    pub dropped_blocks: usize,
+    /// `emitted_chars / extracted_chars`, clamped to `[0, 1]` (1.0 when nothing
+    /// was extracted).
+    pub ratio: f64,
 }
 
 /// The result of a full PDF analysis, including any non-fatal warnings.
@@ -131,4 +163,6 @@ pub struct AnalysisResult {
     pub document: crate::types::PaperDocument,
     /// Non-fatal warnings accumulated during analysis.
     pub warnings: Vec<PdfLayWarning>,
+    /// Text-coverage metrics for this run.
+    pub coverage: Coverage,
 }

@@ -39,6 +39,11 @@ pub struct Config {
     /// smaller than body size.
     #[serde(default = "default_running_header_max_chars")]
     pub running_header_max_chars: usize,
+    /// Minimum acceptable text-coverage ratio (emitted / extracted characters).
+    /// A `LowCoverage` warning is emitted when the measured ratio falls below
+    /// this value.
+    #[serde(default = "default_min_coverage_ratio")]
+    pub min_coverage_ratio: f64,
 }
 
 /// Default value for [`Config::caption_max_chars`].
@@ -49,6 +54,11 @@ fn default_caption_max_chars() -> usize {
 /// Default value for [`Config::running_header_max_chars`].
 fn default_running_header_max_chars() -> usize {
     60
+}
+
+/// Default value for [`Config::min_coverage_ratio`].
+fn default_min_coverage_ratio() -> f64 {
+    0.9
 }
 
 impl Default for Config {
@@ -67,6 +77,7 @@ impl Default for Config {
             resource_limits: ResourceLimits::default(),
             caption_max_chars: default_caption_max_chars(),
             running_header_max_chars: default_running_header_max_chars(),
+            min_coverage_ratio: default_min_coverage_ratio(),
         }
     }
 }

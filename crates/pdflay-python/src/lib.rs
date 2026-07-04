@@ -793,7 +793,9 @@ fn analyze(
         ..Config::default()
     };
 
-    let AnalysisResult { document, warnings } = analyze_pdf(Path::new(path), &config)
+    let AnalysisResult {
+        document, warnings, ..
+    } = analyze_pdf(Path::new(path), &config)
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
     // Log non-fatal warnings to stderr (uses Display to omit PDF-derived text).
