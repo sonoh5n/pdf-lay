@@ -57,18 +57,48 @@ pub fn analyze_pdf(path: &Path, config: &Config) -> Result<AnalysisResult, PdfLa
     let raw_spans = reader.extract_all_text_spans()?;
     let spans = SpanBuilder::new().merge(raw_spans);
 
-    // Collect page dimensions.
+    // Collect page dimensions. Prefer the real MediaBox; when it cannot be read,
+    // derive the page extent from that page's spans so no on-page text falls
+    // outside the layout bounds (No Silent Drop), and only then fall back to a
+    // Letter-size default. Both fallbacks are reported as warnings.
     let mut page_dims_list = Vec::new();
     for page in 0..page_count {
-        match reader.page_dimensions(page) {
-            Ok(dims) => page_dims_list.push(dims),
-            Err(e) => {
-                warnings.push(PdfLayWarning::PageSkipped {
-                    page,
-                    reason: e.to_string(),
-                });
+        let dims = match reader.page_media_box(page) {
+            Some((width, height, _rotation)) => crate::types::PageDimensions {
+                page_number: page,
+                width,
+                height,
+            },
+            None => {
+                let (mut width, mut height) = (0.0_f64, 0.0_f64);
+                for s in spans.iter().filter(|s| s.page == page) {
+                    width = width.max(s.bbox.right);
+                    height = height.max(s.bbox.top);
+                }
+                if width > 0.0 && height > 0.0 {
+                    warnings.push(PdfLayWarning::PageDimensionsFallback {
+                        page,
+                        method: "span-bbox",
+                    });
+                    crate::types::PageDimensions {
+                        page_number: page,
+                        width,
+                        height,
+                    }
+                } else {
+                    warnings.push(PdfLayWarning::PageDimensionsFallback {
+                        page,
+                        method: "letter-default",
+                    });
+                    crate::types::PageDimensions {
+                        page_number: page,
+                        width: 612.0,
+                        height: 792.0,
+                    }
+                }
             }
-        }
+        };
+        page_dims_list.push(dims);
     }
 
     // Extract images (optional).

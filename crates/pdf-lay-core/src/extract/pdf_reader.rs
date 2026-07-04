@@ -6,6 +6,7 @@
 use std::path::Path;
 
 use pdf_oxide::document::PdfDocument;
+use pdf_oxide::object::Object;
 
 use crate::error::PdfLayError;
 use crate::types::{FontInfo, PageDimensions, PathObject, PathType, Rect, TextSpan};
@@ -60,28 +61,70 @@ impl PdfReader {
         self.inner.page_count().unwrap_or(0) as u32
     }
 
+    /// Read the page's MediaBox (and rotation) directly from the page dictionary.
+    ///
+    /// Returns `(width, height, rotation_degrees)` in points, with `width` and
+    /// `height` already swapped for 90°/270° page rotation. Returns `None` when
+    /// the MediaBox cannot be read.
+    ///
+    /// This uses pdf_oxide's non-rendering page-dictionary accessor
+    /// (`get_page_for_debug`), so it works **without** enabling the heavy
+    /// `rendering` feature. Inherited MediaBox values are resolved by
+    /// pdf_oxide's page-tree walk.
+    pub fn page_media_box(&mut self, page: u32) -> Option<(f64, f64, i32)> {
+        let page_obj = self.inner.get_page_for_debug(page as usize).ok()?;
+        let dict = page_obj.as_dict()?;
+
+        // MediaBox = [x0, y0, x1, y1]; entries may be Integer or Real.
+        let arr = dict.get("MediaBox").and_then(|o| o.as_array())?;
+        let num = |o: &Object| o.as_real().or_else(|| o.as_integer().map(|i| i as f64));
+        let x0 = num(arr.first()?)?;
+        let y0 = num(arr.get(1)?)?;
+        let x1 = num(arr.get(2)?)?;
+        let y1 = num(arr.get(3)?)?;
+        let width = (x1 - x0).abs();
+        let height = (y1 - y0).abs();
+        if width <= 0.0 || height <= 0.0 {
+            return None;
+        }
+
+        // /Rotate (optional): normalize to a positive 0/90/180/270 value.
+        let rotation = dict
+            .get("Rotate")
+            .and_then(|o| o.as_integer())
+            .map(|r| r.rem_euclid(360) as i32)
+            .unwrap_or(0);
+
+        // For 90°/270° the visible page is rotated a quarter turn, so the
+        // effective width and height are swapped relative to the MediaBox.
+        let (width, height) = if rotation == 90 || rotation == 270 {
+            (height, width)
+        } else {
+            (width, height)
+        };
+
+        Some((width, height, rotation))
+    }
+
     /// Dimensions of the specified page in points.
     ///
-    /// Parses the page's MediaBox from the PDF dictionary.
-    /// Falls back to US Letter size (612 × 792 pt) if the page cannot be found.
+    /// Reads the page's real MediaBox via [`Self::page_media_box`]. When the
+    /// MediaBox cannot be read, falls back to US Letter size (612 × 792 pt) so
+    /// callers can proceed. Callers that have access to extracted spans should
+    /// prefer a span-extent fallback (see the pipeline) over this Letter default.
     pub fn page_dimensions(&mut self, page: u32) -> Result<PageDimensions, PdfLayError> {
         let total = self.page_count();
         if page >= total {
             return Err(PdfLayError::PageOutOfRange(page, total));
         }
-        // pdf_oxide does not expose a non-rendering page-size API, so we derive
-        // dimensions from the extracted spans' bounding boxes as a best-effort
-        // heuristic.  A proper implementation would parse the /MediaBox array from
-        // the page dictionary; that requires either the `rendering` feature or
-        // duplicating the dictionary walking logic, both of which are out of scope
-        // for Task 3.  Instead, use a fixed Letter default so callers can proceed.
-        //
-        // NOTE: This will be improved in a future task when page-geometry access is
-        // available.
+        let (width, height) = self
+            .page_media_box(page)
+            .map(|(w, h, _rot)| (w, h))
+            .unwrap_or((612.0, 792.0));
         Ok(PageDimensions {
             page_number: page,
-            width: 612.0,
-            height: 792.0,
+            width,
+            height,
         })
     }
 
@@ -343,6 +386,89 @@ mod tests {
         assert!(
             matches!(result, Err(PdfLayError::FileNotFound(_))),
             "Expected FileNotFound error"
+        );
+    }
+
+    /// Build a minimal single-page PDF with a given MediaBox and optional
+    /// /Rotate, with a correct cross-reference table so pdf_oxide can open it.
+    fn build_minimal_pdf(media_box: [i32; 4], rotate: Option<i32>) -> Vec<u8> {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut offsets: Vec<usize> = Vec::new();
+
+        buf.extend_from_slice(b"%PDF-1.4\n");
+
+        offsets.push(buf.len());
+        buf.extend_from_slice(b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n");
+
+        offsets.push(buf.len());
+        buf.extend_from_slice(b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n");
+
+        offsets.push(buf.len());
+        let rotate_str = rotate.map(|r| format!(" /Rotate {r}")).unwrap_or_default();
+        let page = format!(
+            "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [{} {} {} {}]{} >>\nendobj\n",
+            media_box[0], media_box[1], media_box[2], media_box[3], rotate_str
+        );
+        buf.extend_from_slice(page.as_bytes());
+
+        let xref_offset = buf.len();
+        let size = offsets.len() + 1; // + the free object 0
+        buf.extend_from_slice(format!("xref\n0 {size}\n").as_bytes());
+        buf.extend_from_slice(b"0000000000 65535 f \n");
+        for off in &offsets {
+            buf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        buf.extend_from_slice(
+            format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+
+        buf
+    }
+
+    #[test]
+    fn page_media_box_reads_real_dimensions() {
+        // A4 in points: 595 × 842 (NOT the old hardcoded Letter 612 × 792).
+        let pdf = build_minimal_pdf([0, 0, 595, 842], None);
+        let mut reader = PdfReader::from_bytes(&pdf).expect("minimal PDF should open");
+        let (w, h, rot) = reader
+            .page_media_box(0)
+            .expect("MediaBox should be readable");
+        assert!((w - 595.0).abs() < 1.0, "width should be ~595, got {w}");
+        assert!((h - 842.0).abs() < 1.0, "height should be ~842, got {h}");
+        assert_eq!(rot, 0);
+    }
+
+    #[test]
+    fn page_media_box_swaps_on_rotation() {
+        let pdf = build_minimal_pdf([0, 0, 595, 842], Some(90));
+        let mut reader = PdfReader::from_bytes(&pdf).expect("minimal PDF should open");
+        let (w, h, rot) = reader
+            .page_media_box(0)
+            .expect("MediaBox should be readable");
+        // 90° rotation swaps width and height.
+        assert!(
+            (w - 842.0).abs() < 1.0,
+            "rotated width should be ~842, got {w}"
+        );
+        assert!(
+            (h - 595.0).abs() < 1.0,
+            "rotated height should be ~595, got {h}"
+        );
+        assert_eq!(rot, 90);
+    }
+
+    #[test]
+    fn page_dimensions_uses_mediabox_not_letter_default() {
+        let pdf = build_minimal_pdf([0, 0, 595, 842], None);
+        let mut reader = PdfReader::from_bytes(&pdf).expect("minimal PDF should open");
+        let dims = reader
+            .page_dimensions(0)
+            .expect("dimensions should be readable");
+        assert!(
+            dims.height > 800.0,
+            "A4 height must be read from MediaBox (~842), got {} (regression to Letter 792?)",
+            dims.height
         );
     }
 

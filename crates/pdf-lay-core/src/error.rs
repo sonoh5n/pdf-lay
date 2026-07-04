@@ -87,6 +87,15 @@ pub enum PdfLayWarning {
         /// Human-readable description of why the page was skipped.
         reason: String,
     },
+    /// The page MediaBox could not be read, so page dimensions fell back to a
+    /// derived or default value.
+    PageDimensionsFallback {
+        /// Zero-based page index.
+        page: u32,
+        /// Which fallback was used: `"span-bbox"` (derived from span extents) or
+        /// `"letter-default"` (612 × 792).
+        method: &'static str,
+    },
 }
 
 impl std::fmt::Display for PdfLayWarning {
@@ -107,6 +116,9 @@ impl std::fmt::Display for PdfLayWarning {
             }
             Self::PageSkipped { page, reason } => {
                 write!(f, "page {page} skipped: {reason}")
+            }
+            Self::PageDimensionsFallback { page, method } => {
+                write!(f, "page {page} dimensions fallback ({method})")
             }
         }
     }
