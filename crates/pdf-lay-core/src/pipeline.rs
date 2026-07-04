@@ -174,7 +174,8 @@ pub fn analyze_pdf(path: &Path, config: &Config) -> Result<AnalysisResult, PdfLa
         .with_gap_multiplier(config.block_gap_multiplier)
         .group(&lines, &layouts);
 
-    let classifier = BlockClassifier::from_blocks(&blocks);
+    let classifier = BlockClassifier::from_blocks(&blocks)
+        .with_limits(config.caption_max_chars, config.running_header_max_chars);
     classifier.classify_all(&mut blocks);
 
     let headers = HeaderDetector::with_config(

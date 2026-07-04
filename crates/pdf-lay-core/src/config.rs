@@ -29,6 +29,26 @@ pub struct Config {
     pub header_detection: HeaderDetectionConfig,
     /// Resource limits to guard against excessively large inputs.
     pub resource_limits: ResourceLimits,
+    /// Maximum character count for a block to be classified as a figure/table
+    /// caption. Longer blocks that merely start with "Table"/"Figure" are kept
+    /// as body text rather than dropped.
+    #[serde(default = "default_caption_max_chars")]
+    pub caption_max_chars: usize,
+    /// Maximum character count for a small-font single line to be classified as
+    /// a running header. Longer lines are kept as body text even if the font is
+    /// smaller than body size.
+    #[serde(default = "default_running_header_max_chars")]
+    pub running_header_max_chars: usize,
+}
+
+/// Default value for [`Config::caption_max_chars`].
+fn default_caption_max_chars() -> usize {
+    240
+}
+
+/// Default value for [`Config::running_header_max_chars`].
+fn default_running_header_max_chars() -> usize {
+    60
 }
 
 impl Default for Config {
@@ -45,6 +65,8 @@ impl Default for Config {
             block_gap_multiplier: 1.8,
             header_detection: HeaderDetectionConfig::default(),
             resource_limits: ResourceLimits::default(),
+            caption_max_chars: default_caption_max_chars(),
+            running_header_max_chars: default_running_header_max_chars(),
         }
     }
 }

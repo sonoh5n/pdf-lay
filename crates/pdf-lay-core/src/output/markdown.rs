@@ -201,28 +201,32 @@ impl MarkdownGenerator {
         let mut table_queue: VecDeque<&TableInfo> = section.tables.iter().collect();
 
         for block in &section.blocks {
-            // Skip non-content blocks.
-            match block.block_type {
+            // Non-content blocks contribute no body text, but we must still run
+            // the figure/table drain below (a figure anchored to such a block
+            // would otherwise never be emitted inline and get flushed at the
+            // section end).
+            let emit_body = !matches!(
+                block.block_type,
                 BlockType::Caption
-                | BlockType::PageNumber
-                | BlockType::RunningHeader
-                | BlockType::RunningFooter => continue,
-                _ => {
-                    let text = if let Some((ref detector, ref converter)) = math_components {
-                        let mc = self
-                            .config
-                            .math_config
-                            .as_ref()
-                            .expect("math_config present");
-                        // Escaping is applied inside convert_block_text_with_math
-                        // to non-math spans only, preserving math delimiters.
-                        convert_block_text_with_math(block, detector, converter, mc)
-                    } else {
-                        escape_for_markdown_text(&block.text)
-                    };
-                    md.push_str(&text);
-                    md.push_str("\n\n");
-                }
+                    | BlockType::PageNumber
+                    | BlockType::RunningHeader
+                    | BlockType::RunningFooter
+            );
+            if emit_body {
+                let text = if let Some((ref detector, ref converter)) = math_components {
+                    let mc = self
+                        .config
+                        .math_config
+                        .as_ref()
+                        .expect("math_config present");
+                    // Escaping is applied inside convert_block_text_with_math
+                    // to non-math spans only, preserving math delimiters.
+                    convert_block_text_with_math(block, detector, converter, mc)
+                } else {
+                    escape_for_markdown_text(&block.text)
+                };
+                md.push_str(&text);
+                md.push_str("\n\n");
             }
 
             // Emit figures whose insertion_point falls after this block.
@@ -437,6 +441,70 @@ mod tests {
         assert!(
             output.contains("*Fig. 1: A diagram.*"),
             "Should contain italic caption"
+        );
+    }
+
+    #[test]
+    fn figure_anchored_to_caption_block_emitted_inline() {
+        // A figure whose insertion point is a Caption block must still be
+        // emitted at that point (inline), not flushed to the section end.
+        let mdgen = MarkdownGenerator::new(default_config());
+        let caption = TextBlock {
+            global_index: 0,
+            lines: vec![],
+            text: "Fig. 1: Cap".to_string(),
+            bbox: Rect::new(72.0, 700.0, 540.0, 690.0),
+            page: 0,
+            column_index: 0,
+            block_type: BlockType::Caption,
+        };
+        let body = TextBlock {
+            global_index: 1,
+            lines: vec![],
+            text: "BODYTEXTMARKER".to_string(),
+            bbox: Rect::new(72.0, 680.0, 540.0, 670.0),
+            page: 0,
+            column_index: 0,
+            block_type: BlockType::BodyText,
+        };
+        let section = Section {
+            header: None,
+            level: 1,
+            blocks: vec![caption, body],
+            figures: vec![FigureInfo {
+                figure_id: "Fig. 1".to_string(),
+                figure_number: Some(1),
+                caption_text: "Fig. 1: Cap".to_string(),
+                image: ImageInfo {
+                    path: PathBuf::from("images/p000_img000.png"),
+                    page: 0,
+                    raw_bbox: Rect::new(0.0, 0.0, 0.0, 0.0),
+                    normalized_bbox: Rect::new(0.0, 0.0, 0.0, 0.0),
+                    width_px: 10,
+                    height_px: 10,
+                    format: ImageFormat::Png,
+                },
+                context_text: String::new(),
+                insertion_point: InsertionPoint {
+                    page: 0,
+                    after_block_index: Some(0),
+                    y_position: 0.0,
+                },
+            }],
+            tables: vec![],
+            children: vec![],
+            page_range: (0, 0),
+        };
+        let out = mdgen.generate_for_sections(&[&section]);
+        let img_pos = out
+            .find("![Fig. 1]")
+            .expect("figure link should be present");
+        let body_pos = out
+            .find("BODYTEXTMARKER")
+            .expect("body text should be present");
+        assert!(
+            img_pos < body_pos,
+            "figure anchored to caption block (index 0) must appear before the body block (index 1):\n{out}"
         );
     }
 
