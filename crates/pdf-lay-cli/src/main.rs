@@ -10,7 +10,10 @@ use std::path::PathBuf;
 use std::process;
 
 use clap::{Args, Parser, Subcommand};
-use pdf_lay::{CaptionStyle, Config, MarkdownConfig, MarkdownGenerator, TocGenerator, analyze_pdf};
+use pdf_lay::{
+    CaptionStyle, Config, MarkdownConfig, MarkdownGenerator, MathConfig,
+    MathRepresentationPreference, TocGenerator, analyze_pdf,
+};
 
 const CLI_LONG_ABOUT: &str = "\
 Analyze academic-paper PDFs and emit section-aware outputs for review, conversion,
@@ -317,6 +320,23 @@ other tools. When provided, pdf-lay writes the final Markdown bytes directly to 
 the specified file path."
     )]
     output: Option<PathBuf>,
+
+    /// How to render mathematical expressions in the Markdown output.
+    #[arg(
+        long,
+        default_value = "latex",
+        value_name = "FORMAT",
+        value_parser = ["latex", "unicode", "plain", "off"],
+        help = "How to render math: latex (default), unicode, plain, or off.",
+        long_help = "How to render mathematical expressions detected in the PDF.\n\n\
+  latex   - LaTeX notation such as `$E = mc^{2}$` (default; best for LLMs).\n\
+  unicode - Unicode math characters such as `E = mc²`.\n\
+  plain   - Plain ASCII approximation such as `E = mc^2`.\n\
+  off     - No conversion; math spans are emitted as raw extracted glyphs.\n\n\
+Math conversion is enabled by default. Use `off` to reproduce the previous \
+raw-text behavior."
+    )]
+    math_format: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -401,6 +421,23 @@ fn print_entries(entries: &[pdf_lay::SectionEntry], indent: usize, figures_only:
 // Subcommand: markdown
 // ---------------------------------------------------------------------------
 
+/// Build the optional math configuration from the `--math-format` flag.
+///
+/// Returns `None` for `"off"` (raw glyphs, no conversion); otherwise a
+/// `MathConfig` with the requested representation.
+fn math_config_from_flag(format: &str) -> Option<MathConfig> {
+    let representation = match format {
+        "off" => return None,
+        "unicode" => MathRepresentationPreference::UnicodeMath,
+        "plain" => MathRepresentationPreference::PlainText,
+        _ => MathRepresentationPreference::LaTeX,
+    };
+    Some(MathConfig {
+        representation,
+        ..MathConfig::default()
+    })
+}
+
 fn cmd_markdown(args: &MarkdownArgs) {
     let result = run_analysis(&args.common);
     let doc = &result.document;
@@ -412,7 +449,7 @@ fn cmd_markdown(args: &MarkdownArgs) {
         include_metadata_header: false,
         table_as_image: false,
         figure_caption_style: CaptionStyle::Italic,
-        math_config: None,
+        math_config: math_config_from_flag(&args.math_format),
     };
 
     let output = if args.sections.is_empty() {
@@ -501,6 +538,35 @@ mod tests {
         assert!(help.contains("--image-dir"));
         assert!(help.contains("--image-base"));
         assert!(help.contains("Section filtering:"));
+    }
+
+    #[test]
+    fn markdown_math_format_defaults_to_latex() {
+        let cli = Cli::try_parse_from(["pdf-lay", "markdown", "paper.pdf"])
+            .expect("markdown should parse with defaults");
+        let super::Commands::Markdown(args) = cli.command else {
+            panic!("expected markdown command");
+        };
+        assert_eq!(args.math_format, "latex");
+        assert!(super::math_config_from_flag(&args.math_format).is_some());
+    }
+
+    #[test]
+    fn markdown_math_format_off_disables_conversion() {
+        let cli = Cli::try_parse_from(["pdf-lay", "markdown", "paper.pdf", "--math-format", "off"])
+            .expect("--math-format off should parse");
+        let super::Commands::Markdown(args) = cli.command else {
+            panic!("expected markdown command");
+        };
+        assert_eq!(args.math_format, "off");
+        assert!(super::math_config_from_flag(&args.math_format).is_none());
+    }
+
+    #[test]
+    fn markdown_math_format_rejects_unknown() {
+        let result =
+            Cli::try_parse_from(["pdf-lay", "markdown", "paper.pdf", "--math-format", "bogus"]);
+        assert!(result.is_err(), "unknown math format should be rejected");
     }
 
     #[test]
