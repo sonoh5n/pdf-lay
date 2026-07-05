@@ -1,76 +1,9 @@
 //! Generates LLM-optimized plain text from selected sections.
 
 use crate::config::{FigureTextFormat, LlmTextConfig, MathConfig, MathRepresentationPreference};
-use crate::math::{MathContext, MathConverter, MathDetector, MathFormatter};
-use crate::types::{BlockType, FigureInfo, Section, TableRepresentation, TextBlock};
-
-/// Convert a block's text, replacing contiguous math spans with formatted math notation
-/// for LLM text output.
-///
-/// Behaves identically to the Markdown variant but uses
-/// [`MathFormatter::format_for_llm`] for wrapping.
-fn convert_block_text_for_llm(
-    block: &TextBlock,
-    detector: &MathDetector,
-    converter: &MathConverter,
-    config: &MathConfig,
-) -> String {
-    let mut result = String::new();
-
-    for (line_idx, line) in block.lines.iter().enumerate() {
-        if line_idx > 0 {
-            result.push('\n');
-        }
-
-        let math_regions = detector.detect_in_line(line);
-
-        if math_regions.is_empty() {
-            let line_text: String = line.spans.iter().map(|s| s.text.as_str()).collect();
-            result.push_str(&line_text);
-        } else {
-            let mut span_idx = 0usize;
-
-            for region in &math_regions {
-                while span_idx < line.spans.len() {
-                    let span = &line.spans[span_idx];
-                    let is_region_start = region
-                        .spans
-                        .first()
-                        .is_some_and(|rs| rs.bbox.left == span.bbox.left && rs.text == span.text);
-                    if is_region_start {
-                        break;
-                    }
-                    result.push_str(&span.text);
-                    span_idx += 1;
-                }
-
-                let converted = converter.convert(&region.text, &region.spans);
-                let is_display = region.context == MathContext::Display;
-                let formatted = MathFormatter::format_for_llm(
-                    &converted,
-                    is_display,
-                    region.equation_number.as_deref(),
-                    config,
-                );
-                result.push_str(&formatted);
-
-                span_idx += region.spans.len();
-            }
-
-            while span_idx < line.spans.len() {
-                result.push_str(&line.spans[span_idx].text);
-                span_idx += 1;
-            }
-        }
-    }
-
-    // Fall back to block.text if lines are empty (defensive).
-    if result.is_empty() && !block.text.is_empty() {
-        return block.text.clone();
-    }
-
-    result
-}
+use crate::math::{MathConverter, MathDetector};
+use crate::output::render_core::{self, EscapeMode};
+use crate::types::{BlockType, FigureInfo, Section, TableRepresentation};
 
 /// Build a [`MathConfig`] from the representation preference stored in [`LlmTextConfig`].
 ///
@@ -115,24 +48,30 @@ impl LlmTextGenerator {
         }
 
         // Prepare math detector/converter once per section (from LlmTextConfig).
-        let math_components = math_config_from_llm(&self.config).map(|mc| {
+        let math_config = math_config_from_llm(&self.config);
+        let math_components = math_config.as_ref().map(|mc| {
             (
                 MathDetector::new(mc.clone()),
                 MathConverter::new(mc.clone()),
-                mc,
             )
         });
 
-        // Body blocks.
+        // Body blocks. Delegates to render-core's single block→rich-text
+        // implementation (shared with markdown/chunker).
         for block in &section.blocks {
             match block.block_type {
                 BlockType::BodyText | BlockType::Abstract | BlockType::ListItem => {
-                    let text = if let Some((ref detector, ref converter, ref mc)) = math_components
-                    {
-                        convert_block_text_for_llm(block, detector, converter, mc)
-                    } else {
-                        block.text.clone()
+                    let (detector, converter) = match &math_components {
+                        Some((d, c)) => (Some(d), Some(c)),
+                        None => (None, None),
                     };
+                    let text = render_core::render_block(
+                        block,
+                        detector,
+                        converter,
+                        math_config.as_ref(),
+                        EscapeMode::Plain,
+                    );
                     out.push_str(&text);
                     out.push_str("\n\n");
                 }
@@ -144,12 +83,17 @@ impl LlmTextGenerator {
                 }
                 _ => {
                     // Include other types (Title, Footnote, etc.) by default.
-                    let text = if let Some((ref detector, ref converter, ref mc)) = math_components
-                    {
-                        convert_block_text_for_llm(block, detector, converter, mc)
-                    } else {
-                        block.text.clone()
+                    let (detector, converter) = match &math_components {
+                        Some((d, c)) => (Some(d), Some(c)),
+                        None => (None, None),
                     };
+                    let text = render_core::render_block(
+                        block,
+                        detector,
+                        converter,
+                        math_config.as_ref(),
+                        EscapeMode::Plain,
+                    );
                     out.push_str(&text);
                     out.push_str("\n\n");
                 }

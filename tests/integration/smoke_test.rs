@@ -356,6 +356,7 @@ fn chunker_on_constructed_document() {
         overlap_tokens: 100,
         split_strategy: SplitStrategy::SectionBoundary,
         include_section_context: true,
+        math_config: None,
     };
 
     let chunker = Chunker::new(config);
@@ -391,6 +392,7 @@ fn chunker_token_count_strategy() {
         overlap_tokens: 10,
         split_strategy: SplitStrategy::TokenCount,
         include_section_context: false,
+        math_config: None,
     };
 
     let chunker = Chunker::new(config);
@@ -413,6 +415,7 @@ fn chunker_paragraph_strategy() {
         overlap_tokens: 10,
         split_strategy: SplitStrategy::Paragraph,
         include_section_context: false,
+        math_config: None,
     };
 
     let chunker = Chunker::new(config);
@@ -706,6 +709,7 @@ fn ieee_paper_chunking_produces_chunks() {
         overlap_tokens: 100,
         split_strategy: SplitStrategy::SectionBoundary,
         include_section_context: true,
+        math_config: None,
     };
     let chunker = Chunker::new(config);
     let chunks = chunker.chunk(&result.document);
@@ -783,6 +787,7 @@ fn ieee_paper_all_strategies_produce_chunks() {
             overlap_tokens: 50,
             split_strategy: strategy,
             include_section_context: true,
+            math_config: None,
         };
         let chunker = Chunker::new(config);
         let chunks = chunker.chunk(&result.document);

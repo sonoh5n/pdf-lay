@@ -146,6 +146,7 @@ impl PyPaperDocument {
             overlap_tokens: overlap,
             split_strategy,
             include_section_context: true,
+            math_config: None,
         };
         Ok(Chunker::new(config)
             .chunk(&self.inner)
@@ -380,6 +381,7 @@ impl PySectionSelector {
             overlap_tokens: overlap,
             split_strategy: SplitStrategy::SectionBoundary,
             include_section_context: true,
+            math_config: None,
         };
         Ok(self
             .rebuild_selector()

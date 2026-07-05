@@ -3,95 +3,10 @@
 use std::collections::VecDeque;
 use std::path::Path;
 
-use crate::config::{CaptionStyle, MarkdownConfig, MathConfig};
-use crate::math::{MathContext, MathConverter, MathDetector, MathFormatter};
-use crate::types::{
-    BlockType, FigureInfo, PaperDocument, Section, TableInfo, TableRepresentation, TextBlock,
-};
-
-/// Convert a block's text, replacing contiguous math spans with formatted math notation.
-///
-/// For each line in the block, math regions are detected using `detector`.
-/// Non-math spans are output as-is; math spans are converted via `converter` and
-/// wrapped with [`MathFormatter::format_for_markdown`].
-///
-/// When no math regions are found in a line, the line's span texts are concatenated
-/// without modification.
-/// Convert a block's text, replacing contiguous math spans with formatted math notation.
-///
-/// Non-math spans are sanitized via [`escape_for_markdown_text`] so that PDF-derived
-/// text cannot inject HTML or Markdown structures, while math regions are left
-/// unescaped so that `$...$` / `$$...$$` delimiters and LaTeX commands remain valid.
-fn convert_block_text_with_math(
-    block: &TextBlock,
-    detector: &MathDetector,
-    converter: &MathConverter,
-    config: &MathConfig,
-) -> String {
-    let mut result = String::new();
-
-    for (line_idx, line) in block.lines.iter().enumerate() {
-        if line_idx > 0 {
-            result.push('\n');
-        }
-
-        let math_regions = detector.detect_in_line(line);
-
-        if math_regions.is_empty() {
-            // No math in this line — concatenate span texts and sanitize.
-            let line_text: String = line.spans.iter().map(|s| s.text.as_str()).collect();
-            result.push_str(&escape_for_markdown_text(&line_text));
-        } else {
-            // Rebuild the line, substituting math regions with formatted math.
-            let mut span_idx = 0usize;
-
-            for region in &math_regions {
-                // Output non-math spans that precede this region (sanitized).
-                while span_idx < line.spans.len() {
-                    let span = &line.spans[span_idx];
-                    // Check whether this span is the start of the current region.
-                    let is_region_start = region
-                        .spans
-                        .first()
-                        .is_some_and(|rs| rs.bbox.left == span.bbox.left && rs.text == span.text);
-                    if is_region_start {
-                        break;
-                    }
-                    result.push_str(&escape_for_markdown_text(&span.text));
-                    span_idx += 1;
-                }
-
-                // Convert and format the math region (NOT escaped — math content
-                // must preserve LaTeX operators like < > &).
-                let converted = converter.convert(&region.text, &region.spans);
-                let is_display = region.context == MathContext::Display;
-                let formatted = MathFormatter::format_for_markdown(
-                    &converted,
-                    is_display,
-                    region.equation_number.as_deref(),
-                    config,
-                );
-                result.push_str(&formatted);
-
-                // Advance past the math spans belonging to this region.
-                span_idx += region.spans.len();
-            }
-
-            // Output any remaining non-math spans after the last region (sanitized).
-            while span_idx < line.spans.len() {
-                result.push_str(&escape_for_markdown_text(&line.spans[span_idx].text));
-                span_idx += 1;
-            }
-        }
-    }
-
-    // Fall back to block.text if lines are empty (defensive).
-    if result.is_empty() && !block.text.is_empty() {
-        return escape_for_markdown_text(&block.text);
-    }
-
-    result
-}
+use crate::config::{CaptionStyle, MarkdownConfig};
+use crate::math::{MathConverter, MathDetector};
+use crate::output::render_core::{self, EscapeMode, escape_for_markdown_text};
+use crate::types::{BlockType, FigureInfo, PaperDocument, Section, TableInfo, TableRepresentation};
 
 /// Escape a string for use inside a double-quoted YAML value.
 ///
@@ -132,16 +47,6 @@ fn relative_image_path(image_dir: &Path, output_dir: &Path, filename: &str) -> S
         }
         None => format!("./{filename}"),
     }
-}
-
-/// Escape a string for safe inclusion in Markdown body text or headings.
-///
-/// Neutralizes HTML tags (`<` / `>`) and Markdown link injection (`](`).
-fn escape_for_markdown_text(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace("](", "]\\(")
 }
 
 /// Generates Markdown from a [`PaperDocument`].
@@ -237,18 +142,21 @@ impl MarkdownGenerator {
                     | BlockType::RunningFooter
             );
             if emit_body {
-                let text = if let Some((ref detector, ref converter)) = math_components {
-                    let mc = self
-                        .config
-                        .math_config
-                        .as_ref()
-                        .expect("math_config present");
-                    // Escaping is applied inside convert_block_text_with_math
-                    // to non-math spans only, preserving math delimiters.
-                    convert_block_text_with_math(block, detector, converter, mc)
-                } else {
-                    escape_for_markdown_text(&block.text)
+                // Delegates to render-core's single block→rich-text
+                // implementation (shared with llm_text/chunker). Escaping is
+                // applied inside render_block to non-math spans only,
+                // preserving math delimiters.
+                let (detector, converter) = match &math_components {
+                    Some((d, c)) => (Some(d), Some(c)),
+                    None => (None, None),
                 };
+                let text = render_core::render_block(
+                    block,
+                    detector,
+                    converter,
+                    self.config.math_config.as_ref(),
+                    EscapeMode::Markdown,
+                );
                 md.push_str(&text);
                 md.push_str("\n\n");
             }

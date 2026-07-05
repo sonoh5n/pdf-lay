@@ -1,6 +1,7 @@
 //! Splits a PaperDocument into Chunks for LLM consumption.
 
-use crate::config::{ChunkConfig, SplitStrategy};
+use crate::config::{ChunkConfig, FigureTextFormat, SplitStrategy};
+use crate::output::render_core::{self, EscapeMode, RenderOptions};
 use crate::types::{Chunk, PaperDocument, Section};
 
 /// Splits a [`PaperDocument`] into [`Chunk`] records for LLM consumption.
@@ -13,6 +14,25 @@ impl Chunker {
     /// Create a new chunker with the given configuration.
     pub fn new(config: ChunkConfig) -> Self {
         Self { config }
+    }
+
+    /// Build the render-core options used to turn a [`Section`] into chunk
+    /// body text: math conversion follows `self.config.math_config` (`None`
+    /// disables it, preserving the pre-render-core behavior of chunk text
+    /// carrying unconverted math glyphs), section headers are left out (the
+    /// breadcrumb/heading prefix is a chunker-level concern, not render-core's),
+    /// and figures/tables are interleaved at their insertion point so chunk
+    /// text reaches the same fidelity as markdown/llm_text output.
+    fn render_opts(&self) -> RenderOptions<'_> {
+        RenderOptions {
+            math_config: self.config.math_config.as_ref(),
+            escape: EscapeMode::Plain,
+            include_headers: false,
+            include_figures: true,
+            include_tables: true,
+            figure_format: FigureTextFormat::Placeholder,
+            image_base: String::new(),
+        }
     }
 
     /// Chunk an entire document.
@@ -28,9 +48,10 @@ impl Chunker {
     pub fn chunk_sections(&self, sections: &[&Section]) -> Vec<Chunk> {
         let mut chunks = Vec::new();
         let mut chunk_id = 0;
+        let opts = self.render_opts();
 
         for section in sections {
-            let section_text = section.full_text();
+            let section_text = render_core::render_section_content(section, &opts);
             let estimated_tokens = Self::estimate_tokens(&section_text);
 
             if estimated_tokens <= self.config.max_tokens {
@@ -48,7 +69,7 @@ impl Chunker {
                 chunk_id += 1;
             } else {
                 let sub = self.split_section_text(
-                    &section.full_text(),
+                    &section_text,
                     "",
                     section.header_text(),
                     section.page_range,
@@ -82,7 +103,8 @@ impl Chunker {
         chunk_id: &mut usize,
         out: &mut Vec<Chunk>,
     ) {
-        let section_text = section.full_text();
+        let opts = self.render_opts();
+        let section_text = render_core::render_section_content(section, &opts);
         let estimated_tokens = Self::estimate_tokens(&section_text);
 
         if estimated_tokens <= self.config.max_tokens {
@@ -101,7 +123,7 @@ impl Chunker {
         } else {
             // Section too large: split by paragraph.
             let sub = self.split_section_text(
-                &section.full_text(),
+                &section_text,
                 paper_id,
                 section.header_text(),
                 section.page_range,
@@ -223,11 +245,15 @@ impl Chunker {
     // ---- Strategy: TokenCount ----
 
     fn chunk_by_tokens(&self, doc: &PaperDocument) -> Vec<Chunk> {
-        // Concatenate all section text then split mechanically.
+        // Concatenate all section rich text (render-core: math-converted,
+        // with inline table markdown and figure placeholders) then split
+        // mechanically. Section attribution for these chunks is not yet
+        // preserved (see P2-4); this task only fixes the text fidelity.
+        let opts = self.render_opts();
         let all_text: String = doc
             .sections
             .iter()
-            .map(|s| s.full_text())
+            .map(|s| render_core::render_section_content(s, &opts))
             .collect::<Vec<_>>()
             .join("\n\n");
 
@@ -277,10 +303,11 @@ impl Chunker {
     // ---- Strategy: Paragraph ----
 
     fn chunk_by_paragraph(&self, doc: &PaperDocument) -> Vec<Chunk> {
+        let opts = self.render_opts();
         let all_text: String = doc
             .sections
             .iter()
-            .map(|s| s.full_text())
+            .map(|s| render_core::render_section_content(s, &opts))
             .collect::<Vec<_>>()
             .join("\n\n");
 
@@ -370,6 +397,7 @@ mod tests {
             overlap_tokens: 200,
             split_strategy: SplitStrategy::SectionBoundary,
             include_section_context: true,
+            math_config: None,
         }
     }
 
@@ -437,6 +465,7 @@ mod tests {
             overlap_tokens: 2, // 2 * 4 = 8 target chars
             split_strategy: SplitStrategy::SectionBoundary,
             include_section_context: true,
+            math_config: None,
         };
         let chunker = Chunker::new(config);
         // 10 Japanese characters (3 bytes each in UTF-8).
@@ -453,11 +482,169 @@ mod tests {
             overlap_tokens: 0,
             split_strategy: SplitStrategy::TokenCount,
             include_section_context: true,
+            math_config: None,
         };
         let chunker = Chunker::new(config);
         let doc = make_doc_with_sections(vec![make_section("SEC", "Hello world.", 1)]);
         // Should complete without infinite loop (max_tokens clamped to 1).
         let chunks = chunker.chunk(&doc);
         assert!(!chunks.is_empty());
+    }
+
+    // ---- render-core integration (P2-1): chunk.text must carry the same
+    // fidelity as markdown/llm_text output instead of raw full_text(). ----
+
+    /// A section whose single block is a math-font line (CMMI10 "α", all-math
+    /// → Display context), so math conversion is exercised end-to-end.
+    fn make_math_section(math_text: &str, font_name: &str) -> Section {
+        use crate::types::{SectionHeader, TextLine, TextSpan};
+
+        let span = TextSpan {
+            text: math_text.to_string(),
+            font_name: font_name.to_string(),
+            font_size: 10.0,
+            is_bold: false,
+            is_italic: true,
+            bbox: Rect::new(100.0, 700.0, 150.0, 690.0),
+            page: 0,
+        };
+        let line = TextLine {
+            text: math_text.to_string(),
+            spans: vec![span],
+            bbox: Rect::new(100.0, 700.0, 150.0, 690.0),
+            page: 0,
+            baseline_y: 690.0,
+            primary_font_size: 10.0,
+            primary_font_name: font_name.to_string(),
+            is_bold: false,
+        };
+        let block = TextBlock {
+            global_index: 0,
+            lines: vec![line],
+            text: math_text.to_string(),
+            bbox: Rect::new(100.0, 700.0, 150.0, 690.0),
+            page: 0,
+            column_index: 0,
+            block_type: BlockType::BodyText,
+        };
+        Section {
+            header: Some(SectionHeader {
+                text: "SEC".to_string(),
+                clean_text: "SEC".to_string(),
+                level: 1,
+                numbering: None,
+                page: 0,
+                bbox: Rect::new(0.0, 0.0, 0.0, 0.0),
+                block_index: 0,
+            }),
+            level: 1,
+            blocks: vec![block],
+            figures: vec![],
+            tables: vec![],
+            children: vec![],
+            page_range: (0, 0),
+        }
+    }
+
+    #[test]
+    fn chunk_text_contains_converted_math() {
+        use crate::config::{MathConfig, MathRepresentationPreference};
+
+        let config = ChunkConfig {
+            math_config: Some(MathConfig {
+                representation: MathRepresentationPreference::LaTeX,
+                ..MathConfig::default()
+            }),
+            ..default_config()
+        };
+        let chunker = Chunker::new(config);
+        let doc = make_doc_with_sections(vec![make_math_section("α", "CMMI10")]);
+        let chunks = chunker.chunk(&doc);
+
+        assert_eq!(chunks.len(), 1);
+        assert!(
+            chunks[0].text.contains("\\alpha"),
+            "expected converted math '\\alpha' in chunk text, got: {}",
+            chunks[0].text
+        );
+        assert!(
+            !chunks[0].text.contains('α'),
+            "raw math glyph should have been converted, got: {}",
+            chunks[0].text
+        );
+    }
+
+    #[test]
+    fn chunk_text_contains_table_markdown() {
+        use crate::types::{InsertionPoint, TableInfo, TableRepresentation};
+
+        let mut section = make_section("SEC", "Body text.", 1);
+        section.tables.push(TableInfo {
+            table_id: "Table 1".to_string(),
+            table_number: Some(1),
+            caption: None,
+            representation: TableRepresentation::Markdown {
+                header: vec!["A".to_string(), "B".to_string()],
+                rows: vec![vec!["1".to_string(), "2".to_string()]],
+                caption: None,
+                markdown_text: "| A | B |\n| --- | --- |\n| 1 | 2 |\n".to_string(),
+            },
+            insertion_point: InsertionPoint {
+                page: 0,
+                after_block_index: None,
+                y_position: 0.0,
+            },
+            page: 0,
+        });
+        let config = default_config();
+        let chunker = Chunker::new(config);
+        let doc = make_doc_with_sections(vec![section]);
+        let chunks = chunker.chunk(&doc);
+
+        assert_eq!(chunks.len(), 1);
+        assert!(
+            chunks[0].text.contains("| --- |"),
+            "expected table markdown in chunk text, got: {}",
+            chunks[0].text
+        );
+    }
+
+    #[test]
+    fn chunk_text_contains_figure_placeholder() {
+        use crate::types::{FigureInfo, ImageFormat, ImageInfo, InsertionPoint};
+        use std::path::PathBuf;
+
+        let mut section = make_section("SEC", "Body text.", 1);
+        section.figures.push(FigureInfo {
+            figure_id: "Fig. 1".to_string(),
+            figure_number: Some(1),
+            caption_text: "Fig. 1: A diagram.".to_string(),
+            image: ImageInfo {
+                path: PathBuf::from("images/p000_img000.png"),
+                page: 0,
+                raw_bbox: Rect::new(0.0, 0.0, 0.0, 0.0),
+                normalized_bbox: Rect::new(0.0, 0.0, 0.0, 0.0),
+                width_px: 10,
+                height_px: 10,
+                format: ImageFormat::Png,
+            },
+            context_text: String::new(),
+            insertion_point: InsertionPoint {
+                page: 0,
+                after_block_index: Some(0),
+                y_position: 0.0,
+            },
+        });
+        let config = default_config();
+        let chunker = Chunker::new(config);
+        let doc = make_doc_with_sections(vec![section]);
+        let chunks = chunker.chunk(&doc);
+
+        assert_eq!(chunks.len(), 1);
+        assert!(
+            chunks[0].text.contains("[IMAGE:"),
+            "expected figure placeholder in chunk text, got: {}",
+            chunks[0].text
+        );
     }
 }

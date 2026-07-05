@@ -430,6 +430,14 @@ pub struct ChunkConfig {
     pub split_strategy: SplitStrategy,
     /// Whether to prepend the section path as context at the start of each chunk.
     pub include_section_context: bool,
+    /// Optional math configuration used to render chunk body text.
+    ///
+    /// `None` (the default) keeps the legacy behavior of chunk text carrying
+    /// unconverted math glyphs; `Some` routes chunk rendering through the same
+    /// math detector/converter used by Markdown and LLM text output, via
+    /// `output::render_core`.
+    #[serde(default)]
+    pub math_config: Option<MathConfig>,
 }
 
 impl Default for ChunkConfig {
@@ -439,6 +447,7 @@ impl Default for ChunkConfig {
             overlap_tokens: 200,
             split_strategy: SplitStrategy::SectionBoundary,
             include_section_context: true,
+            math_config: None,
         }
     }
 }
