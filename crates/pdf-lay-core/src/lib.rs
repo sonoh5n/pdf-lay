@@ -37,7 +37,7 @@ pub use config::{
     CaptionStyle, ChunkConfig, Config, FigureTextFormat, LlmTextConfig, MarkdownConfig, MathConfig,
     MathRepresentationPreference, ResourceLimits, SplitStrategy, TableConfig,
 };
-pub use error::{AnalysisResult, PdfLayError, PdfLayWarning};
+pub use error::{AnalysisResult, Coverage, PdfLayError, PdfLayWarning};
 pub use math::{
     MathContext, MathConverter, MathDetector, MathFormatter, MathRegion, math_symbols,
     to_latex_map, to_unicode_map,

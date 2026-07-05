@@ -10,7 +10,10 @@ use std::path::PathBuf;
 use std::process;
 
 use clap::{Args, Parser, Subcommand};
-use pdf_lay::{CaptionStyle, Config, MarkdownConfig, MarkdownGenerator, TocGenerator, analyze_pdf};
+use pdf_lay::{
+    CaptionStyle, Config, MarkdownConfig, MarkdownGenerator, MathConfig,
+    MathRepresentationPreference, TocGenerator, analyze_pdf,
+};
 
 const CLI_LONG_ABOUT: &str = "\
 Analyze academic-paper PDFs and emit section-aware outputs for review, conversion,
@@ -295,15 +298,17 @@ Markdown without page annotations."
     /// Base path used for image links in the generated Markdown.
     #[arg(
         long,
-        default_value = "./images",
         value_name = "PATH",
         help = "Base path written into Markdown image links.",
         long_help = "Base path written into Markdown image links.\n\n\
-This string is prefixed to extracted image filenames when pdf-lay emits \
-Markdown image links such as `![Fig. 1](PATH/p000_img000.png)`. It does not \
-control where image files are saved; use `--image-dir` for that."
+When set, this string is prefixed to extracted image filenames in Markdown image \
+links such as `![Fig. 1](PATH/p000_img000.png)`. When omitted, and output is \
+written to a file with `-o`, pdf-lay instead computes the link path relative to \
+that output file's directory using `--image-dir`, so links resolve no matter \
+where the .md is written. This option does not control where image files are \
+saved; use `--image-dir` for that."
     )]
-    image_base: String,
+    image_base: Option<String>,
 
     /// Write output to a file instead of stdout.
     #[arg(
@@ -317,6 +322,23 @@ other tools. When provided, pdf-lay writes the final Markdown bytes directly to 
 the specified file path."
     )]
     output: Option<PathBuf>,
+
+    /// How to render mathematical expressions in the Markdown output.
+    #[arg(
+        long,
+        default_value = "latex",
+        value_name = "FORMAT",
+        value_parser = ["latex", "unicode", "plain", "off"],
+        help = "How to render math: latex (default), unicode, plain, or off.",
+        long_help = "How to render mathematical expressions detected in the PDF.\n\n\
+  latex   - LaTeX notation such as `$E = mc^{2}$` (default; best for LLMs).\n\
+  unicode - Unicode math characters such as `E = mc²`.\n\
+  plain   - Plain ASCII approximation such as `E = mc^2`.\n\
+  off     - No conversion; math spans are emitted as raw extracted glyphs.\n\n\
+Math conversion is enabled by default. Use `off` to reproduce the previous \
+raw-text behavior."
+    )]
+    math_format: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -401,18 +423,58 @@ fn print_entries(entries: &[pdf_lay::SectionEntry], indent: usize, figures_only:
 // Subcommand: markdown
 // ---------------------------------------------------------------------------
 
+/// Build the optional math configuration from the `--math-format` flag.
+///
+/// Returns `None` for `"off"` (raw glyphs, no conversion); otherwise a
+/// `MathConfig` with the requested representation.
+fn math_config_from_flag(format: &str) -> Option<MathConfig> {
+    let representation = match format {
+        "off" => return None,
+        "unicode" => MathRepresentationPreference::UnicodeMath,
+        "plain" => MathRepresentationPreference::PlainText,
+        _ => MathRepresentationPreference::LaTeX,
+    };
+    Some(MathConfig {
+        representation,
+        ..MathConfig::default()
+    })
+}
+
 fn cmd_markdown(args: &MarkdownArgs) {
     let result = run_analysis(&args.common);
     let doc = &result.document;
 
+    // If --image-base was given explicitly, honor it (prefix behavior). Otherwise
+    // compute image links relative to the output file's directory when writing to
+    // a file, so links resolve regardless of where the .md lives.
+    let image_base_explicit = args.image_base.is_some();
+    let image_base_path = args
+        .image_base
+        .clone()
+        .unwrap_or_else(|| "./images".to_string());
+    let (image_dir, output_dir) = if image_base_explicit {
+        (None, None)
+    } else {
+        let output_dir = args.output.as_ref().and_then(|p| p.parent()).map(|par| {
+            if par.as_os_str().is_empty() {
+                PathBuf::from(".")
+            } else {
+                par.to_path_buf()
+            }
+        });
+        (Some(args.common.image_dir.clone()), output_dir)
+    };
+
     let md_config = MarkdownConfig {
-        image_base_path: args.image_base.clone(),
+        image_base_path,
         include_page_numbers: !args.no_page_numbers,
         heading_offset: args.heading_offset,
         include_metadata_header: false,
         table_as_image: false,
         figure_caption_style: CaptionStyle::Italic,
-        math_config: None,
+        math_config: math_config_from_flag(&args.math_format),
+        image_dir,
+        output_dir,
     };
 
     let output = if args.sections.is_empty() {
@@ -501,6 +563,35 @@ mod tests {
         assert!(help.contains("--image-dir"));
         assert!(help.contains("--image-base"));
         assert!(help.contains("Section filtering:"));
+    }
+
+    #[test]
+    fn markdown_math_format_defaults_to_latex() {
+        let cli = Cli::try_parse_from(["pdf-lay", "markdown", "paper.pdf"])
+            .expect("markdown should parse with defaults");
+        let super::Commands::Markdown(args) = cli.command else {
+            panic!("expected markdown command");
+        };
+        assert_eq!(args.math_format, "latex");
+        assert!(super::math_config_from_flag(&args.math_format).is_some());
+    }
+
+    #[test]
+    fn markdown_math_format_off_disables_conversion() {
+        let cli = Cli::try_parse_from(["pdf-lay", "markdown", "paper.pdf", "--math-format", "off"])
+            .expect("--math-format off should parse");
+        let super::Commands::Markdown(args) = cli.command else {
+            panic!("expected markdown command");
+        };
+        assert_eq!(args.math_format, "off");
+        assert!(super::math_config_from_flag(&args.math_format).is_none());
+    }
+
+    #[test]
+    fn markdown_math_format_rejects_unknown() {
+        let result =
+            Cli::try_parse_from(["pdf-lay", "markdown", "paper.pdf", "--math-format", "bogus"]);
+        assert!(result.is_err(), "unknown math format should be rejected");
     }
 
     #[test]

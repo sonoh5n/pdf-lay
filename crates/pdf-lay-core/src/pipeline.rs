@@ -2,6 +2,7 @@
 
 use std::path::Path;
 
+use crate::error::Coverage;
 use crate::{
     config::Config,
     error::{AnalysisResult, PdfLayError, PdfLayWarning},
@@ -10,7 +11,7 @@ use crate::{
     layout::{ColumnDetector, LineReconstructor},
     structure::{BlockClassifier, BlockGrouper, HeaderDetector, MetadataExtractor, SectionBuilder},
     table::{GridBuilder, TableDetector, TableRegion, TableTextConverter},
-    types::{InsertionPoint, PaperDocument, TableInfo, TextBlock},
+    types::{BlockType, InsertionPoint, PaperDocument, Section, TableInfo, TextBlock},
 };
 
 /// Analyze a PDF file and return a structured `PaperDocument`.
@@ -57,18 +58,51 @@ pub fn analyze_pdf(path: &Path, config: &Config) -> Result<AnalysisResult, PdfLa
     let raw_spans = reader.extract_all_text_spans()?;
     let spans = SpanBuilder::new().merge(raw_spans);
 
-    // Collect page dimensions.
+    // Coverage baseline: total characters extracted from the PDF.
+    let extracted_chars: usize = spans.iter().map(|s| s.text.chars().count()).sum();
+
+    // Collect page dimensions. Prefer the real MediaBox; when it cannot be read,
+    // derive the page extent from that page's spans so no on-page text falls
+    // outside the layout bounds (No Silent Drop), and only then fall back to a
+    // Letter-size default. Both fallbacks are reported as warnings.
     let mut page_dims_list = Vec::new();
     for page in 0..page_count {
-        match reader.page_dimensions(page) {
-            Ok(dims) => page_dims_list.push(dims),
-            Err(e) => {
-                warnings.push(PdfLayWarning::PageSkipped {
-                    page,
-                    reason: e.to_string(),
-                });
+        let dims = match reader.page_media_box(page) {
+            Some((width, height, _rotation)) => crate::types::PageDimensions {
+                page_number: page,
+                width,
+                height,
+            },
+            None => {
+                let (mut width, mut height) = (0.0_f64, 0.0_f64);
+                for s in spans.iter().filter(|s| s.page == page) {
+                    width = width.max(s.bbox.right);
+                    height = height.max(s.bbox.top);
+                }
+                if width > 0.0 && height > 0.0 {
+                    warnings.push(PdfLayWarning::PageDimensionsFallback {
+                        page,
+                        method: "span-bbox",
+                    });
+                    crate::types::PageDimensions {
+                        page_number: page,
+                        width,
+                        height,
+                    }
+                } else {
+                    warnings.push(PdfLayWarning::PageDimensionsFallback {
+                        page,
+                        method: "letter-default",
+                    });
+                    crate::types::PageDimensions {
+                        page_number: page,
+                        width: 612.0,
+                        height: 792.0,
+                    }
+                }
             }
-        }
+        };
+        page_dims_list.push(dims);
     }
 
     // Extract images (optional).
@@ -144,7 +178,8 @@ pub fn analyze_pdf(path: &Path, config: &Config) -> Result<AnalysisResult, PdfLa
         .with_gap_multiplier(config.block_gap_multiplier)
         .group(&lines, &layouts);
 
-    let classifier = BlockClassifier::from_blocks(&blocks);
+    let classifier = BlockClassifier::from_blocks(&blocks)
+        .with_limits(config.caption_max_chars, config.running_header_max_chars);
     classifier.classify_all(&mut blocks);
 
     let headers = HeaderDetector::with_config(
@@ -227,6 +262,21 @@ pub fn analyze_pdf(path: &Path, config: &Config) -> Result<AnalysisResult, PdfLa
 
     // ---- Phase 6: Section Assembly ----
 
+    // Coverage: count blocks that will be dropped from body text by the
+    // renderer (they are represented elsewhere or intentionally excluded).
+    let dropped_blocks = blocks
+        .iter()
+        .filter(|b| {
+            matches!(
+                b.block_type,
+                BlockType::Caption
+                    | BlockType::PageNumber
+                    | BlockType::RunningHeader
+                    | BlockType::RunningFooter
+            )
+        })
+        .count();
+
     let sections = SectionBuilder::build(blocks, &headers, figures, tables, &layouts);
 
     // ---- Assembly ----
@@ -250,7 +300,66 @@ pub fn analyze_pdf(path: &Path, config: &Config) -> Result<AnalysisResult, PdfLa
         all_tables,
     };
 
-    Ok(AnalysisResult { document, warnings })
+    // Coverage: characters that reached the output (section body + headers).
+    let emitted_chars = emitted_char_count(&document.sections);
+    let ratio = if extracted_chars == 0 {
+        1.0
+    } else {
+        (emitted_chars as f64 / extracted_chars as f64).clamp(0.0, 1.0)
+    };
+    if ratio < config.min_coverage_ratio {
+        warnings.push(PdfLayWarning::LowCoverage { ratio });
+    }
+    let coverage = Coverage {
+        extracted_chars,
+        emitted_chars,
+        dropped_blocks,
+        ratio,
+    };
+
+    Ok(AnalysisResult {
+        document,
+        warnings,
+        coverage,
+    })
+}
+
+/// Recursively sum the characters that reach the output: each section's body
+/// text, header text, and figure/table captions.
+///
+/// Figure and table captions are rendered in the output but are excluded from
+/// [`Section::full_text`] (they are `Caption`-type blocks), so they are counted
+/// here to keep the coverage ratio aligned with the actual output reach. Table
+/// cell text is already counted via `full_text` body blocks, so the table
+/// representation itself is intentionally not added again (doing so would
+/// double-count the cells and inflate the ratio).
+fn emitted_char_count(sections: &[Section]) -> usize {
+    sections
+        .iter()
+        .map(|s| {
+            let header_chars = s
+                .header
+                .as_ref()
+                .map(|h| h.clean_text.chars().count())
+                .unwrap_or(0);
+            let figure_caption_chars: usize = s
+                .figures
+                .iter()
+                .map(|f| f.caption_text.chars().count())
+                .sum();
+            let table_caption_chars: usize = s
+                .tables
+                .iter()
+                .filter_map(|t| t.caption.as_ref())
+                .map(|c| c.chars().count())
+                .sum();
+            header_chars
+                + s.full_text().chars().count()
+                + figure_caption_chars
+                + table_caption_chars
+                + emitted_char_count(&s.children)
+        })
+        .sum()
 }
 
 /// Recursively collect all figures from sections and their children.
@@ -318,6 +427,89 @@ pub fn analyze_pdf_bytes(bytes: &[u8], config: &Config) -> Result<AnalysisResult
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn emitted_char_count_sums_headers_and_body() {
+        use crate::types::{Rect, Section, SectionHeader};
+
+        let block = TextBlock {
+            global_index: 0,
+            lines: vec![],
+            text: "hello".to_string(), // 5 chars
+            bbox: Rect::new(0.0, 0.0, 0.0, 0.0),
+            page: 0,
+            column_index: 0,
+            block_type: BlockType::BodyText,
+        };
+        let section = Section {
+            header: Some(SectionHeader {
+                text: "1 Intro".to_string(),
+                clean_text: "Intro".to_string(), // 5 chars
+                level: 1,
+                numbering: None,
+                page: 0,
+                bbox: Rect::new(0.0, 0.0, 0.0, 0.0),
+                block_index: 0,
+            }),
+            level: 1,
+            blocks: vec![block],
+            figures: vec![],
+            tables: vec![],
+            children: vec![],
+            page_range: (0, 0),
+        };
+        // header "Intro" (5) + body "hello" (5) = 10.
+        assert_eq!(emitted_char_count(&[section]), 10);
+    }
+
+    #[test]
+    fn emitted_char_count_includes_figure_caption() {
+        use crate::types::{
+            FigureInfo, ImageFormat, ImageInfo, InsertionPoint, Rect, Section, TextBlock,
+        };
+
+        let block = TextBlock {
+            global_index: 0,
+            lines: vec![],
+            text: "abc".to_string(), // 3 chars
+            bbox: Rect::new(0.0, 0.0, 0.0, 0.0),
+            page: 0,
+            column_index: 0,
+            block_type: BlockType::BodyText,
+        };
+        let figure = FigureInfo {
+            figure_id: "Fig. 1".to_string(),
+            figure_number: Some(1),
+            caption_text: "Fig. 1: X".to_string(), // 9 chars
+            image: ImageInfo {
+                path: std::path::PathBuf::from("images/p000_img000.png"),
+                page: 0,
+                raw_bbox: Rect::new(0.0, 0.0, 0.0, 0.0),
+                normalized_bbox: Rect::new(0.0, 0.0, 0.0, 0.0),
+                width_px: 1,
+                height_px: 1,
+                format: ImageFormat::Png,
+            },
+            context_text: String::new(),
+            insertion_point: InsertionPoint {
+                page: 0,
+                after_block_index: None,
+                y_position: 0.0,
+            },
+        };
+        let section = Section {
+            header: None,
+            level: 1,
+            blocks: vec![block],
+            figures: vec![figure],
+            tables: vec![],
+            children: vec![],
+            page_range: (0, 0),
+        };
+        // body "abc" (3) + figure caption "Fig. 1: X" (9) = 12; the caption is
+        // excluded from full_text() but rendered in the output.
+        assert_eq!(emitted_char_count(&[section]), 12);
+    }
 
     #[test]
     fn analyze_pdf_returns_file_not_found_for_nonexistent_path() {

@@ -29,6 +29,36 @@ pub struct Config {
     pub header_detection: HeaderDetectionConfig,
     /// Resource limits to guard against excessively large inputs.
     pub resource_limits: ResourceLimits,
+    /// Maximum character count for a block to be classified as a figure/table
+    /// caption. Longer blocks that merely start with "Table"/"Figure" are kept
+    /// as body text rather than dropped.
+    #[serde(default = "default_caption_max_chars")]
+    pub caption_max_chars: usize,
+    /// Maximum character count for a small-font single line to be classified as
+    /// a running header. Longer lines are kept as body text even if the font is
+    /// smaller than body size.
+    #[serde(default = "default_running_header_max_chars")]
+    pub running_header_max_chars: usize,
+    /// Minimum acceptable text-coverage ratio (emitted / extracted characters).
+    /// A `LowCoverage` warning is emitted when the measured ratio falls below
+    /// this value.
+    #[serde(default = "default_min_coverage_ratio")]
+    pub min_coverage_ratio: f64,
+}
+
+/// Default value for [`Config::caption_max_chars`].
+fn default_caption_max_chars() -> usize {
+    240
+}
+
+/// Default value for [`Config::running_header_max_chars`].
+fn default_running_header_max_chars() -> usize {
+    60
+}
+
+/// Default value for [`Config::min_coverage_ratio`].
+fn default_min_coverage_ratio() -> f64 {
+    0.9
 }
 
 impl Default for Config {
@@ -45,6 +75,9 @@ impl Default for Config {
             block_gap_multiplier: 1.8,
             header_detection: HeaderDetectionConfig::default(),
             resource_limits: ResourceLimits::default(),
+            caption_max_chars: default_caption_max_chars(),
+            running_header_max_chars: default_running_header_max_chars(),
+            min_coverage_ratio: default_min_coverage_ratio(),
         }
     }
 }
@@ -78,6 +111,18 @@ pub struct MarkdownConfig {
     /// Optional math configuration for converting math spans at render time.
     /// When `None`, math spans are output as plain `block.text` without conversion.
     pub math_config: Option<MathConfig>,
+    /// On-disk directory where extracted images live (from `--image-dir`).
+    ///
+    /// When both this and [`Self::output_dir`] are set, image links are written
+    /// as a path relative to the output file's directory instead of prefixing
+    /// [`Self::image_base_path`]. `None` keeps the legacy prefix behavior.
+    #[serde(default)]
+    pub image_dir: Option<PathBuf>,
+    /// Directory of the Markdown output file (from `-o`), or `None` for stdout.
+    ///
+    /// Used together with [`Self::image_dir`] to compute relative image links.
+    #[serde(default)]
+    pub output_dir: Option<PathBuf>,
 }
 
 impl Default for MarkdownConfig {
@@ -90,6 +135,8 @@ impl Default for MarkdownConfig {
             table_as_image: false,
             figure_caption_style: CaptionStyle::Italic,
             math_config: None,
+            image_dir: None,
+            output_dir: None,
         }
     }
 }

@@ -8,7 +8,7 @@ use pdf_lay_core::{
     AnalysisResult, analyze_pdf,
     config::{
         CaptionStyle, ChunkConfig, Config, FigureTextFormat, LlmTextConfig, MarkdownConfig,
-        MathRepresentationPreference, SplitStrategy,
+        MathConfig, MathRepresentationPreference, SplitStrategy,
     },
     output::{Chunker, JsonGenerator, MarkdownGenerator},
     selector::{SectionEntry, SectionSelector, TocGenerator},
@@ -86,12 +86,14 @@ impl PyPaperDocument {
     ///     image_base_path: Base path prepended to image paths in Markdown links.
     ///     include_page_numbers: Whether to annotate sections with page numbers.
     ///     heading_offset: Offset added to section level for ``#`` headers (1 = level-1 → ``##``).
-    #[pyo3(signature = (image_base_path = "./images", include_page_numbers = false, heading_offset = 1))]
+    ///     math_format: Math rendering: ``"latex"`` (default), ``"unicode"``, ``"plain"``, or ``"off"``.
+    #[pyo3(signature = (image_base_path = "./images", include_page_numbers = false, heading_offset = 1, math_format = "latex"))]
     fn to_markdown(
         &self,
         image_base_path: &str,
         include_page_numbers: bool,
         heading_offset: u8,
+        math_format: &str,
     ) -> String {
         let config = MarkdownConfig {
             image_base_path: image_base_path.to_string(),
@@ -100,7 +102,9 @@ impl PyPaperDocument {
             include_metadata_header: false,
             table_as_image: false,
             figure_caption_style: CaptionStyle::Italic,
-            math_config: None,
+            math_config: math_config_from_str(math_format),
+            image_dir: None,
+            output_dir: None,
         };
         MarkdownGenerator::new(config).generate(&self.inner)
     }
@@ -304,8 +308,8 @@ impl PySectionSelector {
     ///
     /// Args:
     ///     image_base_path: Base path prepended to image paths in Markdown links.
-    #[pyo3(signature = (image_base_path = "./images"))]
-    fn to_markdown(&self, image_base_path: &str) -> String {
+    #[pyo3(signature = (image_base_path = "./images", math_format = "latex"))]
+    fn to_markdown(&self, image_base_path: &str, math_format: &str) -> String {
         let config = MarkdownConfig {
             image_base_path: image_base_path.to_string(),
             include_page_numbers: false,
@@ -313,7 +317,9 @@ impl PySectionSelector {
             include_metadata_header: false,
             table_as_image: false,
             figure_caption_style: CaptionStyle::Italic,
-            math_config: None,
+            math_config: math_config_from_str(math_format),
+            image_dir: None,
+            output_dir: None,
         };
         self.rebuild_selector().to_markdown(&config)
     }
@@ -717,6 +723,24 @@ impl PyChunk {
 // Helper functions
 // ---------------------------------------------------------------------------
 
+/// Build the optional math configuration from a `math_format` string.
+///
+/// Returns `None` for `"off"` (raw glyphs, no conversion); otherwise a
+/// `MathConfig` with the requested representation (`"latex"`, `"unicode"`,
+/// `"plain"`; unknown values default to LaTeX).
+fn math_config_from_str(format: &str) -> Option<MathConfig> {
+    let representation = match format {
+        "off" => return None,
+        "unicode" => MathRepresentationPreference::UnicodeMath,
+        "plain" => MathRepresentationPreference::PlainText,
+        _ => MathRepresentationPreference::LaTeX,
+    };
+    Some(MathConfig {
+        representation,
+        ..MathConfig::default()
+    })
+}
+
 /// Recursively flatten sections into a depth-first ordered list.
 fn flatten_sections(sections: &[Section]) -> Vec<&Section> {
     let mut result = Vec::new();
@@ -769,7 +793,9 @@ fn analyze(
         ..Config::default()
     };
 
-    let AnalysisResult { document, warnings } = analyze_pdf(Path::new(path), &config)
+    let AnalysisResult {
+        document, warnings, ..
+    } = analyze_pdf(Path::new(path), &config)
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
     // Log non-fatal warnings to stderr (uses Display to omit PDF-derived text).

@@ -29,6 +29,7 @@ pub use pdf_lay_core::{
     Chunk,
     ChunkConfig,
     Config,
+    Coverage,
     DocumentMetadata,
     FigureInfo,
     FigureTextFormat,

@@ -1,6 +1,8 @@
 //! Groups TextLines within columns into paragraph-level TextBlocks.
 
-use crate::types::{BlockType, LayoutRegion, PageLayout, Rect, TextBlock, TextLine};
+use std::collections::HashMap;
+
+use crate::types::{BlockType, Column, LayoutRegion, PageLayout, Rect, TextBlock, TextLine};
 
 /// Groups lines into blocks using line-gap, font-size, and bold-change heuristics.
 pub struct BlockGrouper {
@@ -70,22 +72,70 @@ impl BlockGrouper {
                 continue;
             }
 
-            for region in regions {
-                for column in &region.columns {
-                    // Filter lines that belong to this column's X range and Y band.
-                    let col_lines: Vec<&TextLine> = page_lines
-                        .iter()
-                        .copied()
-                        .filter(|l| {
-                            l.bbox.center_x() >= column.left
-                                && l.bbox.center_x() < column.right
-                                && l.bbox.top <= region.y_top
-                                && l.bbox.bottom >= region.y_bottom
-                        })
-                        .collect();
+            // Assign EVERY line on the page to exactly one (region, column),
+            // picking the nearest when a line does not fall cleanly inside one
+            // (e.g. a line straddling a region boundary, or whose center sits
+            // outside all column ranges). No line is ever discarded — this is
+            // the No Silent Drop invariant. The previous implementation used a
+            // strict containment filter that silently dropped such lines.
+            let mut buckets: HashMap<(usize, usize), Vec<&TextLine>> = HashMap::new();
 
-                    let blocks =
-                        self.group_column_lines(&col_lines, &mut global_index, page, column.index);
+            // Output order: region order, then column order within each region.
+            let mut slot_order: Vec<(usize, usize)> = Vec::new();
+            for (ri, region) in regions.iter().enumerate() {
+                if region.columns.is_empty() {
+                    slot_order.push((ri, 0));
+                } else {
+                    for column in &region.columns {
+                        slot_order.push((ri, column.index));
+                    }
+                }
+            }
+
+            for &line in &page_lines {
+                let cy = line.bbox.center_y();
+                let cx = line.bbox.center_x();
+
+                // Nearest region by vertical distance (0 when inside the band).
+                let ri = regions
+                    .iter()
+                    .enumerate()
+                    .min_by(|(_, a), (_, b)| {
+                        region_y_distance(a, cy)
+                            .partial_cmp(&region_y_distance(b, cy))
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+
+                // Nearest column within that region (0 when the region has none).
+                let ci = if regions[ri].columns.is_empty() {
+                    0
+                } else {
+                    regions[ri]
+                        .columns
+                        .iter()
+                        .min_by(|a, b| {
+                            column_x_distance(a, cx)
+                                .partial_cmp(&column_x_distance(b, cx))
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        })
+                        .map(|c| c.index)
+                        .unwrap_or(0)
+                };
+
+                buckets.entry((ri, ci)).or_default().push(line);
+            }
+
+            debug_assert_eq!(
+                buckets.values().map(|v| v.len()).sum::<usize>(),
+                page_lines.len(),
+                "every line on the page must be assigned to a bucket (No Silent Drop)"
+            );
+
+            for slot in &slot_order {
+                if let Some(bucket) = buckets.get(slot) {
+                    let blocks = self.group_column_lines(bucket, &mut global_index, page, slot.1);
                     all_blocks.extend(blocks);
                 }
             }
@@ -194,6 +244,28 @@ impl BlockGrouper {
     }
 }
 
+/// Vertical distance from a Y coordinate to a region's band, `0.0` when inside.
+fn region_y_distance(region: &LayoutRegion, cy: f64) -> f64 {
+    if cy > region.y_top {
+        cy - region.y_top
+    } else if cy < region.y_bottom {
+        region.y_bottom - cy
+    } else {
+        0.0
+    }
+}
+
+/// Horizontal distance from an X coordinate to a column's range, `0.0` when inside.
+fn column_x_distance(column: &Column, cx: f64) -> f64 {
+    if cx < column.left {
+        column.left - cx
+    } else if cx >= column.right {
+        cx - column.right
+    } else {
+        0.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -291,5 +363,54 @@ mod tests {
         let layout = vec![single_col_layout(0)];
         let blocks = BlockGrouper::new().group(&[], &layout);
         assert!(blocks.is_empty());
+    }
+
+    #[test]
+    fn every_line_assigned_no_drop() {
+        // Two vertically-stacked regions. Under the old strict-containment
+        // filter, a line straddling the region boundary and a line whose
+        // center_x is outside the column range were both silently dropped.
+        let layout = PageLayout {
+            regions: vec![
+                LayoutRegion {
+                    y_top: 800.0,
+                    y_bottom: 400.0,
+                    columns: vec![Column {
+                        left: 0.0,
+                        right: 300.0,
+                        index: 0,
+                    }],
+                },
+                LayoutRegion {
+                    y_top: 400.0,
+                    y_bottom: 0.0,
+                    columns: vec![Column {
+                        left: 0.0,
+                        right: 300.0,
+                        index: 0,
+                    }],
+                },
+            ],
+            page_width: 300.0,
+            page_height: 800.0,
+            page: 0,
+        };
+
+        // A: straddles the 400.0 region boundary (top=410, bottom=390).
+        let straddling = make_line(410.0, 20.0, false, 0);
+        // B: center_x = 530, well outside the column's [0, 300) range.
+        let mut out_of_column = make_line(600.0, 10.0, false, 0);
+        out_of_column.bbox = Rect::new(500.0, 600.0, 560.0, 590.0);
+        // C: an ordinary line.
+        let normal = make_line(700.0, 10.0, false, 0);
+
+        let lines = vec![straddling, out_of_column, normal];
+        let blocks = BlockGrouper::new().group(&lines, &[layout]);
+
+        let total_lines: usize = blocks.iter().map(|b| b.lines.len()).sum();
+        assert_eq!(
+            total_lines, 3,
+            "all lines must survive into some block (No Silent Drop)"
+        );
     }
 }

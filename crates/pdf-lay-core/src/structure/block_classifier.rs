@@ -34,10 +34,19 @@ const KNOWN_SECTION_NAMES: &[&str] = &[
     "SUPPORTING INFORMATION",
 ];
 
+/// Default maximum character count for a caption block (see [`Config::caption_max_chars`]).
+const DEFAULT_CAPTION_MAX_CHARS: usize = 240;
+/// Default maximum character count for a running-header line (see [`Config::running_header_max_chars`]).
+const DEFAULT_RUNNING_HEADER_MAX_CHARS: usize = 60;
+
 /// Classifies TextBlocks by analyzing font size, position, and text patterns.
 pub struct BlockClassifier {
     /// Statistically determined body text font size.
     pub body_font_size: f64,
+    /// Maximum character count for a caption block; longer blocks stay body text.
+    caption_max_chars: usize,
+    /// Maximum character count for a running-header line; longer lines stay body text.
+    running_header_max_chars: usize,
 }
 
 impl BlockClassifier {
@@ -46,12 +55,31 @@ impl BlockClassifier {
     /// Uses a character-count-weighted histogram: the modal font size bin is the body size.
     pub fn from_blocks(blocks: &[TextBlock]) -> Self {
         let body_font_size = Self::detect_body_font_size(blocks);
-        Self { body_font_size }
+        Self {
+            body_font_size,
+            caption_max_chars: DEFAULT_CAPTION_MAX_CHARS,
+            running_header_max_chars: DEFAULT_RUNNING_HEADER_MAX_CHARS,
+        }
     }
 
     /// Create with an explicit body font size (for testing).
     pub fn with_body_size(body_font_size: f64) -> Self {
-        Self { body_font_size }
+        Self {
+            body_font_size,
+            caption_max_chars: DEFAULT_CAPTION_MAX_CHARS,
+            running_header_max_chars: DEFAULT_RUNNING_HEADER_MAX_CHARS,
+        }
+    }
+
+    /// Override the caption / running-header length limits (from [`Config`]).
+    pub fn with_limits(
+        mut self,
+        caption_max_chars: usize,
+        running_header_max_chars: usize,
+    ) -> Self {
+        self.caption_max_chars = caption_max_chars;
+        self.running_header_max_chars = running_header_max_chars;
+        self
     }
 
     /// Classify all blocks in place (mutates `block_type`).
@@ -193,7 +221,7 @@ impl BlockClassifier {
         };
 
         // Check in priority order:
-        if Self::is_caption(text) {
+        if self.is_caption(text) {
             BlockType::Caption
         } else if Self::is_page_number(text) {
             BlockType::PageNumber
@@ -218,12 +246,36 @@ impl BlockClassifier {
 
     // ---- detection helpers ----
 
-    fn is_caption(text: &str) -> bool {
-        let lower = text.to_lowercase();
-        lower.starts_with("fig.")
-            || lower.starts_with("figure")
-            || lower.starts_with("table")
-            || lower.starts_with("tab.")
+    /// Whether a block is a figure/table caption.
+    ///
+    /// Requires a caption prefix (`Fig.`/`Figure`/`Table`/`Tab.`) followed by a
+    /// number and a caption delimiter (`:` or `.`), e.g. `"Fig. 1:"` or
+    /// `"Table 2."`, and a length below [`Self::caption_max_chars`]. This avoids
+    /// misclassifying ordinary sentences like "Table 1 shows the results…" as
+    /// captions (which the renderer would then drop). Genuine figure/table
+    /// matching is handled separately by `CaptionDetector`.
+    fn is_caption(&self, text: &str) -> bool {
+        let trimmed = text.trim();
+        if trimmed.chars().count() > self.caption_max_chars {
+            return false;
+        }
+        let lower = trimmed.to_lowercase();
+        let rest = ["figure", "fig.", "table", "tab."]
+            .iter()
+            .find_map(|p| lower.strip_prefix(p));
+        let Some(rest) = rest else {
+            return false;
+        };
+        // Require: optional spaces, a number, then a ':' or '.' caption delimiter.
+        let rest = rest.trim_start();
+        let digits_end = rest
+            .find(|c: char| !c.is_ascii_digit())
+            .unwrap_or(rest.len());
+        if digits_end == 0 {
+            return false; // no caption number (e.g. "Table of contents")
+        }
+        let after = rest[digits_end..].trim_start();
+        after.starts_with(':') || after.starts_with('.')
     }
 
     fn is_page_number(text: &str) -> bool {
@@ -235,11 +287,13 @@ impl BlockClassifier {
     }
 
     fn is_running_header(&self, block: &TextBlock) -> bool {
-        // Heuristic: small font, near top of page (Y > page_height - 3 × body_size)
-        // Without access to page height, use: font_size < body * 0.85
-        // and block is only 1 line
+        // Heuristic: small font, single line, and short. The length guard keeps
+        // legitimate small-font body lines (which can be long) from being
+        // classified as running headers and dropped by the renderer.
         let size_ratio = block.primary_font_size() / self.body_font_size.max(1.0);
-        block.lines.len() == 1 && size_ratio < 0.85
+        block.lines.len() == 1
+            && size_ratio < 0.85
+            && block.text.trim().chars().count() <= self.running_header_max_chars
     }
 
     fn is_footnote(&self, block: &TextBlock, size_ratio: f64) -> bool {
@@ -380,6 +434,47 @@ mod tests {
         let classifier = BlockClassifier::with_body_size(10.0);
         let block = make_block("Fig. 1: Overview of the system.", 10.0, 1, false);
         assert_eq!(classifier.classify(&block), BlockType::Caption);
+    }
+
+    #[test]
+    fn body_sentence_starting_with_table_not_caption() {
+        // A body sentence that merely starts with "Table 1" (no caption
+        // delimiter after the number) must not be classified as a caption,
+        // otherwise the renderer would silently drop it.
+        let classifier = BlockClassifier::with_body_size(10.0);
+        let block = make_block(
+            "Table 1 shows the accuracy of the different methods across datasets.",
+            10.0,
+            1,
+            false,
+        );
+        assert_eq!(classifier.classify(&block), BlockType::BodyText);
+    }
+
+    #[test]
+    fn caption_with_period_delimiter_detected() {
+        let classifier = BlockClassifier::with_body_size(10.0);
+        let block = make_block("Table 2. Performance comparison.", 10.0, 1, false);
+        assert_eq!(classifier.classify(&block), BlockType::Caption);
+    }
+
+    #[test]
+    fn long_small_font_line_not_running_header() {
+        // A single small-font line that is long enough to be body content must
+        // not be classified as a running header (and thus dropped).
+        let classifier = BlockClassifier::with_body_size(10.0);
+        let long = "this is a fairly long small-font line of legitimate body \
+                    content that should not be treated as a running header at all";
+        assert!(long.chars().count() > 60);
+        let block = make_block(long, 8.0, 1, false); // 8.0 / 10.0 = 0.8 < 0.85
+        assert_ne!(classifier.classify(&block), BlockType::RunningHeader);
+    }
+
+    #[test]
+    fn short_small_font_line_still_running_header() {
+        let classifier = BlockClassifier::with_body_size(10.0);
+        let block = make_block("Journal of Examples, Vol. 3", 8.0, 1, false);
+        assert_eq!(classifier.classify(&block), BlockType::RunningHeader);
     }
 
     #[test]
