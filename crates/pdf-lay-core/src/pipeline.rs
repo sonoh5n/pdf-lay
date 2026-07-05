@@ -182,13 +182,19 @@ pub fn analyze_pdf(path: &Path, config: &Config) -> Result<AnalysisResult, PdfLa
         .with_limits(config.caption_max_chars, config.running_header_max_chars);
     classifier.classify_all(&mut blocks);
 
-    let headers = HeaderDetector::with_config(
-        classifier.body_font_size,
-        config.header_detection.min_score,
-        config.header_detection.max_chars,
-        config.header_detection.max_lines,
-    )
-    .detect(&blocks);
+    // Reclassify text that repeats in the top/bottom zone across pages as
+    // running headers/footers so it cannot become a spurious section header.
+    if config.header_detection.detect_repeated_running {
+        let before = count_running(&blocks);
+        BlockClassifier::detect_repeated_headers_footers(&mut blocks);
+        let added = count_running(&blocks).saturating_sub(before);
+        if added > 0 {
+            warnings.push(PdfLayWarning::RepeatedRunningReclassified { count: added });
+        }
+    }
+
+    let headers = HeaderDetector::with_config(classifier.body_font_size, &config.header_detection)
+        .detect(&blocks);
 
     // ---- Phase 5: Figure Matching ----
 
@@ -324,6 +330,19 @@ pub fn analyze_pdf(path: &Path, config: &Config) -> Result<AnalysisResult, PdfLa
     })
 }
 
+/// Count blocks currently classified as a running header or footer.
+fn count_running(blocks: &[TextBlock]) -> usize {
+    blocks
+        .iter()
+        .filter(|b| {
+            matches!(
+                b.block_type,
+                BlockType::RunningHeader | BlockType::RunningFooter
+            )
+        })
+        .count()
+}
+
 /// Recursively sum the characters that reach the output: each section's body
 /// text, header text, and figure/table captions.
 ///
@@ -427,6 +446,86 @@ pub fn analyze_pdf_bytes(bytes: &[u8], config: &Config) -> Result<AnalysisResult
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeated_running_reclassified_before_header_detection() {
+        use crate::types::{Rect, TextLine};
+
+        // A bold all-caps single line repeated in the top zone of 3 pages would
+        // score as a header, but running the same classify -> reclassify ->
+        // detect sequence as the pipeline must demote it to RunningHeader and
+        // keep it out of the detected headers.
+        fn page_blocks(page: u32, gi_base: usize) -> Vec<TextBlock> {
+            let running_line = TextLine {
+                spans: vec![],
+                text: "JOURNAL OF EXAMPLES".to_string(),
+                bbox: Rect::new(72.0, 995.0, 540.0, 985.0),
+                page,
+                baseline_y: 985.0,
+                primary_font_size: 10.0,
+                primary_font_name: "Regular".to_string(),
+                is_bold: true,
+            };
+            let running = TextBlock {
+                global_index: gi_base,
+                lines: vec![running_line],
+                text: "JOURNAL OF EXAMPLES".to_string(),
+                bbox: Rect::new(72.0, 995.0, 540.0, 985.0),
+                page,
+                column_index: 0,
+                block_type: BlockType::BodyText,
+            };
+            // A tall body block establishes the page height (top ~1000).
+            let body_line = TextLine {
+                spans: vec![],
+                text: "Body paragraph text.".to_string(),
+                bbox: Rect::new(72.0, 1000.0, 540.0, 100.0),
+                page,
+                baseline_y: 100.0,
+                primary_font_size: 10.0,
+                primary_font_name: "Regular".to_string(),
+                is_bold: false,
+            };
+            let body = TextBlock {
+                global_index: gi_base + 1,
+                lines: vec![body_line],
+                text: "Body paragraph text.".to_string(),
+                bbox: Rect::new(72.0, 1000.0, 540.0, 100.0),
+                page,
+                column_index: 0,
+                block_type: BlockType::BodyText,
+            };
+            vec![running, body]
+        }
+
+        let mut blocks: Vec<TextBlock> = Vec::new();
+        for p in 0..3u32 {
+            blocks.extend(page_blocks(p, (p as usize) * 2));
+        }
+
+        let classifier = BlockClassifier::from_blocks(&blocks);
+        classifier.classify_all(&mut blocks);
+        assert_eq!(
+            count_running(&blocks),
+            0,
+            "none running before reclassification"
+        );
+
+        BlockClassifier::detect_repeated_headers_footers(&mut blocks);
+        assert_eq!(
+            count_running(&blocks),
+            3,
+            "the repeated top-zone line should be reclassified on all 3 pages"
+        );
+
+        let headers = HeaderDetector::new(classifier.body_font_size).detect(&blocks);
+        assert!(
+            !headers
+                .iter()
+                .any(|h| h.clean_text.contains("JOURNAL OF EXAMPLES")),
+            "repeated running header must not be detected as a section header"
+        );
+    }
 
     #[test]
     fn emitted_char_count_sums_headers_and_body() {

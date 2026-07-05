@@ -34,7 +34,7 @@ impl SectionBuilder {
     }
 
     fn split_by_headers(blocks: &[TextBlock], headers: &[SectionHeader]) -> Vec<FlatSection> {
-        // Collect header block_indices for fast lookup.
+        // Index headers by their anchor block's global_index for fast lookup.
         let header_at: std::collections::HashMap<usize, &SectionHeader> =
             headers.iter().map(|h| (h.block_index, h)).collect();
 
@@ -224,6 +224,24 @@ mod tests {
             "INTRODUCTION"
         );
         assert_eq!(sections[1].header.as_ref().unwrap().clean_text, "METHODS");
+    }
+
+    #[test]
+    fn header_anchored_by_global_index_not_position() {
+        // Blocks have non-contiguous global_index values (as if some were
+        // filtered upstream). A header anchored at global_index 20 must split at
+        // that block regardless of its slice position.
+        let blocks = vec![make_block(10, 0), make_block(20, 0), make_block(30, 0)];
+        let headers = vec![make_header(20, 1, "METHODS", 0)];
+        let sections = SectionBuilder::build(blocks, &headers, vec![], vec![], &[]);
+        assert_eq!(sections.len(), 2);
+        assert!(
+            sections[0].header.is_none(),
+            "preamble should be headerless"
+        );
+        assert_eq!(sections[0].blocks.len(), 1); // global_index 10
+        assert_eq!(sections[1].header.as_ref().unwrap().clean_text, "METHODS");
+        assert_eq!(sections[1].blocks.len(), 1); // global_index 30 (20 is the anchor)
     }
 
     #[test]

@@ -102,6 +102,12 @@ pub enum PdfLayWarning {
         /// Ratio of emitted characters to extracted characters, in `[0, 1]`.
         ratio: f64,
     },
+    /// Blocks were reclassified as repeated running headers/footers before
+    /// header detection.
+    RepeatedRunningReclassified {
+        /// Number of blocks reclassified.
+        count: usize,
+    },
 }
 
 impl std::fmt::Display for PdfLayWarning {
@@ -131,6 +137,12 @@ impl std::fmt::Display for PdfLayWarning {
                     f,
                     "low text coverage: {:.1}% of extracted text reached the output",
                     ratio * 100.0
+                )
+            }
+            Self::RepeatedRunningReclassified { count } => {
+                write!(
+                    f,
+                    "reclassified {count} repeated running header/footer block(s)"
                 )
             }
         }

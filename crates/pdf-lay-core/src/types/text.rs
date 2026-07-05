@@ -208,7 +208,8 @@ pub struct SectionHeader {
     pub page: u32,
     /// Bounding box of the header block.
     pub bbox: Rect,
-    /// Index into the flat `TextBlock` array.
+    /// `global_index` of the header's anchor block (a stable id that matches
+    /// `TextBlock.global_index`, not a slice position).
     pub block_index: usize,
 }
 
