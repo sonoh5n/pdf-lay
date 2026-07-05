@@ -1,10 +1,87 @@
 //! Builds the Section hierarchy from blocks, headers, figures, and tables.
 
+use std::collections::{HashMap, HashSet};
+
+use crate::error::{NumberingAnomalyKind, PdfLayWarning};
+use crate::structure::numbering::NumberingParser;
 use crate::structure::reading_order::ReadingOrderSorter;
-use crate::types::{FigureInfo, PageLayout, Section, SectionHeader, TableInfo, TextBlock};
+use crate::types::{
+    FigureInfo, NumberComponent, PageLayout, Section, SectionHeader, TableInfo, TextBlock,
+};
 
 /// Assembles Section hierarchy from flat lists of blocks and headers.
 pub struct SectionBuilder;
+
+/// Numeric tag distinguishing numbering component variants (for comparing only
+/// same-variant siblings, which sidesteps Roman/Alpha single-letter ambiguity).
+fn variant_tag(c: &NumberComponent) -> u8 {
+    match c {
+        NumberComponent::Arabic(_) => 0,
+        NumberComponent::Roman(_) => 1,
+        NumberComponent::Alpha(_) => 2,
+    }
+}
+
+/// A comparable signature of a numbering key: `(variant, ordinal)` per component.
+fn key_signature(components: &[NumberComponent]) -> Vec<(u8, u32)> {
+    components
+        .iter()
+        .map(|c| (variant_tag(c), c.ordinal()))
+        .collect()
+}
+
+/// Detect section-numbering anomalies (duplicate, non-monotonic, skipped) across
+/// the ordered headers, returning warnings. Sections are never dropped; this is
+/// purely diagnostic (No Silent Drop).
+pub fn validate_numbering(headers: &[SectionHeader]) -> Vec<PdfLayWarning> {
+    let parser = NumberingParser::new();
+    let mut warnings = Vec::new();
+    let mut seen: HashSet<Vec<(u8, u32)>> = HashSet::new();
+    // parent signature -> (variant, ordinal) of the last sibling seen.
+    let mut last_child: HashMap<Vec<(u8, u32)>, (u8, u32)> = HashMap::new();
+
+    for header in headers {
+        let Some((key, _)) = parser.parse(&header.text) else {
+            continue;
+        };
+        let sig = key_signature(&key.components);
+        let Some(last) = key.components.last() else {
+            continue;
+        };
+
+        if !seen.insert(sig.clone()) {
+            warnings.push(PdfLayWarning::SectionNumberingAnomaly {
+                kind: NumberingAnomalyKind::Duplicate,
+                page: header.page,
+            });
+            continue;
+        }
+
+        let parent_sig = sig[..sig.len() - 1].to_vec();
+        let variant = variant_tag(last);
+        let ord = last.ordinal();
+
+        if let Some((prev_variant, prev_ord)) = last_child.get(&parent_sig).copied() {
+            // Only compare siblings of the same numbering variant.
+            if prev_variant == variant {
+                if ord <= prev_ord {
+                    warnings.push(PdfLayWarning::SectionNumberingAnomaly {
+                        kind: NumberingAnomalyKind::NonMonotonic,
+                        page: header.page,
+                    });
+                } else if ord > prev_ord + 1 {
+                    warnings.push(PdfLayWarning::SectionNumberingAnomaly {
+                        kind: NumberingAnomalyKind::SkippedNumber,
+                        page: header.page,
+                    });
+                }
+            }
+        }
+        last_child.insert(parent_sig, (variant, ord));
+    }
+
+    warnings
+}
 
 impl SectionBuilder {
     /// Build the section hierarchy.
@@ -224,6 +301,79 @@ mod tests {
             "INTRODUCTION"
         );
         assert_eq!(sections[1].header.as_ref().unwrap().clean_text, "METHODS");
+    }
+
+    #[test]
+    fn numbering_prefix_builds_tree() {
+        // "2 Methods" (depth 1) then "2.1 Data" (depth 2) → 2.1 nests under 2.
+        let blocks = vec![make_block(0, 0), make_block(1, 0)];
+        let headers = vec![
+            make_header(0, 1, "2 Methods", 0),
+            make_header(1, 2, "2.1 Data Collection", 0),
+        ];
+        let sections = SectionBuilder::build(blocks, &headers, vec![], vec![], &[]);
+        assert_eq!(sections.len(), 1);
+        assert_eq!(sections[0].children.len(), 1);
+        assert_eq!(
+            sections[0].children[0].header.as_ref().unwrap().clean_text,
+            "2.1 Data Collection"
+        );
+    }
+
+    #[test]
+    fn skipped_number_warns_but_keeps_section() {
+        let headers = vec![
+            make_header(0, 1, "IV. Experiments", 0),
+            make_header(1, 1, "VI. Results", 1),
+        ];
+        let warnings = validate_numbering(&headers);
+        assert!(warnings.iter().any(|w| matches!(
+            w,
+            PdfLayWarning::SectionNumberingAnomaly {
+                kind: NumberingAnomalyKind::SkippedNumber,
+                ..
+            }
+        )));
+        // The sections themselves are not dropped.
+        let blocks = vec![make_block(0, 0), make_block(1, 1)];
+        let sections = SectionBuilder::build(blocks, &headers, vec![], vec![], &[]);
+        assert_eq!(sections.len(), 2);
+    }
+
+    #[test]
+    fn duplicate_number_warns() {
+        let headers = vec![
+            make_header(0, 2, "2.1 First", 0),
+            make_header(1, 2, "2.1 Second", 1),
+        ];
+        let warnings = validate_numbering(&headers);
+        assert!(warnings.iter().any(|w| matches!(
+            w,
+            PdfLayWarning::SectionNumberingAnomaly {
+                kind: NumberingAnomalyKind::Duplicate,
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn unnumbered_falls_back_without_warnings() {
+        let headers = vec![
+            make_header(0, 1, "Introduction", 0),
+            make_header(1, 1, "Methods", 0),
+        ];
+        assert!(validate_numbering(&headers).is_empty());
+    }
+
+    #[test]
+    fn monotonic_numbering_has_no_warnings() {
+        let headers = vec![
+            make_header(0, 1, "1 Introduction", 0),
+            make_header(1, 1, "2 Methods", 0),
+            make_header(2, 2, "2.1 Data", 0),
+            make_header(3, 1, "3 Results", 1),
+        ];
+        assert!(validate_numbering(&headers).is_empty());
     }
 
     #[test]

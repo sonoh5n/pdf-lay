@@ -3,6 +3,7 @@
 pub mod document;
 pub mod geometry;
 pub mod layout;
+pub mod numbering;
 pub mod path;
 pub mod text;
 
@@ -13,5 +14,6 @@ pub use document::{
 };
 pub use geometry::{PageDimensions, Rect};
 pub use layout::{Column, LayoutRegion, PageLayout};
+pub use numbering::{NumberComponent, NumberingKey};
 pub use path::{PathObject, PathType};
 pub use text::{BlockType, FontInfo, Section, SectionHeader, TextBlock, TextLine, TextSpan};

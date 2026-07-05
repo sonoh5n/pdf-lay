@@ -37,7 +37,7 @@ pub use config::{
     CaptionStyle, ChunkConfig, Config, FigureTextFormat, LlmTextConfig, MarkdownConfig, MathConfig,
     MathRepresentationPreference, ResourceLimits, SplitStrategy, TableConfig,
 };
-pub use error::{AnalysisResult, Coverage, PdfLayError, PdfLayWarning};
+pub use error::{AnalysisResult, Coverage, NumberingAnomalyKind, PdfLayError, PdfLayWarning};
 pub use math::{
     MathContext, MathConverter, MathDetector, MathFormatter, MathRegion, math_symbols,
     to_latex_map, to_unicode_map,
@@ -47,6 +47,6 @@ pub use selector::{LlmTextGenerator, SectionEntry, SectionSelector, TocGenerator
 pub use table::{GridBuilder, TableDetector, TableGrid, TableTextConverter};
 pub use types::{
     BlockType, Chunk, DocumentMetadata, FigureInfo, ImageFormat, ImageInfo, InsertionPoint,
-    PaperDocument, Rect, Section, SectionHeader, TableInfo, TableRepresentation, TextBlock,
-    TextLine, TextSpan,
+    NumberComponent, NumberingKey, PaperDocument, Rect, Section, SectionHeader, TableInfo,
+    TableRepresentation, TextBlock, TextLine, TextSpan,
 };

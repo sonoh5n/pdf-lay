@@ -1,8 +1,7 @@
 //! Detects section headers from TextBlocks using multi-signal scoring.
 
-use regex::Regex;
-
 use crate::config::{HeaderDetectionConfig, default_known_section_names};
+use crate::structure::numbering::NumberingParser;
 use crate::types::{BlockType, SectionHeader, TextBlock};
 
 /// Max extra characters beyond a known name's length for the bounded-substring
@@ -24,12 +23,8 @@ pub struct HeaderDetector {
     known_section_names: Vec<String>,
     /// Score bonus for CJK-script headings.
     cjk_heading_bonus: u32,
-    // Compiled regex patterns (stored to avoid recompilation).
-    re_roman: Regex,
-    re_arabic_dot_dot: Regex,
-    re_arabic_dot: Regex,
-    re_arabic: Regex,
-    re_alpha: Regex,
+    /// Parses leading section numbers into structured keys.
+    numbering_parser: NumberingParser,
 }
 
 impl HeaderDetector {
@@ -43,11 +38,7 @@ impl HeaderDetector {
             respect_classification: true,
             known_section_names: normalize_names(&default_known_section_names()),
             cjk_heading_bonus: 1,
-            re_roman: Regex::new(r"^([IVX]+\.)\s+").unwrap(),
-            re_arabic_dot_dot: Regex::new(r"^(\d+\.\d+\.\d+)[\s.]").unwrap(),
-            re_arabic_dot: Regex::new(r"^(\d+\.\d+)[\s.]").unwrap(),
-            re_arabic: Regex::new(r"^(\d+\.)\s+").unwrap(),
-            re_alpha: Regex::new(r"^([A-Z]\.)\s+").unwrap(),
+            numbering_parser: NumberingParser::new(),
         }
     }
 
@@ -127,13 +118,13 @@ impl HeaderDetector {
 
         let mut score: u32 = 0;
         let mut level: u8 = 1;
-        let mut numbering: Option<String> = None;
 
-        // Numbering pattern (+3 points).
-        if let Some((num, pat_level)) = self.match_numbering(text) {
+        // Structured numbering (+3 points). Level is the numbering depth so
+        // deeper numbers (e.g. "3.1.1.2") map to deeper levels.
+        let parsed = self.numbering_parser.parse(text);
+        if let Some((ref key, _)) = parsed {
             score += 3;
-            level = pat_level;
-            numbering = Some(num);
+            level = key.depth();
         }
 
         // All uppercase (+2).
@@ -170,16 +161,23 @@ impl HeaderDetector {
             return None;
         }
 
-        // Refine level if no numbering was detected.
-        if numbering.is_none() {
-            level = if size_ratio > 1.15 || self.is_all_caps(text) {
-                1
-            } else {
-                2
-            };
-        }
-
-        let clean_text = self.clean_header_text(text, &numbering);
+        // Split the leading number (display string) from the clean title, and
+        // fall back to a font-based level only when there is no numbering.
+        let (numbering, clean_text) = match &parsed {
+            Some((_, prefix_len)) => (
+                Some(text[..*prefix_len].trim().to_string()),
+                text[*prefix_len..].trim().to_string(),
+            ),
+            None => {
+                // Refine level from font size / caps for unnumbered headers.
+                level = if size_ratio > 1.15 || self.is_all_caps(text) {
+                    1
+                } else {
+                    2
+                };
+                (None, text.to_string())
+            }
+        };
 
         Some(SectionHeader {
             text: text.to_string(),
@@ -190,30 +188,6 @@ impl HeaderDetector {
             bbox: block.bbox.clone(),
             block_index: global_index,
         })
-    }
-
-    // ---- pattern matching ----
-
-    /// Match a numbering pattern and return `(number_string, level)`.
-    fn match_numbering(&self, text: &str) -> Option<(String, u8)> {
-        let t = text.trim();
-
-        if let Some(caps) = self.re_roman.captures(t) {
-            return Some((caps[1].to_string(), 1));
-        }
-        if let Some(caps) = self.re_arabic_dot_dot.captures(t) {
-            return Some((caps[1].to_string(), 3));
-        }
-        if let Some(caps) = self.re_arabic_dot.captures(t) {
-            return Some((caps[1].to_string(), 2));
-        }
-        if let Some(caps) = self.re_arabic.captures(t) {
-            return Some((caps[1].to_string(), 1));
-        }
-        if let Some(caps) = self.re_alpha.captures(t) {
-            return Some((caps[1].to_string(), 2));
-        }
-        None
     }
 
     fn is_all_caps(&self, text: &str) -> bool {
@@ -241,15 +215,6 @@ impl HeaderDetector {
     fn is_cjk_heading_like(&self, text: &str) -> bool {
         let t = text.trim();
         cjk_ratio(t) > 0.5 && t.chars().count() <= self.max_chars && !t.ends_with(['。', '．', '.'])
-    }
-
-    /// Remove leading numbering from header text.
-    fn clean_header_text(&self, text: &str, numbering: &Option<String>) -> String {
-        if let Some(num) = numbering {
-            text.trim_start_matches(num.as_str()).trim().to_string()
-        } else {
-            text.to_string()
-        }
     }
 }
 

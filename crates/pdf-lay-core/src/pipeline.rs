@@ -196,6 +196,10 @@ pub fn analyze_pdf(path: &Path, config: &Config) -> Result<AnalysisResult, PdfLa
     let headers = HeaderDetector::with_config(classifier.body_font_size, &config.header_detection)
         .detect(&blocks);
 
+    // Report section-numbering anomalies (skips, duplicates, non-monotonic
+    // sequences). Sections are still kept regardless (No Silent Drop).
+    warnings.extend(crate::structure::validate_numbering(&headers));
+
     // ---- Phase 5: Figure Matching ----
 
     let caption_detector = CaptionDetector::new();
