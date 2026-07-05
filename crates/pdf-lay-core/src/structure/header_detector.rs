@@ -112,15 +112,14 @@ impl HeaderDetector {
     pub fn detect(&self, blocks: &[TextBlock]) -> Vec<SectionHeader> {
         blocks
             .iter()
-            .enumerate()
-            .filter(|(_, block)| {
+            .filter(|block| {
                 !self.respect_classification || Self::is_header_eligible(&block.block_type)
             })
-            .filter_map(|(i, block)| self.try_detect(block, i))
+            .filter_map(|block| self.try_detect(block, block.global_index))
             .collect()
     }
 
-    fn try_detect(&self, block: &TextBlock, block_index: usize) -> Option<SectionHeader> {
+    fn try_detect(&self, block: &TextBlock, global_index: usize) -> Option<SectionHeader> {
         let text = block.text.trim();
 
         // Quick exclusions.
@@ -205,7 +204,7 @@ impl HeaderDetector {
             numbering,
             page: block.page,
             bbox: block.bbox.clone(),
-            block_index,
+            block_index: global_index,
         })
     }
 
@@ -293,6 +292,11 @@ mod tests {
         }
     }
 
+    fn with_global_index(mut block: TextBlock, global_index: usize) -> TextBlock {
+        block.global_index = global_index;
+        block
+    }
+
     #[test]
     fn roman_numeral_header_detected() {
         let detector = HeaderDetector::new(10.0);
@@ -370,11 +374,25 @@ mod tests {
     fn block_index_preserved() {
         let detector = HeaderDetector::new(10.0);
         let blocks = vec![
-            make_block("Body text", 10.0, false, 1),
-            make_block("II. INTRODUCTION", 11.0, true, 1),
+            with_global_index(make_block("Body text", 10.0, false, 1), 0),
+            with_global_index(make_block("II. INTRODUCTION", 11.0, true, 1), 1),
         ];
         let headers = detector.detect(&blocks);
         assert_eq!(headers[0].block_index, 1);
+    }
+
+    #[test]
+    fn block_index_is_global_index_not_slice_position() {
+        // A header at slice position 1 but with global_index 42 must anchor by
+        // global_index, so future filtering/reordering cannot mis-anchor it.
+        let detector = HeaderDetector::new(10.0);
+        let blocks = vec![
+            with_global_index(make_block("Body text", 10.0, false, 1), 7),
+            with_global_index(make_block("II. INTRODUCTION", 11.0, true, 1), 42),
+        ];
+        let headers = detector.detect(&blocks);
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].block_index, 42);
     }
 
     // ---- P1-1: classifier-informed candidate filtering -------------------
