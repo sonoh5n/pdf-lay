@@ -2,18 +2,47 @@
 
 use crate::config::{ChunkConfig, FigureTextFormat, SplitStrategy};
 use crate::output::render_core::{self, EscapeMode, RenderOptions};
+use crate::output::tokenizer::{HeuristicTokenizer, Tokenizer};
 use crate::types::{Chunk, PaperDocument, Section};
 
 /// Splits a [`PaperDocument`] into [`Chunk`] records for LLM consumption.
 pub struct Chunker {
     /// The configuration controlling chunk sizes and split strategy.
     pub config: ChunkConfig,
+    /// Counts tokens for chunk sizing, `estimated_tokens`, and overlap.
+    ///
+    /// Not part of `ChunkConfig`: a `Box<dyn Tokenizer>` is not `serde`
+    /// representable, so it lives on `Chunker` itself and is supplied at
+    /// construction time (`new` defaults to [`HeuristicTokenizer`];
+    /// [`Chunker::with_tokenizer`] plugs in another implementation, e.g. a
+    /// real BPE tokenizer behind the `real-tokenizer` feature).
+    tokenizer: Box<dyn Tokenizer>,
 }
 
 impl Chunker {
-    /// Create a new chunker with the given configuration.
+    /// Create a new chunker with the given configuration and the default
+    /// [`HeuristicTokenizer`] for token counting.
     pub fn new(config: ChunkConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            tokenizer: Box::new(HeuristicTokenizer),
+        }
+    }
+
+    /// Create a new chunker with a custom [`Tokenizer`], e.g. a real BPE
+    /// tokenizer loaded via `output::tokenizer::HfTokenizer` (behind the
+    /// `real-tokenizer` feature).
+    pub fn with_tokenizer(config: ChunkConfig, tokenizer: Box<dyn Tokenizer>) -> Self {
+        Self { config, tokenizer }
+    }
+
+    /// Count tokens in `text` using this chunker's configured tokenizer.
+    ///
+    /// The single entry point for all token counting inside `Chunker` (chunk
+    /// sizing, `estimated_tokens`, the token-budget split, and overlap) so
+    /// every measurement agrees with whichever [`Tokenizer`] is plugged in.
+    fn count_tokens(&self, text: &str) -> usize {
+        self.tokenizer.count(text)
     }
 
     /// Build the render-core options used to turn a [`Section`] into chunk
@@ -52,7 +81,7 @@ impl Chunker {
 
         for section in sections {
             let section_text = render_core::render_section_content(section, &opts);
-            let estimated_tokens = Self::estimate_tokens(&section_text);
+            let estimated_tokens = self.count_tokens(&section_text);
 
             if estimated_tokens <= self.config.max_tokens {
                 chunks.push(Chunk {
@@ -125,7 +154,7 @@ impl Chunker {
             String::new()
         };
         let prefixed_text = format!("{prefix}{section_text}");
-        let estimated_tokens = Self::estimate_tokens(&prefixed_text);
+        let estimated_tokens = self.count_tokens(&prefixed_text);
 
         if estimated_tokens <= self.config.max_tokens {
             out.push(Chunk {
@@ -221,7 +250,7 @@ impl Chunker {
         let mut is_first = true;
 
         for para in &paragraphs {
-            let para_tokens = Self::estimate_tokens(para);
+            let para_tokens = self.count_tokens(para);
 
             if current_tokens + para_tokens > self.config.max_tokens && !current_text.is_empty() {
                 // Flush current chunk. Every sub-chunk (first and
@@ -233,7 +262,7 @@ impl Chunker {
                     paper_id: paper_id.to_string(),
                     section: section_name.clone(),
                     page_range,
-                    estimated_tokens: Self::estimate_tokens(&prefixed_text),
+                    estimated_tokens: self.count_tokens(&prefixed_text),
                     text: prefixed_text,
                     figures: if is_first {
                         section.figures.clone()
@@ -250,9 +279,11 @@ impl Chunker {
                 *chunk_id += 1;
                 is_first = false;
 
-                // Add overlap from end of previous chunk.
+                // Add overlap from end of previous chunk, measured in tokens
+                // (not a fixed char multiplier) so it stays accurate for
+                // CJK text.
                 current_text = self.extract_overlap(&current_text);
-                current_tokens = Self::estimate_tokens(&current_text);
+                current_tokens = self.count_tokens(&current_text);
             }
 
             if !current_text.is_empty() {
@@ -270,7 +301,7 @@ impl Chunker {
                 paper_id: paper_id.to_string(),
                 section: section_name,
                 page_range,
-                estimated_tokens: Self::estimate_tokens(&prefixed_text),
+                estimated_tokens: self.count_tokens(&prefixed_text),
                 text: prefixed_text,
                 figures: if is_first {
                     section.figures.clone()
@@ -295,18 +326,82 @@ impl Chunker {
         chunks
     }
 
+    /// Take a suffix of `text` whose token count (per `self.tokenizer`) fits
+    /// within `self.config.overlap_tokens`.
+    ///
+    /// Replaces the legacy `overlap_tokens * 4` fixed char-per-token
+    /// approximation, which overshot the configured overlap budget for CJK
+    /// text (see [`crate::output::tokenizer`]).
     fn extract_overlap(&self, text: &str) -> String {
         if self.config.overlap_tokens == 0 {
             return String::new();
         }
-        // Take characters from the end of text proportional to overlap_tokens.
-        let target_chars = self.config.overlap_tokens * 4; // approximate
-        let char_count = text.chars().count();
-        if char_count <= target_chars {
-            text.to_string()
-        } else {
-            text.chars().skip(char_count - target_chars).collect()
+        let chars: Vec<char> = text.chars().collect();
+        let end = chars.len();
+        let start = self.token_overlap_start(&chars, end, self.config.overlap_tokens);
+        chars[start..end].iter().collect()
+    }
+
+    /// Find the start index (within `chars[..end]`) of the longest suffix
+    /// ending at `end` whose token count is within `overlap_tokens`.
+    ///
+    /// Walks backward from `end` one character at a time, which is simpler
+    /// than a binary search and does not depend on token count growing
+    /// strictly monotonically with window length (true for
+    /// [`HeuristicTokenizer`](crate::output::tokenizer::HeuristicTokenizer),
+    /// but not guaranteed for every possible [`Tokenizer`] impl, e.g. a real
+    /// BPE tokenizer's merges).
+    fn token_overlap_start(&self, chars: &[char], end: usize, overlap_tokens: usize) -> usize {
+        if overlap_tokens == 0 || end == 0 {
+            return end;
         }
+        let mut start = end;
+        while start > 0 {
+            let candidate: String = chars[start - 1..end].iter().collect();
+            if self.count_tokens(&candidate) > overlap_tokens {
+                break;
+            }
+            start -= 1;
+        }
+        start
+    }
+
+    /// Find the end index (within `chars[start..]`) of the longest chunk
+    /// starting at `start` whose token count (per `self.tokenizer`) is
+    /// within `max_tokens`.
+    ///
+    /// Starts from a coarse guess (the legacy ~4 ASCII-chars/token ratio)
+    /// then walks the guess forward or backward one character at a time
+    /// against the real tokenizer count, so CJK-heavy runs — which the
+    /// legacy `max_tokens * 4` fixed char budget systematically
+    /// overshot — land within `max_tokens` too. Always returns an index
+    /// `> start` (forward progress guaranteed even when a single character
+    /// already meets or exceeds the budget, so callers never loop forever
+    /// and no character is ever silently dropped).
+    fn token_budget_end(&self, chars: &[char], start: usize, max_tokens: usize) -> usize {
+        let mut end = (start + max_tokens.saturating_mul(4))
+            .min(chars.len())
+            .max(start + 1);
+
+        // Shrink: the coarse guess can overshoot for CJK-heavy text.
+        while end > start + 1 {
+            let candidate: String = chars[start..end].iter().collect();
+            if self.count_tokens(&candidate) <= max_tokens {
+                break;
+            }
+            end -= 1;
+        }
+
+        // Grow: the coarse guess can undershoot for ASCII-heavy text.
+        while end < chars.len() {
+            let candidate: String = chars[start..end + 1].iter().collect();
+            if self.count_tokens(&candidate) > max_tokens {
+                break;
+            }
+            end += 1;
+        }
+
+        end
     }
 
     // ---- Strategy: TokenCount ----
@@ -315,7 +410,8 @@ impl Chunker {
         // Concatenate all section rich text (render-core: math-converted,
         // with inline table markdown and figure placeholders) then split
         // mechanically. Section attribution for these chunks is not yet
-        // preserved (see P2-4); this task only fixes the text fidelity.
+        // preserved (see P2-4); this task only fixes the text fidelity and
+        // the char-budget vs token-budget inconsistency.
         let opts = self.render_opts();
         let all_text: String = doc
             .sections
@@ -334,14 +430,12 @@ impl Chunker {
         let mut chunks = Vec::new();
         let mut chunk_id = 0;
         let chars: Vec<char> = all_text.chars().collect();
-        let max_chars = effective_max_tokens * 4;
-        let overlap_chars = self.config.overlap_tokens * 4;
         let mut start = 0;
 
         while start < chars.len() {
-            let end = (start + max_chars).min(chars.len());
+            let end = self.token_budget_end(&chars, start, effective_max_tokens);
             let text: String = chars[start..end].iter().collect();
-            let estimated_tokens = Self::estimate_tokens(&text);
+            let estimated_tokens = self.count_tokens(&text);
 
             chunks.push(Chunk {
                 chunk_id,
@@ -359,9 +453,13 @@ impl Chunker {
             if end >= chars.len() {
                 break;
             }
-            // Ensure forward progress: advance by at least 1 character.
-            let advance = max_chars.saturating_sub(overlap_chars).max(1);
-            start += advance;
+
+            // Overlap is measured in tokens, not a fixed char multiplier
+            // (see `token_overlap_start`). Always advance past the previous
+            // start so the loop terminates even when the overlap window
+            // would otherwise reproduce the whole chunk.
+            let overlap_start = self.token_overlap_start(&chars, end, self.config.overlap_tokens);
+            start = overlap_start.max(start + 1);
         }
 
         chunks
@@ -404,11 +502,17 @@ impl Chunker {
 
     // ---- Token estimation ----
 
-    /// Token count estimate: ASCII ~4 chars/token, non-ASCII ~1.5 chars/token.
+    /// Static token count estimate using the default [`HeuristicTokenizer`].
+    ///
+    /// Kept as a thin wrapper (rather than removed) for callers that need a
+    /// standalone estimate with no `Chunker` instance at hand (e.g.
+    /// [`crate::selector::SectionSelector::total_estimated_tokens`] and
+    /// existing tests). Instance-scoped counting — which respects whatever
+    /// [`Tokenizer`] a given `Chunker` was constructed with — goes through
+    /// [`Self::count_tokens`] instead; this static function always uses the
+    /// heuristic regardless of a `Chunker`'s configured tokenizer.
     pub fn estimate_tokens(text: &str) -> usize {
-        let ascii_chars = text.chars().filter(|c| c.is_ascii()).count();
-        let non_ascii_chars = text.chars().filter(|c| !c.is_ascii()).count();
-        ascii_chars / 4 + (non_ascii_chars as f64 / 1.5) as usize
+        HeuristicTokenizer.count(text)
     }
 }
 
@@ -530,10 +634,13 @@ mod tests {
 
     #[test]
     fn extract_overlap_handles_non_ascii() {
-        // Verify extract_overlap works with multibyte UTF-8 characters.
+        // Verify extract_overlap works with multibyte UTF-8 characters, and
+        // is measured in tokens (not the legacy `overlap_tokens * 4` char
+        // approximation, which — since CJK is ~1 char/token, not
+        // ~4 — would have overshot to 8 chars instead of 2).
         let config = ChunkConfig {
             max_tokens: 10,
-            overlap_tokens: 2, // 2 * 4 = 8 target chars
+            overlap_tokens: 2,
             split_strategy: SplitStrategy::SectionBoundary,
             include_section_context: true,
             math_config: None,
@@ -542,8 +649,9 @@ mod tests {
         // 10 Japanese characters (3 bytes each in UTF-8).
         let text = "あいうえおかきくけこ";
         let overlap = chunker.extract_overlap(text);
-        // Should take last 8 chars: "うえおかきくけこ"
-        assert_eq!(overlap, "うえおかきくけこ");
+        // 1 CJK char == 1 token under HeuristicTokenizer, so 2 overlap
+        // tokens == the last 2 chars: "けこ".
+        assert_eq!(overlap, "けこ");
     }
 
     #[test]
@@ -560,6 +668,115 @@ mod tests {
         // Should complete without infinite loop (max_tokens clamped to 1).
         let chunks = chunker.chunk(&doc);
         assert!(!chunks.is_empty());
+    }
+
+    // ---- Tokenizer trait / CJK budget fix (P2-3) ----
+
+    #[test]
+    fn token_count_strategy_respects_budget_for_cjk() {
+        // 1000 CJK characters, split with a small token budget. Under the
+        // legacy `max_tokens * 4` char budget (which assumed ~4 ASCII
+        // chars/token even for CJK, where the real ratio is closer to
+        // 1 char/token) each chunk would have held ~1200 tokens' worth of
+        // text against a budget of 300 — a 4x overshoot. The token-budgeted
+        // split must keep every chunk within budget.
+        let config = ChunkConfig {
+            max_tokens: 300,
+            overlap_tokens: 0,
+            split_strategy: SplitStrategy::TokenCount,
+            include_section_context: false,
+            math_config: None,
+        };
+        let chunker = Chunker::new(config);
+        let cjk_text: String = "漢字仮名交じり文章例。"
+            .chars()
+            .cycle()
+            .take(1000)
+            .collect();
+        let doc = make_doc_with_sections(vec![make_section("SEC", &cjk_text, 1)]);
+
+        let chunks = chunker.chunk(&doc);
+
+        assert!(
+            chunks.len() >= 4,
+            "1000 CJK chars over a 300-token budget should split into >= 4 chunks, got {}",
+            chunks.len()
+        );
+        for chunk in &chunks {
+            let actual = Chunker::estimate_tokens(&chunk.text);
+            assert!(
+                actual <= 300,
+                "chunk exceeded the token budget: {actual} tokens (text len {} chars)",
+                chunk.text.chars().count()
+            );
+        }
+    }
+
+    #[test]
+    fn token_overlap_start_respects_token_budget() {
+        // 16 ASCII chars; HeuristicTokenizer counts ASCII at chars/4 (floor),
+        // so the largest window whose count stays <= 2 tokens is 11 chars
+        // (floor(11/4) == 2, floor(12/4) == 3) — the walk finds the true
+        // token-budgeted boundary rather than a fixed `overlap_tokens * 4`
+        // multiplication.
+        let chunker = Chunker::new(default_config());
+        let chars: Vec<char> = "a".repeat(16).chars().collect();
+        let start = chunker.token_overlap_start(&chars, chars.len(), 2);
+        assert_eq!(
+            chars.len() - start,
+            11,
+            "expected an 11-char overlap window for a 2-token budget"
+        );
+    }
+
+    #[test]
+    fn token_budget_end_keeps_cjk_within_budget() {
+        // 50 CJK chars; under HeuristicTokenizer 1 CJK char == 1 token, so a
+        // 10-token budget must cut at exactly 10 chars (the legacy
+        // `max_tokens * 4` char budget would have cut at 40).
+        let chunker = Chunker::new(default_config());
+        let chars: Vec<char> = "漢".repeat(50).chars().collect();
+        let end = chunker.token_budget_end(&chars, 0, 10);
+        assert_eq!(end, 10);
+    }
+
+    #[test]
+    fn chunk_by_tokens_overlap_is_token_based() {
+        // With a token-count strategy and a nonzero overlap, chunk N+1 must
+        // begin with the token-budgeted overlap tail of chunk N (computed by
+        // `token_overlap_start`), not a fixed char multiplier of
+        // `overlap_tokens`.
+        let config = ChunkConfig {
+            max_tokens: 20,
+            overlap_tokens: 5,
+            split_strategy: SplitStrategy::TokenCount,
+            include_section_context: false,
+            math_config: None,
+        };
+        let chunker = Chunker::new(config);
+        let text = "word ".repeat(60); // plenty of ASCII text to force multiple chunks
+        let doc = make_doc_with_sections(vec![make_section("SEC", &text, 1)]);
+
+        let chunks = chunker.chunk(&doc);
+        assert!(
+            chunks.len() >= 2,
+            "expected multiple chunks, got {}",
+            chunks.len()
+        );
+
+        let chars0: Vec<char> = chunks[0].text.chars().collect();
+        let overlap_start = chunker.token_overlap_start(&chars0, chars0.len(), 5);
+        let expected_overlap: String = chars0[overlap_start..].iter().collect();
+
+        assert!(
+            !expected_overlap.is_empty(),
+            "expected a nonempty token-based overlap window"
+        );
+        assert!(
+            chunks[1].text.starts_with(&expected_overlap),
+            "chunk 1 should begin with chunk 0's token-budgeted overlap tail:\nexpected prefix: {expected_overlap:?}\nchunk1: {}",
+            chunks[1].text
+        );
     }
 
     // ---- render-core integration (P2-1): chunk.text must carry the same
