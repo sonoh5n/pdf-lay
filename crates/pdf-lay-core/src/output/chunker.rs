@@ -68,6 +68,11 @@ impl Chunker {
                 });
                 chunk_id += 1;
             } else {
+                // Not tracked in a hierarchy here (a flat, pre-selected slice
+                // of sections with no parent chain available), so no
+                // breadcrumb prefix is built for this path — see
+                // `chunk_section_recursive` for the SectionBoundary strategy,
+                // which is where `include_section_context` applies (P2-2).
                 let sub = self.split_section_text(
                     &section_text,
                     "",
@@ -75,6 +80,7 @@ impl Chunker {
                     section.page_range,
                     section,
                     &mut chunk_id,
+                    "",
                 );
                 chunks.extend(sub);
             }
@@ -90,30 +96,44 @@ impl Chunker {
         let mut chunk_id = 0;
 
         for section in &doc.sections {
-            self.chunk_section_recursive(section, &doc.paper_id, &mut chunk_id, &mut chunks);
+            self.chunk_section_recursive(section, &doc.paper_id, &[], &mut chunk_id, &mut chunks);
         }
 
         chunks
     }
 
+    /// Recursively chunk `section` and its children, prefixing each chunk's
+    /// text with a `[Context: A > B > C]` breadcrumb plus the section's own
+    /// heading line when `include_section_context` is enabled.
+    ///
+    /// `breadcrumb` holds the clean heading text of every ancestor section
+    /// (root-to-parent order); it is empty for top-level sections.
     fn chunk_section_recursive(
         &self,
         section: &Section,
         paper_id: &str,
+        breadcrumb: &[&str],
         chunk_id: &mut usize,
         out: &mut Vec<Chunk>,
     ) {
         let opts = self.render_opts();
         let section_text = render_core::render_section_content(section, &opts);
-        let estimated_tokens = Self::estimate_tokens(&section_text);
+        let own = section.header_text();
+        let prefix = if self.config.include_section_context {
+            Self::build_context_prefix(breadcrumb, &own)
+        } else {
+            String::new()
+        };
+        let prefixed_text = format!("{prefix}{section_text}");
+        let estimated_tokens = Self::estimate_tokens(&prefixed_text);
 
         if estimated_tokens <= self.config.max_tokens {
             out.push(Chunk {
                 chunk_id: *chunk_id,
                 paper_id: paper_id.to_string(),
-                section: section.header_text(),
+                section: own.clone(),
                 page_range: section.page_range,
-                text: section_text,
+                text: prefixed_text,
                 figures: section.figures.clone(),
                 tables: section.tables.clone(),
                 estimated_tokens,
@@ -121,24 +141,66 @@ impl Chunker {
             });
             *chunk_id += 1;
         } else {
-            // Section too large: split by paragraph.
+            // Section too large: split by paragraph, carrying the same
+            // breadcrumb/heading prefix onto every resulting sub-chunk.
             let sub = self.split_section_text(
                 &section_text,
                 paper_id,
-                section.header_text(),
+                own.clone(),
                 section.page_range,
                 section,
                 chunk_id,
+                &prefix,
             );
             out.extend(sub);
         }
 
-        // Recurse into children.
+        // Recurse into children, extending the breadcrumb with this
+        // section's own heading (skipped when headerless, so headerless
+        // sections don't leave an empty path segment for their descendants).
+        let mut child_breadcrumb = breadcrumb.to_vec();
+        if !own.is_empty() {
+            child_breadcrumb.push(own.as_str());
+        }
         for child in &section.children {
-            self.chunk_section_recursive(child, paper_id, chunk_id, out);
+            self.chunk_section_recursive(child, paper_id, &child_breadcrumb, chunk_id, out);
         }
     }
 
+    /// Build the `[Context: ...]` breadcrumb + heading prefix prepended to a
+    /// chunk's text when `include_section_context` is enabled.
+    ///
+    /// `ancestors` are the clean heading text of enclosing sections
+    /// (root-to-parent order); `own` is the current section's own clean
+    /// heading (empty for headerless sections). Headerless entries (empty
+    /// strings) are dropped from the path so they never produce an empty
+    /// `" > "`-joined segment. Returns an empty string when the resulting
+    /// path is empty (an entirely headerless section with no headed
+    /// ancestors) — no prefix is emitted in that case.
+    fn build_context_prefix(ancestors: &[&str], own: &str) -> String {
+        let mut path: Vec<&str> = ancestors
+            .iter()
+            .copied()
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !own.is_empty() {
+            path.push(own);
+        }
+        if path.is_empty() {
+            return String::new();
+        }
+        let joined = path.join(" > ");
+        if own.is_empty() {
+            format!("[Context: {joined}]\n\n")
+        } else {
+            format!("[Context: {joined}]\n# {own}\n\n")
+        }
+    }
+
+    // `prefix` (P2-2's breadcrumb/heading text) pushed this past clippy's
+    // 7-argument default; a dedicated params struct would be overkill for a
+    // single private helper with three call sites.
+    #[allow(clippy::too_many_arguments)]
     fn split_section_text(
         &self,
         text: &str,
@@ -147,6 +209,7 @@ impl Chunker {
         page_range: (u32, u32),
         section: &Section,
         chunk_id: &mut usize,
+        prefix: &str,
     ) -> Vec<Chunk> {
         let paragraphs: Vec<&str> = text
             .split("\n\n")
@@ -161,13 +224,17 @@ impl Chunker {
             let para_tokens = Self::estimate_tokens(para);
 
             if current_tokens + para_tokens > self.config.max_tokens && !current_text.is_empty() {
-                // Flush current chunk.
+                // Flush current chunk. Every sub-chunk (first and
+                // continuation alike) carries the same context prefix, so
+                // positional information survives the split (P2-2).
+                let prefixed_text = format!("{prefix}{}", current_text.trim());
                 chunks.push(Chunk {
                     chunk_id: *chunk_id,
                     paper_id: paper_id.to_string(),
                     section: section_name.clone(),
                     page_range,
-                    text: current_text.trim().to_string(),
+                    estimated_tokens: Self::estimate_tokens(&prefixed_text),
+                    text: prefixed_text,
                     figures: if is_first {
                         section.figures.clone()
                     } else {
@@ -178,7 +245,6 @@ impl Chunker {
                     } else {
                         vec![]
                     },
-                    estimated_tokens: current_tokens,
                     has_continuation: true,
                 });
                 *chunk_id += 1;
@@ -198,12 +264,14 @@ impl Chunker {
 
         // Final chunk.
         if !current_text.is_empty() {
+            let prefixed_text = format!("{prefix}{}", current_text.trim());
             chunks.push(Chunk {
                 chunk_id: *chunk_id,
                 paper_id: paper_id.to_string(),
                 section: section_name,
                 page_range,
-                text: current_text.trim().to_string(),
+                estimated_tokens: Self::estimate_tokens(&prefixed_text),
+                text: prefixed_text,
                 figures: if is_first {
                     section.figures.clone()
                 } else {
@@ -214,7 +282,6 @@ impl Chunker {
                 } else {
                     vec![]
                 },
-                estimated_tokens: current_tokens,
                 has_continuation: false,
             });
             *chunk_id += 1;
@@ -321,6 +388,9 @@ impl Chunker {
             page_range: (0, doc.metadata.pages.saturating_sub(1)),
         };
 
+        // No per-chunk section attribution exists yet for this strategy (see
+        // P2-4), so there is no section path to build a breadcrumb from; no
+        // context prefix is applied here (non-scope for P2-2).
         self.split_section_text(
             &all_text,
             &doc.paper_id,
@@ -328,6 +398,7 @@ impl Chunker {
             (0, doc.metadata.pages.saturating_sub(1)),
             &empty_section,
             &mut 0,
+            "",
         )
     }
 
@@ -646,5 +717,167 @@ mod tests {
             "expected figure placeholder in chunk text, got: {}",
             chunks[0].text
         );
+    }
+
+    // ---- include_section_context (P2-2): breadcrumb + heading prefix ----
+
+    #[test]
+    fn breadcrumb_prefix_for_nested_section() {
+        let config = default_config(); // include_section_context: true
+        let chunker = Chunker::new(config);
+
+        let mut parent = make_section("METHODS", "Parent body text.", 1);
+        parent
+            .children
+            .push(make_section("Data Collection", "Child body text.", 2));
+
+        let doc = make_doc_with_sections(vec![parent]);
+        let chunks = chunker.chunk(&doc);
+
+        assert_eq!(chunks.len(), 2, "expected one chunk per section");
+        assert!(
+            chunks[0]
+                .text
+                .starts_with("[Context: METHODS]\n# METHODS\n\n"),
+            "top-level chunk should carry its own heading as the sole breadcrumb entry: {}",
+            chunks[0].text
+        );
+        assert!(
+            chunks[1]
+                .text
+                .starts_with("[Context: METHODS > Data Collection]\n# Data Collection\n\n"),
+            "nested chunk should show the full ancestor path: {}",
+            chunks[1].text
+        );
+    }
+
+    #[test]
+    fn no_prefix_when_context_disabled() {
+        let config = ChunkConfig {
+            include_section_context: false,
+            ..default_config()
+        };
+        let chunker = Chunker::new(config);
+
+        let mut parent = make_section("METHODS", "Parent body text.", 1);
+        parent
+            .children
+            .push(make_section("Data Collection", "Child body text.", 2));
+
+        let doc = make_doc_with_sections(vec![parent]);
+        let chunks = chunker.chunk(&doc);
+
+        assert_eq!(chunks.len(), 2);
+        for chunk in &chunks {
+            assert!(
+                !chunk.text.contains("[Context:"),
+                "prefix must be absent when include_section_context is false: {}",
+                chunk.text
+            );
+        }
+        // Disabling the flag reproduces the plain (unprefixed) body text.
+        assert!(chunks[0].text.starts_with("Parent body text."));
+        assert!(chunks[1].text.starts_with("Child body text."));
+    }
+
+    #[test]
+    fn headerless_section_no_empty_breadcrumb() {
+        let config = default_config();
+        let chunker = Chunker::new(config);
+
+        let section = Section {
+            header: None,
+            level: 1,
+            blocks: vec![TextBlock {
+                global_index: 0,
+                lines: vec![],
+                text: "Preamble text.".to_string(),
+                bbox: Rect::new(0.0, 0.0, 0.0, 0.0),
+                page: 0,
+                column_index: 0,
+                block_type: BlockType::BodyText,
+            }],
+            figures: vec![],
+            tables: vec![],
+            children: vec![],
+            page_range: (0, 0),
+        };
+        let doc = make_doc_with_sections(vec![section]);
+        let chunks = chunker.chunk(&doc);
+
+        assert_eq!(chunks.len(), 1);
+        assert!(
+            !chunks[0].text.contains("[Context:"),
+            "an entirely headerless section (no ancestors either) must have no breadcrumb: {}",
+            chunks[0].text
+        );
+        assert!(
+            !chunks[0].text.contains(" >  >") && !chunks[0].text.contains("Context: ]"),
+            "must not produce an empty or doubly-separated breadcrumb: {}",
+            chunks[0].text
+        );
+        assert!(chunks[0].text.contains("Preamble text."));
+    }
+
+    #[test]
+    fn split_chunks_all_carry_prefix() {
+        use crate::types::SectionHeader;
+
+        // Small max_tokens forces `split_section_text` to break the section's
+        // three paragraphs into multiple sub-chunks.
+        let config = ChunkConfig {
+            max_tokens: 15,
+            overlap_tokens: 0,
+            split_strategy: SplitStrategy::SectionBoundary,
+            include_section_context: true,
+            math_config: None,
+        };
+        let chunker = Chunker::new(config);
+
+        let make_block = |idx: usize, text: &str| TextBlock {
+            global_index: idx,
+            lines: vec![],
+            text: text.to_string(),
+            bbox: Rect::new(0.0, 0.0, 0.0, 0.0),
+            page: 0,
+            column_index: 0,
+            block_type: BlockType::BodyText,
+        };
+        let section = Section {
+            header: Some(SectionHeader {
+                text: "BIG".to_string(),
+                clean_text: "BIG".to_string(),
+                level: 1,
+                numbering: None,
+                page: 0,
+                bbox: Rect::new(0.0, 0.0, 0.0, 0.0),
+                block_index: 0,
+            }),
+            level: 1,
+            blocks: vec![
+                make_block(0, "Paragraph one padding text goes here now."),
+                make_block(1, "Paragraph two padding text goes here now."),
+                make_block(2, "Paragraph three padding text goes here."),
+            ],
+            figures: vec![],
+            tables: vec![],
+            children: vec![],
+            page_range: (0, 0),
+        };
+        let doc = make_doc_with_sections(vec![section]);
+        let chunks = chunker.chunk(&doc);
+
+        assert!(
+            chunks.len() >= 2,
+            "expected the oversized section to split into multiple sub-chunks, got {}",
+            chunks.len()
+        );
+        for chunk in &chunks {
+            assert!(
+                chunk.text.starts_with("[Context: BIG]\n# BIG\n\n"),
+                "every sub-chunk must carry the same section prefix: {}",
+                chunk.text
+            );
+        }
     }
 }

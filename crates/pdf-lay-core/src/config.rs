@@ -428,7 +428,14 @@ pub struct ChunkConfig {
     pub overlap_tokens: usize,
     /// Strategy for determining chunk boundaries.
     pub split_strategy: SplitStrategy,
-    /// Whether to prepend the section path as context at the start of each chunk.
+    /// Whether to prepend a breadcrumb of ancestor section headings plus the
+    /// section's own heading line to the start of each chunk's text, e.g.
+    /// `[Context: METHODS > Data Collection]\n# Data Collection`. Ancestor
+    /// headings are joined with `" > "`; headerless sections contribute no
+    /// path segment. Applies to the `SectionBoundary` split strategy
+    /// (including its oversized-section sub-splits, where every sub-chunk
+    /// carries the same prefix); `TokenCount` and `Paragraph` do not yet
+    /// carry per-chunk section attribution to prefix (see P2-4).
     pub include_section_context: bool,
     /// Optional math configuration used to render chunk body text.
     ///
