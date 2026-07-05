@@ -233,10 +233,20 @@ pub struct HeaderDetectionConfig {
     /// behavior.
     #[serde(default = "default_respect_classification")]
     pub respect_classification: bool,
+    /// When true, text repeated in the top/bottom zone across 3+ pages is
+    /// reclassified as a running header/footer before header detection, so it
+    /// cannot become a spurious section header. Set false for legacy behavior.
+    #[serde(default = "default_detect_repeated_running")]
+    pub detect_repeated_running: bool,
 }
 
 /// Default value for [`HeaderDetectionConfig::respect_classification`].
 fn default_respect_classification() -> bool {
+    true
+}
+
+/// Default value for [`HeaderDetectionConfig::detect_repeated_running`].
+fn default_detect_repeated_running() -> bool {
     true
 }
 
@@ -247,6 +257,7 @@ impl Default for HeaderDetectionConfig {
             max_chars: 120,
             max_lines: 3,
             respect_classification: default_respect_classification(),
+            detect_repeated_running: default_detect_repeated_running(),
         }
     }
 }
