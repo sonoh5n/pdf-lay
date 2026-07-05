@@ -227,6 +227,17 @@ pub struct HeaderDetectionConfig {
     pub max_chars: usize,
     /// Maximum line count for a header candidate.
     pub max_lines: usize,
+    /// When true, blocks the classifier marked as non-body (caption, running
+    /// head/foot, footnote, reference, page number) are excluded from header
+    /// candidates. Set false to restore the legacy classification-agnostic
+    /// behavior.
+    #[serde(default = "default_respect_classification")]
+    pub respect_classification: bool,
+}
+
+/// Default value for [`HeaderDetectionConfig::respect_classification`].
+fn default_respect_classification() -> bool {
+    true
 }
 
 impl Default for HeaderDetectionConfig {
@@ -235,6 +246,7 @@ impl Default for HeaderDetectionConfig {
             min_score: 4,
             max_chars: 120,
             max_lines: 3,
+            respect_classification: default_respect_classification(),
         }
     }
 }

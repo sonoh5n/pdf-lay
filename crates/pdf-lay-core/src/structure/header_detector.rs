@@ -2,7 +2,7 @@
 
 use regex::Regex;
 
-use crate::types::{SectionHeader, TextBlock};
+use crate::types::{BlockType, SectionHeader, TextBlock};
 
 const KNOWN_SECTION_NAMES: &[&str] = &[
     "ABSTRACT",
@@ -39,6 +39,11 @@ pub struct HeaderDetector {
     min_score: u32,
     max_chars: usize,
     max_lines: usize,
+    /// When true, blocks the classifier marked as non-body (caption, running
+    /// head/foot, footnote, reference, page number) are excluded from header
+    /// candidates. Set false to restore the legacy classification-agnostic
+    /// behavior.
+    respect_classification: bool,
     // Compiled regex patterns (stored to avoid recompilation).
     re_roman: Regex,
     re_arabic_dot_dot: Regex,
@@ -55,6 +60,7 @@ impl HeaderDetector {
             min_score: 4,
             max_chars: 120,
             max_lines: 3,
+            respect_classification: true,
             re_roman: Regex::new(r"^([IVX]+\.)\s+").unwrap(),
             re_arabic_dot_dot: Regex::new(r"^(\d+\.\d+\.\d+)[\s.]").unwrap(),
             re_arabic_dot: Regex::new(r"^(\d+\.\d+)[\s.]").unwrap(),
@@ -69,22 +75,47 @@ impl HeaderDetector {
         min_score: u32,
         max_chars: usize,
         max_lines: usize,
+        respect_classification: bool,
     ) -> Self {
         Self {
             min_score,
             max_chars,
             max_lines,
+            respect_classification,
             ..Self::new(body_font_size)
         }
     }
 
+    /// Whether a block's type makes it eligible to be a section-header candidate.
+    ///
+    /// Non-body types (captions, running heads/feet, footnotes, references, page
+    /// numbers) are excluded so the classifier's decision is respected rather
+    /// than re-derived. Excluded blocks are only removed from header *candidacy*;
+    /// they remain in the document as body/other content (No Silent Drop).
+    fn is_header_eligible(block_type: &BlockType) -> bool {
+        !matches!(
+            block_type,
+            BlockType::Caption
+                | BlockType::PageNumber
+                | BlockType::RunningHeader
+                | BlockType::RunningFooter
+                | BlockType::Footnote
+                | BlockType::Reference
+        )
+    }
+
     /// Detect section headers from a slice of blocks.
     ///
-    /// Only blocks that score >= `min_score` (default 4) are returned.
+    /// Only blocks that score >= `min_score` (default 4) are returned. When
+    /// `respect_classification` is set, blocks the classifier marked as non-body
+    /// are excluded from consideration.
     pub fn detect(&self, blocks: &[TextBlock]) -> Vec<SectionHeader> {
         blocks
             .iter()
             .enumerate()
+            .filter(|(_, block)| {
+                !self.respect_classification || Self::is_header_eligible(&block.block_type)
+            })
             .filter_map(|(i, block)| self.try_detect(block, i))
             .collect()
     }
@@ -231,6 +262,16 @@ mod tests {
     use crate::types::{BlockType, Rect, TextBlock, TextLine};
 
     fn make_block(text: &str, font_size: f64, bold: bool, lines: usize) -> TextBlock {
+        make_typed_block(text, font_size, bold, lines, BlockType::BodyText)
+    }
+
+    fn make_typed_block(
+        text: &str,
+        font_size: f64,
+        bold: bool,
+        lines: usize,
+        block_type: BlockType,
+    ) -> TextBlock {
         let line = TextLine {
             spans: vec![],
             text: text.to_string(),
@@ -248,7 +289,7 @@ mod tests {
             bbox: Rect::new(72.0, 700.0, 540.0, 690.0),
             page: 0,
             column_index: 0,
-            block_type: BlockType::BodyText,
+            block_type,
         }
     }
 
@@ -334,5 +375,64 @@ mod tests {
         ];
         let headers = detector.detect(&blocks);
         assert_eq!(headers[0].block_index, 1);
+    }
+
+    // ---- P1-1: classifier-informed candidate filtering -------------------
+
+    #[test]
+    fn caption_block_excluded_from_headers() {
+        let detector = HeaderDetector::new(10.0);
+        // Bold, all-caps, single line, known-name substring — would score high,
+        // but its type is Caption so it must not become a header.
+        let block = make_typed_block("TABLE 1 RESULTS", 11.0, true, 1, BlockType::Caption);
+        assert!(detector.detect(&[block]).is_empty());
+    }
+
+    #[test]
+    fn running_header_block_excluded() {
+        let detector = HeaderDetector::new(10.0);
+        let block = make_typed_block(
+            "IEEE TRANSACTIONS ON EXAMPLES",
+            10.0,
+            true,
+            1,
+            BlockType::RunningHeader,
+        );
+        assert!(detector.detect(&[block]).is_empty());
+    }
+
+    #[test]
+    fn footnote_block_excluded() {
+        let detector = HeaderDetector::new(10.0);
+        let block = make_typed_block(
+            "1. Corresponding author",
+            10.0,
+            true,
+            1,
+            BlockType::Footnote,
+        );
+        assert!(detector.detect(&[block]).is_empty());
+    }
+
+    #[test]
+    fn reference_block_excluded() {
+        let detector = HeaderDetector::new(10.0);
+        let block = make_typed_block("1. A. Author, Title.", 10.0, true, 1, BlockType::Reference);
+        assert!(detector.detect(&[block]).is_empty());
+    }
+
+    #[test]
+    fn bodytext_header_still_detected() {
+        let detector = HeaderDetector::new(10.0);
+        let block = make_typed_block("3. Methods", 10.0, true, 1, BlockType::BodyText);
+        assert_eq!(detector.detect(&[block]).len(), 1);
+    }
+
+    #[test]
+    fn respect_classification_false_restores_legacy() {
+        // With classification disabled, a Caption block can still score as a header.
+        let detector = HeaderDetector::with_config(10.0, 4, 120, 3, false);
+        let block = make_typed_block("TABLE 1 RESULTS", 11.0, true, 1, BlockType::Caption);
+        assert_eq!(detector.detect(&[block]).len(), 1);
     }
 }

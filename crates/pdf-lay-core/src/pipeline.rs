@@ -187,6 +187,7 @@ pub fn analyze_pdf(path: &Path, config: &Config) -> Result<AnalysisResult, PdfLa
         config.header_detection.min_score,
         config.header_detection.max_chars,
         config.header_detection.max_lines,
+        config.header_detection.respect_classification,
     )
     .detect(&blocks);
 
