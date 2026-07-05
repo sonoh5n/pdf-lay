@@ -108,6 +108,36 @@ pub enum PdfLayWarning {
         /// Number of blocks reclassified.
         count: usize,
     },
+    /// A section-numbering anomaly (skip, duplicate, or non-monotonic sequence)
+    /// was detected. The section is still kept.
+    SectionNumberingAnomaly {
+        /// The kind of anomaly.
+        kind: NumberingAnomalyKind,
+        /// Zero-based page index where the anomalous header appears.
+        page: u32,
+    },
+}
+
+/// The kind of section-numbering anomaly detected during hierarchy validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NumberingAnomalyKind {
+    /// A number decreased relative to its sibling (e.g. `3` then `2`).
+    NonMonotonic,
+    /// A number skipped one or more values (e.g. `IV` then `VI`).
+    SkippedNumber,
+    /// The same number appeared more than once.
+    Duplicate,
+}
+
+impl std::fmt::Display for NumberingAnomalyKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::NonMonotonic => "non-monotonic",
+            Self::SkippedNumber => "skipped number",
+            Self::Duplicate => "duplicate",
+        };
+        f.write_str(s)
+    }
 }
 
 impl std::fmt::Display for PdfLayWarning {
@@ -144,6 +174,9 @@ impl std::fmt::Display for PdfLayWarning {
                     f,
                     "reclassified {count} repeated running header/footer block(s)"
                 )
+            }
+            Self::SectionNumberingAnomaly { kind, page } => {
+                write!(f, "section numbering anomaly ({kind}) on page {page}")
             }
         }
     }

@@ -1,8 +1,7 @@
 //! Detects section headers from TextBlocks using multi-signal scoring.
 
-use regex::Regex;
-
 use crate::config::{HeaderDetectionConfig, default_known_section_names};
+use crate::structure::numbering::NumberingParser;
 use crate::types::{BlockType, SectionHeader, TextBlock};
 
 /// Max extra characters beyond a known name's length for the bounded-substring
@@ -24,12 +23,27 @@ pub struct HeaderDetector {
     known_section_names: Vec<String>,
     /// Score bonus for CJK-script headings.
     cjk_heading_bonus: u32,
-    // Compiled regex patterns (stored to avoid recompilation).
-    re_roman: Regex,
-    re_arabic_dot_dot: Regex,
-    re_arabic_dot: Regex,
-    re_arabic: Regex,
-    re_alpha: Regex,
+    /// Bin width (pt) for clustering candidate font sizes into levels.
+    cluster_bin_width: f64,
+    /// Max gap (pt) between adjacent bins merged into one level.
+    cluster_merge_gap: f64,
+    /// Maximum assigned heading level.
+    max_level: u8,
+    /// Parses leading section numbers into structured keys.
+    numbering_parser: NumberingParser,
+}
+
+/// A scored header candidate before its final (font-cluster) level is assigned.
+struct Candidate {
+    global_index: usize,
+    page: u32,
+    bbox: crate::types::Rect,
+    text: String,
+    clean_text: String,
+    numbering: Option<String>,
+    /// Level from numbering depth, if the header is numbered.
+    numbering_level: Option<u8>,
+    font_size: f64,
 }
 
 impl HeaderDetector {
@@ -43,11 +57,10 @@ impl HeaderDetector {
             respect_classification: true,
             known_section_names: normalize_names(&default_known_section_names()),
             cjk_heading_bonus: 1,
-            re_roman: Regex::new(r"^([IVX]+\.)\s+").unwrap(),
-            re_arabic_dot_dot: Regex::new(r"^(\d+\.\d+\.\d+)[\s.]").unwrap(),
-            re_arabic_dot: Regex::new(r"^(\d+\.\d+)[\s.]").unwrap(),
-            re_arabic: Regex::new(r"^(\d+\.)\s+").unwrap(),
-            re_alpha: Regex::new(r"^([A-Z]\.)\s+").unwrap(),
+            cluster_bin_width: 0.5,
+            cluster_merge_gap: 0.5,
+            max_level: 6,
+            numbering_parser: NumberingParser::new(),
         }
     }
 
@@ -60,6 +73,9 @@ impl HeaderDetector {
             respect_classification: cfg.respect_classification,
             known_section_names: normalize_names(&cfg.known_section_names),
             cjk_heading_bonus: cfg.cjk_heading_bonus,
+            cluster_bin_width: cfg.cluster_bin_width,
+            cluster_merge_gap: cfg.cluster_merge_gap,
+            max_level: cfg.max_level,
             ..Self::new(body_font_size)
         }
     }
@@ -84,20 +100,85 @@ impl HeaderDetector {
 
     /// Detect section headers from a slice of blocks.
     ///
-    /// Only blocks that score >= `min_score` (default 4) are returned. When
-    /// `respect_classification` is set, blocks the classifier marked as non-body
-    /// are excluded from consideration.
+    /// Two passes: (1) collect scored candidates; (2) assign each candidate a
+    /// level from its numbering depth (if numbered) or from a document-global
+    /// clustering of candidate font sizes. Font clustering lets three or more
+    /// heading tiers be distinguished, unlike the previous isolated-threshold
+    /// approach. When `respect_classification` is set, classifier-marked
+    /// non-body blocks are excluded.
     pub fn detect(&self, blocks: &[TextBlock]) -> Vec<SectionHeader> {
-        blocks
+        // Pass 1: collect candidates.
+        let candidates: Vec<Candidate> = blocks
             .iter()
             .filter(|block| {
                 !self.respect_classification || Self::is_header_eligible(&block.block_type)
             })
-            .filter_map(|block| self.try_detect(block, block.global_index))
+            .filter_map(|block| self.try_score(block, block.global_index))
+            .collect();
+
+        // Global font clustering → per-bin level.
+        let level_of_bin = self.font_levels(&candidates);
+
+        // Pass 2: finalize levels (numbering depth wins over font level).
+        candidates
+            .into_iter()
+            .map(|c| {
+                let font_level = *level_of_bin.get(&self.font_bin(c.font_size)).unwrap_or(&1);
+                let level = c
+                    .numbering_level
+                    .unwrap_or(font_level)
+                    .clamp(1, self.max_level);
+                SectionHeader {
+                    text: c.text,
+                    clean_text: c.clean_text,
+                    level,
+                    numbering: c.numbering,
+                    page: c.page,
+                    bbox: c.bbox,
+                    block_index: c.global_index,
+                }
+            })
             .collect()
     }
 
-    fn try_detect(&self, block: &TextBlock, global_index: usize) -> Option<SectionHeader> {
+    /// Font-size bin index for clustering.
+    fn font_bin(&self, font_size: f64) -> i64 {
+        (font_size / self.cluster_bin_width).round() as i64
+    }
+
+    /// Cluster candidate font sizes into levels and return a bin → level map.
+    ///
+    /// Bins are ranked largest-first; adjacent bins within `cluster_merge_gap`
+    /// are merged into one level (absorbs measurement jitter). Deterministic:
+    /// depends only on the set of candidate font sizes.
+    fn font_levels(&self, candidates: &[Candidate]) -> std::collections::HashMap<i64, u8> {
+        let mut bins: Vec<i64> = candidates
+            .iter()
+            .map(|c| self.font_bin(c.font_size))
+            .collect();
+        bins.sort_unstable();
+        bins.dedup();
+        bins.reverse(); // largest font first
+
+        let merge_thresh = (self.cluster_merge_gap / self.cluster_bin_width)
+            .round()
+            .max(1.0) as i64;
+        let mut level_of_bin = std::collections::HashMap::new();
+        let mut rank: u8 = 0;
+        let mut prev: Option<i64> = None;
+        for &b in &bins {
+            if let Some(p) = prev
+                && p - b > merge_thresh
+            {
+                rank = rank.saturating_add(1);
+            }
+            level_of_bin.insert(b, (rank + 1).min(self.max_level));
+            prev = Some(b);
+        }
+        level_of_bin
+    }
+
+    fn try_score(&self, block: &TextBlock, global_index: usize) -> Option<Candidate> {
         let text = block.text.trim();
 
         // Quick exclusions. Use character count (not UTF-8 byte length) so CJK
@@ -126,15 +207,14 @@ impl HeaderDetector {
         }
 
         let mut score: u32 = 0;
-        let mut level: u8 = 1;
-        let mut numbering: Option<String> = None;
 
-        // Numbering pattern (+3 points).
-        if let Some((num, pat_level)) = self.match_numbering(text) {
+        // Structured numbering (+3 points). Numbering depth becomes the level
+        // (overrides the font cluster) in pass 2.
+        let parsed = self.numbering_parser.parse(text);
+        let numbering_level = parsed.as_ref().map(|(key, _)| {
             score += 3;
-            level = pat_level;
-            numbering = Some(num);
-        }
+            key.depth()
+        });
 
         // All uppercase (+2).
         if self.is_all_caps(text) {
@@ -170,50 +250,25 @@ impl HeaderDetector {
             return None;
         }
 
-        // Refine level if no numbering was detected.
-        if numbering.is_none() {
-            level = if size_ratio > 1.15 || self.is_all_caps(text) {
-                1
-            } else {
-                2
-            };
-        }
+        // Split the leading number (display string) from the clean title.
+        let (numbering, clean_text) = match &parsed {
+            Some((_, prefix_len)) => (
+                Some(text[..*prefix_len].trim().to_string()),
+                text[*prefix_len..].trim().to_string(),
+            ),
+            None => (None, text.to_string()),
+        };
 
-        let clean_text = self.clean_header_text(text, &numbering);
-
-        Some(SectionHeader {
-            text: text.to_string(),
-            clean_text,
-            level,
-            numbering,
+        Some(Candidate {
+            global_index,
             page: block.page,
             bbox: block.bbox.clone(),
-            block_index: global_index,
+            text: text.to_string(),
+            clean_text,
+            numbering,
+            numbering_level,
+            font_size,
         })
-    }
-
-    // ---- pattern matching ----
-
-    /// Match a numbering pattern and return `(number_string, level)`.
-    fn match_numbering(&self, text: &str) -> Option<(String, u8)> {
-        let t = text.trim();
-
-        if let Some(caps) = self.re_roman.captures(t) {
-            return Some((caps[1].to_string(), 1));
-        }
-        if let Some(caps) = self.re_arabic_dot_dot.captures(t) {
-            return Some((caps[1].to_string(), 3));
-        }
-        if let Some(caps) = self.re_arabic_dot.captures(t) {
-            return Some((caps[1].to_string(), 2));
-        }
-        if let Some(caps) = self.re_arabic.captures(t) {
-            return Some((caps[1].to_string(), 1));
-        }
-        if let Some(caps) = self.re_alpha.captures(t) {
-            return Some((caps[1].to_string(), 2));
-        }
-        None
     }
 
     fn is_all_caps(&self, text: &str) -> bool {
@@ -241,15 +296,6 @@ impl HeaderDetector {
     fn is_cjk_heading_like(&self, text: &str) -> bool {
         let t = text.trim();
         cjk_ratio(t) > 0.5 && t.chars().count() <= self.max_chars && !t.ends_with(['。', '．', '.'])
-    }
-
-    /// Remove leading numbering from header text.
-    fn clean_header_text(&self, text: &str, numbering: &Option<String>) -> String {
-        if let Some(num) = numbering {
-            text.trim_start_matches(num.as_str()).trim().to_string()
-        } else {
-            text.to_string()
-        }
     }
 }
 
@@ -551,5 +597,73 @@ mod tests {
         let long_text = "A".repeat(121);
         let block = make_block(&long_text, 12.0, true, 1);
         assert!(detector.detect(&[block]).is_empty());
+    }
+
+    // ---- P1-3: font clustering for level ---------------------------------
+
+    #[test]
+    fn three_font_tiers_map_to_three_levels() {
+        let detector = HeaderDetector::new(10.0);
+        let blocks = vec![
+            make_block("Alpha Section", 16.0, true, 1),
+            make_block("Beta Section", 13.0, true, 1),
+            make_block("Gamma Section", 11.5, true, 1),
+        ];
+        let headers = detector.detect(&blocks);
+        assert_eq!(headers.len(), 3);
+        let level = |name: &str| {
+            headers
+                .iter()
+                .find(|h| h.clean_text.starts_with(name))
+                .map(|h| h.level)
+                .unwrap()
+        };
+        assert_eq!(level("Alpha"), 1);
+        assert_eq!(level("Beta"), 2);
+        assert_eq!(level("Gamma"), 3);
+    }
+
+    #[test]
+    fn near_equal_font_sizes_merge_into_one_level() {
+        let detector = HeaderDetector::new(10.0);
+        let blocks = vec![
+            make_block("First Heading", 12.4, true, 1),
+            make_block("Second Heading", 12.6, true, 1),
+        ];
+        let headers = detector.detect(&blocks);
+        assert_eq!(headers.len(), 2);
+        assert_eq!(headers[0].level, headers[1].level);
+    }
+
+    #[test]
+    fn numbering_overrides_font_level() {
+        let detector = HeaderDetector::new(10.0);
+        // Body-size numbered subsection: font alone would be level 1, but the
+        // numbering depth (2) must win.
+        let block = make_block("2.1 Data Collection", 10.0, false, 1);
+        let headers = detector.detect(&[block]);
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].level, 2);
+    }
+
+    #[test]
+    fn level_assignment_is_deterministic() {
+        let detector = HeaderDetector::new(10.0);
+        let blocks = vec![
+            make_block("Gamma Section", 11.5, true, 1),
+            make_block("Alpha Section", 16.0, true, 1),
+            make_block("Beta Section", 13.0, true, 1),
+        ];
+        let run1: Vec<(String, u8)> = detector
+            .detect(&blocks)
+            .into_iter()
+            .map(|h| (h.clean_text, h.level))
+            .collect();
+        let run2: Vec<(String, u8)> = detector
+            .detect(&blocks)
+            .into_iter()
+            .map(|h| (h.clean_text, h.level))
+            .collect();
+        assert_eq!(run1, run2);
     }
 }

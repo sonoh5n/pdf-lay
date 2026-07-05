@@ -247,6 +247,17 @@ pub struct HeaderDetectionConfig {
     /// a signal for languages where the all-caps heuristic does not apply.
     #[serde(default = "default_cjk_heading_bonus")]
     pub cjk_heading_bonus: u32,
+    /// Bin width (points) for clustering heading candidate font sizes into
+    /// levels. Matches the body-font histogram bin for consistency.
+    #[serde(default = "default_cluster_bin_width")]
+    pub cluster_bin_width: f64,
+    /// Maximum gap (points) between adjacent font-size bins that are still
+    /// merged into one heading level (absorbs measurement jitter).
+    #[serde(default = "default_cluster_merge_gap")]
+    pub cluster_merge_gap: f64,
+    /// Maximum heading level assigned by font clustering / numbering depth.
+    #[serde(default = "default_max_level")]
+    pub max_level: u8,
 }
 
 /// Default value for [`HeaderDetectionConfig::respect_classification`].
@@ -262,6 +273,21 @@ fn default_detect_repeated_running() -> bool {
 /// Default value for [`HeaderDetectionConfig::cjk_heading_bonus`].
 fn default_cjk_heading_bonus() -> u32 {
     1
+}
+
+/// Default value for [`HeaderDetectionConfig::cluster_bin_width`].
+fn default_cluster_bin_width() -> f64 {
+    0.5
+}
+
+/// Default value for [`HeaderDetectionConfig::cluster_merge_gap`].
+fn default_cluster_merge_gap() -> f64 {
+    0.5
+}
+
+/// Default value for [`HeaderDetectionConfig::max_level`].
+fn default_max_level() -> u8 {
+    6
 }
 
 /// Default known section-name keywords (English + Japanese).
@@ -327,6 +353,9 @@ impl Default for HeaderDetectionConfig {
             detect_repeated_running: default_detect_repeated_running(),
             known_section_names: default_known_section_names(),
             cjk_heading_bonus: default_cjk_heading_bonus(),
+            cluster_bin_width: default_cluster_bin_width(),
+            cluster_merge_gap: default_cluster_merge_gap(),
+            max_level: default_max_level(),
         }
     }
 }
