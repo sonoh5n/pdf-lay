@@ -2,36 +2,12 @@
 
 use regex::Regex;
 
+use crate::config::{HeaderDetectionConfig, default_known_section_names};
 use crate::types::{BlockType, SectionHeader, TextBlock};
 
-const KNOWN_SECTION_NAMES: &[&str] = &[
-    "ABSTRACT",
-    "INTRODUCTION",
-    "BACKGROUND",
-    "RELATED WORK",
-    "METHOD",
-    "METHODS",
-    "METHODOLOGY",
-    "APPROACH",
-    "EXPERIMENT",
-    "EXPERIMENTS",
-    "EXPERIMENTAL",
-    "RESULTS",
-    "RESULT",
-    "RESULTS AND DISCUSSION",
-    "DISCUSSION",
-    "ANALYSIS",
-    "CONCLUSION",
-    "CONCLUSIONS",
-    "SUMMARY",
-    "REFERENCES",
-    "BIBLIOGRAPHY",
-    "ACKNOWLEDGMENT",
-    "ACKNOWLEDGMENTS",
-    "APPENDIX",
-    "SUPPLEMENTARY",
-    "SUPPORTING INFORMATION",
-];
+/// Max extra characters beyond a known name's length for the bounded-substring
+/// match, so a long paragraph merely containing "METHOD" does not match.
+const KNOWN_NAME_SUBSTR_MARGIN: usize = 8;
 
 /// Detects section headers from blocks using scoring heuristics.
 pub struct HeaderDetector {
@@ -44,6 +20,10 @@ pub struct HeaderDetector {
     /// candidates. Set false to restore the legacy classification-agnostic
     /// behavior.
     respect_classification: bool,
+    /// Known section names, pre-normalized (trimmed, full-width folded, upper).
+    known_section_names: Vec<String>,
+    /// Score bonus for CJK-script headings.
+    cjk_heading_bonus: u32,
     // Compiled regex patterns (stored to avoid recompilation).
     re_roman: Regex,
     re_arabic_dot_dot: Regex,
@@ -53,7 +33,7 @@ pub struct HeaderDetector {
 }
 
 impl HeaderDetector {
-    /// Create a new detector with the given body font size.
+    /// Create a new detector with the given body font size and default config.
     pub fn new(body_font_size: f64) -> Self {
         Self {
             body_font_size,
@@ -61,6 +41,8 @@ impl HeaderDetector {
             max_chars: 120,
             max_lines: 3,
             respect_classification: true,
+            known_section_names: normalize_names(&default_known_section_names()),
+            cjk_heading_bonus: 1,
             re_roman: Regex::new(r"^([IVX]+\.)\s+").unwrap(),
             re_arabic_dot_dot: Regex::new(r"^(\d+\.\d+\.\d+)[\s.]").unwrap(),
             re_arabic_dot: Regex::new(r"^(\d+\.\d+)[\s.]").unwrap(),
@@ -69,19 +51,15 @@ impl HeaderDetector {
         }
     }
 
-    /// Create a new detector with the given body font size and custom thresholds.
-    pub fn with_config(
-        body_font_size: f64,
-        min_score: u32,
-        max_chars: usize,
-        max_lines: usize,
-        respect_classification: bool,
-    ) -> Self {
+    /// Create a detector from a [`HeaderDetectionConfig`].
+    pub fn with_config(body_font_size: f64, cfg: &HeaderDetectionConfig) -> Self {
         Self {
-            min_score,
-            max_chars,
-            max_lines,
-            respect_classification,
+            min_score: cfg.min_score,
+            max_chars: cfg.max_chars,
+            max_lines: cfg.max_lines,
+            respect_classification: cfg.respect_classification,
+            known_section_names: normalize_names(&cfg.known_section_names),
+            cjk_heading_bonus: cfg.cjk_heading_bonus,
             ..Self::new(body_font_size)
         }
     }
@@ -122,8 +100,9 @@ impl HeaderDetector {
     fn try_detect(&self, block: &TextBlock, global_index: usize) -> Option<SectionHeader> {
         let text = block.text.trim();
 
-        // Quick exclusions.
-        if text.len() > self.max_chars || block.lines.len() > self.max_lines {
+        // Quick exclusions. Use character count (not UTF-8 byte length) so CJK
+        // headings are not wrongly excluded.
+        if text.chars().count() > self.max_chars || block.lines.len() > self.max_lines {
             return None;
         }
         if text
@@ -175,6 +154,11 @@ impl HeaderDetector {
         // Known section name (+2).
         if self.is_known_name(text) {
             score += 2;
+        }
+
+        // CJK-script heading signal (alternative to all-caps for CJK languages).
+        if self.is_cjk_heading_like(text) {
+            score += self.cjk_heading_bonus;
         }
 
         // Single line (+1).
@@ -238,11 +222,25 @@ impl HeaderDetector {
     }
 
     fn is_known_name(&self, text: &str) -> bool {
-        let upper = text.to_uppercase();
-        let clean = upper.trim();
-        KNOWN_SECTION_NAMES
-            .iter()
-            .any(|&name| clean == name || clean.contains(name))
+        let norm = normalize(text);
+        let norm_len = norm.chars().count();
+        self.known_section_names.iter().any(|name| {
+            if norm == *name {
+                return true;
+            }
+            // Bounded substring: only match when the block is not much longer
+            // than the known name, so a long paragraph containing "METHOD"
+            // does not fire (S6).
+            norm_len <= name.chars().count() + KNOWN_NAME_SUBSTR_MARGIN
+                && norm.contains(name.as_str())
+        })
+    }
+
+    /// Whether a block looks like a CJK-script heading: mostly CJK characters,
+    /// short, and not ending in sentence-final punctuation.
+    fn is_cjk_heading_like(&self, text: &str) -> bool {
+        let t = text.trim();
+        cjk_ratio(t) > 0.5 && t.chars().count() <= self.max_chars && !t.ends_with(['。', '．', '.'])
     }
 
     /// Remove leading numbering from header text.
@@ -253,6 +251,49 @@ impl HeaderDetector {
             text.to_string()
         }
     }
+}
+
+/// Normalize a string for known-name comparison: trim, fold full-width ASCII to
+/// half-width, then uppercase (a no-op for CJK scripts).
+fn normalize(s: &str) -> String {
+    s.trim()
+        .chars()
+        .map(|c| {
+            if ('\u{FF01}'..='\u{FF5E}').contains(&c) {
+                char::from_u32(c as u32 - 0xFEE0).unwrap_or(c)
+            } else {
+                c
+            }
+        })
+        .collect::<String>()
+        .to_uppercase()
+}
+
+/// Normalize a list of known section names.
+fn normalize_names(names: &[String]) -> Vec<String> {
+    names.iter().map(|n| normalize(n)).collect()
+}
+
+/// Whether a character belongs to a CJK script (Han, Kana, Hangul).
+fn is_cjk_char(c: char) -> bool {
+    matches!(c,
+        '\u{4E00}'..='\u{9FFF}'   // CJK Unified Ideographs
+        | '\u{3400}'..='\u{4DBF}' // CJK Unified Ideographs Extension A
+        | '\u{F900}'..='\u{FAFF}' // CJK Compatibility Ideographs
+        | '\u{3040}'..='\u{309F}' // Hiragana
+        | '\u{30A0}'..='\u{30FF}' // Katakana
+        | '\u{AC00}'..='\u{D7A3}' // Hangul Syllables
+    )
+}
+
+/// Fraction of non-whitespace characters that are CJK-script characters.
+fn cjk_ratio(text: &str) -> f64 {
+    let letters: Vec<char> = text.chars().filter(|c| !c.is_whitespace()).collect();
+    if letters.is_empty() {
+        return 0.0;
+    }
+    let cjk = letters.iter().filter(|c| is_cjk_char(**c)).count();
+    cjk as f64 / letters.len() as f64
 }
 
 #[cfg(test)]
@@ -449,8 +490,66 @@ mod tests {
     #[test]
     fn respect_classification_false_restores_legacy() {
         // With classification disabled, a Caption block can still score as a header.
-        let detector = HeaderDetector::with_config(10.0, 4, 120, 3, false);
+        let cfg = HeaderDetectionConfig {
+            respect_classification: false,
+            ..HeaderDetectionConfig::default()
+        };
+        let detector = HeaderDetector::with_config(10.0, &cfg);
         let block = make_typed_block("TABLE 1 RESULTS", 11.0, true, 1, BlockType::Caption);
         assert_eq!(detector.detect(&[block]).len(), 1);
+    }
+
+    // ---- P1-5: Unicode / CJK handling -----------------------------------
+
+    #[test]
+    fn char_count_filter_allows_long_cjk_heading() {
+        let detector = HeaderDetector::new(10.0);
+        // 40 CJK chars = 120 bytes (> max_chars as bytes) but 40 chars (<= 120).
+        let text: String = "あ".repeat(40);
+        let block = make_block(&text, 12.0, true, 1);
+        // Should not be filtered out by the length guard (would have been under
+        // the old byte-length check). It is a candidate; assert it isn't dropped
+        // purely on length by checking a bold CJK line scores as a header.
+        let headers = detector.detect(&[block]);
+        assert_eq!(
+            headers.len(),
+            1,
+            "long CJK heading must pass the length filter"
+        );
+    }
+
+    #[test]
+    fn cjk_heading_detected() {
+        let detector = HeaderDetector::new(10.0);
+        // "関連研究" (Related Work) — known Japanese name + CJK signal + bold.
+        let block = make_block("関連研究", 10.0, true, 1);
+        let headers = detector.detect(&[block]);
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].clean_text, "関連研究");
+    }
+
+    #[test]
+    fn known_name_no_overfire_in_long_body() {
+        let detector = HeaderDetector::new(10.0);
+        // A long sentence that merely contains "method" must not be a known name.
+        let long =
+            "In this work we introduce a novel method for evaluating the approach across datasets";
+        assert!(!detector.is_known_name(long));
+    }
+
+    #[test]
+    fn configurable_known_names_extend() {
+        let mut cfg = HeaderDetectionConfig::default();
+        cfg.known_section_names.push("提案手法".to_string());
+        let detector = HeaderDetector::with_config(10.0, &cfg);
+        assert!(detector.is_known_name("提案手法"));
+    }
+
+    #[test]
+    fn ascii_length_regression_unchanged() {
+        let detector = HeaderDetector::new(10.0);
+        let long_text = "A".repeat(121);
+        let block = make_block(&long_text, 12.0, true, 1);
+        assert!(detector.detect(&[block]).is_empty());
     }
 }

@@ -238,6 +238,15 @@ pub struct HeaderDetectionConfig {
     /// cannot become a spurious section header. Set false for legacy behavior.
     #[serde(default = "default_detect_repeated_running")]
     pub detect_repeated_running: bool,
+    /// Known section-name keywords used as a header signal. Matched
+    /// case-insensitively (and full-width folded) with a bounded substring rule.
+    /// Includes English and Japanese defaults; extend for other formats.
+    #[serde(default = "default_known_section_names")]
+    pub known_section_names: Vec<String>,
+    /// Score bonus added when a block looks like a CJK-script heading. Provides
+    /// a signal for languages where the all-caps heuristic does not apply.
+    #[serde(default = "default_cjk_heading_bonus")]
+    pub cjk_heading_bonus: u32,
 }
 
 /// Default value for [`HeaderDetectionConfig::respect_classification`].
@@ -250,6 +259,64 @@ fn default_detect_repeated_running() -> bool {
     true
 }
 
+/// Default value for [`HeaderDetectionConfig::cjk_heading_bonus`].
+fn default_cjk_heading_bonus() -> u32 {
+    1
+}
+
+/// Default known section-name keywords (English + Japanese).
+pub(crate) fn default_known_section_names() -> Vec<String> {
+    [
+        // English
+        "ABSTRACT",
+        "INTRODUCTION",
+        "BACKGROUND",
+        "RELATED WORK",
+        "METHOD",
+        "METHODS",
+        "METHODOLOGY",
+        "APPROACH",
+        "EXPERIMENT",
+        "EXPERIMENTS",
+        "EXPERIMENTAL",
+        "RESULTS",
+        "RESULT",
+        "RESULTS AND DISCUSSION",
+        "DISCUSSION",
+        "ANALYSIS",
+        "CONCLUSION",
+        "CONCLUSIONS",
+        "SUMMARY",
+        "REFERENCES",
+        "BIBLIOGRAPHY",
+        "ACKNOWLEDGMENT",
+        "ACKNOWLEDGMENTS",
+        "APPENDIX",
+        "SUPPLEMENTARY",
+        "SUPPORTING INFORMATION",
+        // Japanese
+        "概要",
+        "序論",
+        "はじめに",
+        "関連研究",
+        "手法",
+        "提案手法",
+        "実験",
+        "評価",
+        "結果",
+        "考察",
+        "議論",
+        "結論",
+        "まとめ",
+        "参考文献",
+        "謝辞",
+        "付録",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
 impl Default for HeaderDetectionConfig {
     fn default() -> Self {
         Self {
@@ -258,6 +325,8 @@ impl Default for HeaderDetectionConfig {
             max_lines: 3,
             respect_classification: default_respect_classification(),
             detect_repeated_running: default_detect_repeated_running(),
+            known_section_names: default_known_section_names(),
+            cjk_heading_bonus: default_cjk_heading_bonus(),
         }
     }
 }
