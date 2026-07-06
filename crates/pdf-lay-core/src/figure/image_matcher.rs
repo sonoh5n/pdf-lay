@@ -47,8 +47,11 @@ impl ImageMatcher {
 
     /// Match figure captions to images and return [`FigureInfo`] records.
     ///
-    /// Only captions of type [`CaptionType::Figure`] are matched. Table captions
-    /// are silently ignored (they are handled by the table module).
+    /// Captions of type [`CaptionType::Figure`], [`CaptionType::Scheme`], and
+    /// [`CaptionType::Chart`] are all treated as image-matchable (P4-4: a
+    /// chemistry "Scheme N" or "Chart N" caption is matched the same way a
+    /// "Figure N" caption is). [`CaptionType::Table`] captions are ignored
+    /// here (they are handled by the table module).
     pub fn match_all(
         &self,
         captions: &[CaptionInfo],
@@ -58,10 +61,12 @@ impl ImageMatcher {
         let mut used_images: HashSet<usize> = HashSet::new();
         let mut results = Vec::new();
 
-        for caption in captions
-            .iter()
-            .filter(|c| c.caption_type == CaptionType::Figure)
-        {
+        for caption in captions.iter().filter(|c| {
+            matches!(
+                c.caption_type,
+                CaptionType::Figure | CaptionType::Scheme | CaptionType::Chart
+            )
+        }) {
             if let Some((img_idx, image)) = self.find_nearest(caption, images, &used_images) {
                 used_images.insert(img_idx);
 
@@ -260,6 +265,30 @@ mod tests {
             make_image(1, 220.0, 210.0, 72.0, 540.0), // different page
         ];
         let figures = matcher.match_all(&[caption], &images, &[]);
+        assert!(figures.is_empty());
+    }
+
+    #[test]
+    fn scheme_and_chart_captions_are_image_matchable() {
+        // P4-4: Scheme/Chart captions are treated the same as Figure captions
+        // for image matching, not silently dropped like Table captions.
+        let matcher = ImageMatcher::new();
+        let mut scheme_caption = make_caption(0, 0, 200.0);
+        scheme_caption.caption_type = CaptionType::Scheme;
+        scheme_caption.prefix = "Scheme".to_string();
+        let images = vec![make_image(0, 220.0, 210.0, 72.0, 540.0)];
+        let figures = matcher.match_all(&[scheme_caption], &images, &[]);
+        assert_eq!(figures.len(), 1);
+        assert_eq!(figures[0].figure_id, "Scheme 1");
+    }
+
+    #[test]
+    fn table_captions_are_not_image_matched() {
+        let matcher = ImageMatcher::new();
+        let mut table_caption = make_caption(0, 0, 200.0);
+        table_caption.caption_type = CaptionType::Table;
+        let images = vec![make_image(0, 220.0, 210.0, 72.0, 540.0)];
+        let figures = matcher.match_all(&[table_caption], &images, &[]);
         assert!(figures.is_empty());
     }
 

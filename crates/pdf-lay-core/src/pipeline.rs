@@ -202,7 +202,8 @@ pub fn analyze_pdf(path: &Path, config: &Config) -> Result<AnalysisResult, PdfLa
 
     // ---- Phase 5: Figure Matching ----
 
-    let caption_detector = CaptionDetector::new();
+    let (caption_detector, caption_warnings) = CaptionDetector::from_config(&config.caption);
+    warnings.extend(caption_warnings);
     let captions = caption_detector.detect(&blocks);
 
     let image_matcher = ImageMatcher::new().with_max_gap(config.caption_max_gap_pt);

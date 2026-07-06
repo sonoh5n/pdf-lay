@@ -116,6 +116,15 @@ pub enum PdfLayWarning {
         /// Zero-based page index where the anomalous header appears.
         page: u32,
     },
+    /// A user-supplied caption pattern (`CaptionConfig::extra_figure_patterns`
+    /// / `extra_table_patterns`) failed to compile as a regex and was ignored;
+    /// the built-in caption patterns still apply.
+    InvalidCaptionPattern {
+        /// The invalid pattern string, as supplied in the configuration.
+        pattern: String,
+        /// The regex compiler's error message.
+        reason: String,
+    },
 }
 
 /// The kind of section-numbering anomaly detected during hierarchy validation.
@@ -177,6 +186,9 @@ impl std::fmt::Display for PdfLayWarning {
             }
             Self::SectionNumberingAnomaly { kind, page } => {
                 write!(f, "section numbering anomaly ({kind}) on page {page}")
+            }
+            Self::InvalidCaptionPattern { pattern, reason } => {
+                write!(f, "invalid caption pattern {pattern:?} ignored: {reason}")
             }
         }
     }

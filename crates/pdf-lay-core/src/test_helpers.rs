@@ -159,10 +159,14 @@ pub fn make_caption_info(
     let prefix = match caption_type {
         CaptionType::Figure => format!("Fig. {number}"),
         CaptionType::Table => format!("Table {number}"),
+        CaptionType::Scheme => format!("Scheme {number}"),
+        CaptionType::Chart => format!("Chart {number}"),
     };
     let type_label = match caption_type {
         CaptionType::Figure => format!("Fig. {number}."),
         CaptionType::Table => format!("Table {number}."),
+        CaptionType::Scheme => format!("Scheme {number}."),
+        CaptionType::Chart => format!("Chart {number}."),
     };
     CaptionInfo {
         block_index,

@@ -44,6 +44,10 @@ pub struct Config {
     /// this value.
     #[serde(default = "default_min_coverage_ratio")]
     pub min_coverage_ratio: f64,
+    /// Configuration for figure/table caption detection (patterns, language
+    /// toggles). See [`CaptionConfig`].
+    #[serde(default)]
+    pub caption: CaptionConfig,
 }
 
 /// Default value for [`Config::caption_max_chars`].
@@ -78,6 +82,56 @@ impl Default for Config {
             caption_max_chars: default_caption_max_chars(),
             running_header_max_chars: default_running_header_max_chars(),
             min_coverage_ratio: default_min_coverage_ratio(),
+            caption: CaptionConfig::default(),
+        }
+    }
+}
+
+/// Configuration for figure/table caption detection ([`CaptionDetector`]).
+///
+/// [`CaptionDetector`]: crate::figure::CaptionDetector
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CaptionConfig {
+    /// Additional user-supplied regex patterns matched as `Figure` captions,
+    /// on top of the built-in patterns (`Fig.`/`Figure`/`FIG.`). A pattern
+    /// that fails to compile is skipped with a warning rather than causing a
+    /// panic; the remaining patterns (built-in and user-supplied) still apply.
+    #[serde(default)]
+    pub extra_figure_patterns: Vec<String>,
+    /// Additional user-supplied regex patterns matched as `Table` captions,
+    /// on top of the built-in patterns (`Table`/`Tab.`). Same failure handling
+    /// as [`Self::extra_figure_patterns`].
+    #[serde(default)]
+    pub extra_table_patterns: Vec<String>,
+    /// Whether to recognize Japanese caption prefixes ("図"/"表", full-width
+    /// digits included). Default `true`; set `false` to restore the
+    /// ASCII/English-only pre-P4-4 behavior.
+    #[serde(default = "default_enable_japanese")]
+    pub enable_japanese: bool,
+    /// Whether to recognize `Scheme N` / `Chart N` captions (matched as
+    /// image-matchable caption types alongside `Figure`). Default `true`; set
+    /// `false` to restore the pre-P4-4 behavior.
+    #[serde(default = "default_enable_scheme_chart")]
+    pub enable_scheme_chart: bool,
+}
+
+/// Default value for [`CaptionConfig::enable_japanese`].
+fn default_enable_japanese() -> bool {
+    true
+}
+
+/// Default value for [`CaptionConfig::enable_scheme_chart`].
+fn default_enable_scheme_chart() -> bool {
+    true
+}
+
+impl Default for CaptionConfig {
+    fn default() -> Self {
+        Self {
+            extra_figure_patterns: Vec::new(),
+            extra_table_patterns: Vec::new(),
+            enable_japanese: default_enable_japanese(),
+            enable_scheme_chart: default_enable_scheme_chart(),
         }
     }
 }
@@ -567,5 +621,17 @@ mod tests {
         assert_eq!(cc.max_tokens, 4000);
         assert_eq!(cc.overlap_tokens, 200);
         assert!(cc.include_section_context);
+    }
+
+    /// P4-4: caption pattern broadening (Japanese, Scheme/Chart) defaults to
+    /// enabled, with no user-supplied extra patterns.
+    #[test]
+    fn caption_config_defaults() {
+        let cc = CaptionConfig::default();
+        assert!(cc.enable_japanese);
+        assert!(cc.enable_scheme_chart);
+        assert!(cc.extra_figure_patterns.is_empty());
+        assert!(cc.extra_table_patterns.is_empty());
+        assert!(Config::default().caption.enable_japanese);
     }
 }
