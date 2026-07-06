@@ -342,12 +342,15 @@ impl PySectionSelector {
     ///     include_tables: Whether to include inline table text.
     ///     figure_format: One of ``"placeholder"`` (default), ``"markdown"``,
     ///         ``"caption"``, or ``"omit"``.
-    #[pyo3(signature = (include_figures = true, include_tables = true, figure_format = "placeholder"))]
+    ///     image_base: Base path prepended to figure image filenames (e.g.
+    ///         ``"./images"``). Empty emits the filename only.
+    #[pyo3(signature = (include_figures = true, include_tables = true, figure_format = "placeholder", image_base = "./images"))]
     fn to_llm_text(
         &self,
         include_figures: bool,
         include_tables: bool,
         figure_format: &str,
+        image_base: &str,
     ) -> String {
         let config = LlmTextConfig {
             include_figures,
@@ -360,6 +363,7 @@ impl PySectionSelector {
                 _ => FigureTextFormat::Placeholder,
             },
             math_representation: MathRepresentationPreference::Auto,
+            image_base: image_base.to_string(),
         };
         self.rebuild_selector().to_llm_text(&config)
     }

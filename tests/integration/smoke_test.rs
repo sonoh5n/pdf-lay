@@ -47,6 +47,7 @@ fn default_llm_config() -> LlmTextConfig {
         include_section_headers: true,
         figure_format: FigureTextFormat::Placeholder,
         math_representation: MathRepresentationPreference::Auto,
+        image_base: String::new(),
     }
 }
 
@@ -735,6 +736,7 @@ fn ieee_paper_section_selector_by_name() {
         include_section_headers: true,
         figure_format: FigureTextFormat::Omit,
         math_representation: MathRepresentationPreference::Auto,
+        image_base: String::new(),
     });
 
     if !selector.sections().is_empty() {
@@ -948,6 +950,7 @@ fn test_table_excluded_when_include_tables_false() {
         include_section_headers: true,
         figure_format: FigureTextFormat::Placeholder,
         math_representation: MathRepresentationPreference::Auto,
+        image_base: String::new(),
     };
     let llm_gen = LlmTextGenerator::new(no_table_config);
     let text = llm_gen.generate(&sections);

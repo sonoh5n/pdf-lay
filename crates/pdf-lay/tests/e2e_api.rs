@@ -50,6 +50,7 @@ fn llm_text_config_compiles() {
         include_section_headers: true,
         math_representation: MathRepresentationPreference::Auto,
         figure_format: pdf_lay::FigureTextFormat::Placeholder,
+        image_base: String::new(),
     };
     assert!(config.include_figures);
 }

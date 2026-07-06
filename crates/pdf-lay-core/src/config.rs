@@ -391,6 +391,12 @@ pub struct LlmTextConfig {
     pub math_representation: MathRepresentationPreference,
     /// How figures are represented in the LLM text output.
     pub figure_format: FigureTextFormat,
+    /// Base path prepended to figure image filenames in LLM text output
+    /// (e.g. `"./images"`). Empty (the default) emits only the filename
+    /// component of `fig.image.path` — the raw on-disk path (which may be
+    /// absolute) is never embedded. Mirrors `MarkdownConfig::image_base_path`.
+    #[serde(default)]
+    pub image_base: String,
 }
 
 impl Default for LlmTextConfig {
@@ -401,6 +407,7 @@ impl Default for LlmTextConfig {
             include_section_headers: true,
             math_representation: MathRepresentationPreference::Auto,
             figure_format: FigureTextFormat::Placeholder,
+            image_base: String::new(),
         }
     }
 }
