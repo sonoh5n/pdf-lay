@@ -14,6 +14,43 @@ pub struct TableGrid {
     pub column_count: usize,
     /// True if the table has multiple header rows.
     pub has_multi_header: bool,
+    /// Cell-level view of `header`, with best-effort inferred colspan/rowspan
+    /// (see [`GridBuilder::infer_header_spans`]). One `Vec<Cell>` per header
+    /// row, one `Cell` per grid column. Derivable from `header` (every
+    /// `Cell::text` matches the corresponding `header` string), so this is
+    /// an additive, non-breaking field.
+    pub header_rows: Vec<Vec<Cell>>,
+}
+
+/// A single table cell, tracking how many grid columns/rows it visually
+/// spans.
+///
+/// Defaults to `colspan = 1, rowspan = 1` — an ordinary, unmerged cell. A
+/// cell that has been merged into a preceding cell's span (see
+/// [`GridBuilder::infer_header_spans`]) is represented with `colspan = 0,
+/// rowspan = 0` as a "covered by a previous cell — do not render on its own"
+/// sentinel; every other cell has `colspan >= 1` and `rowspan >= 1`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Cell {
+    /// The cell's text content.
+    pub text: String,
+    /// Number of grid columns this cell spans (`1` = normal, `0` = covered
+    /// by a preceding cell's span).
+    pub colspan: usize,
+    /// Number of grid rows this cell spans (`1` = normal, `0` = covered by a
+    /// preceding cell's span).
+    pub rowspan: usize,
+}
+
+impl Cell {
+    /// Build an ordinary (unmerged) cell: `colspan = 1, rowspan = 1`.
+    pub fn new(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            colspan: 1,
+            rowspan: 1,
+        }
+    }
 }
 
 /// Builds a `TableGrid` from table region data.
@@ -46,6 +83,7 @@ impl GridBuilder {
                 rows: vec![],
                 column_count: 0,
                 has_multi_header: false,
+                header_rows: vec![],
             };
         }
 
@@ -59,6 +97,7 @@ impl GridBuilder {
                 rows: vec![],
                 column_count: 0,
                 has_multi_header: false,
+                header_rows: vec![],
             };
         }
 
@@ -72,6 +111,7 @@ impl GridBuilder {
                 rows: vec![],
                 column_count: 0,
                 has_multi_header: false,
+                header_rows: vec![],
             };
         }
 
@@ -104,12 +144,117 @@ impl GridBuilder {
             rows,
             column_count,
             has_multi_header: false,
+            header_rows: vec![],
         };
 
         // 6. Check for multi-row headers using the text blocks.
         Self::detect_multi_header(&table_blocks, &mut table_grid);
 
+        // 7. Best-effort colspan/rowspan inference over the (possibly
+        //    multi-row, post-promotion) header. Must run last, since step 6
+        //    can change `table_grid.header`.
+        table_grid.header_rows = Self::infer_header_spans(&table_grid.header);
+
         table_grid
+    }
+
+    /// Infer header-cell colspan/rowspan from runs of empty grid cells
+    /// (best-effort; see `docs/refactor/phase2_llm_output.md#P2-8`).
+    ///
+    /// Academic tables commonly have a spanning/grouped header label (e.g.
+    /// "Metrics" over "Accuracy" and "Precision") where only *one* grid
+    /// slot actually receives a text block and the other slots it visually
+    /// covers are left blank — both horizontally (empty cells to the right,
+    /// in the same header row) and vertically (empty cells below, in the
+    /// same column, across header rows). This function promotes those runs
+    /// of adjacent empty cells into `colspan`/`rowspan` on the preceding
+    /// non-empty cell.
+    ///
+    /// The two inferences are applied in a fixed order — rowspan first,
+    /// then colspan — and a cell that already gained `rowspan > 1` is never
+    /// also treated as a colspan-merge starting point. This keeps the
+    /// result a single, non-overlapping 2-D layout instead of two
+    /// independently-inferred spans clashing over the same grid slot.
+    /// When no run is found, every cell keeps the `Cell::new` default of
+    /// `colspan = 1, rowspan = 1`.
+    fn infer_header_spans(header: &[Vec<String>]) -> Vec<Vec<Cell>> {
+        if header.is_empty() {
+            return Vec::new();
+        }
+
+        let mut cells: Vec<Vec<Cell>> = header
+            .iter()
+            .map(|row| row.iter().map(|s| Cell::new(s.clone())).collect())
+            .collect();
+
+        // Vertical merge (rowspan): a non-empty cell followed by empty
+        // cells directly below it (same column) is assumed to span those
+        // rows.
+        let column_count = cells.first().map(|r| r.len()).unwrap_or(0);
+        for col in 0..column_count {
+            let mut row = 0;
+            while row < cells.len() {
+                let is_start = cells[row]
+                    .get(col)
+                    .map(|c| !c.text.is_empty())
+                    .unwrap_or(false);
+                if !is_start {
+                    row += 1;
+                    continue;
+                }
+                let mut next = row + 1;
+                while next < cells.len()
+                    && cells[next]
+                        .get(col)
+                        .map(|c| c.text.is_empty())
+                        .unwrap_or(false)
+                {
+                    next += 1;
+                }
+                if next > row + 1 {
+                    if let Some(cell) = cells[row].get_mut(col) {
+                        cell.rowspan = next - row;
+                    }
+                    for covered_row in cells.iter_mut().take(next).skip(row + 1) {
+                        if let Some(cell) = covered_row.get_mut(col) {
+                            cell.colspan = 0;
+                            cell.rowspan = 0;
+                        }
+                    }
+                }
+                row = next;
+            }
+        }
+
+        // Horizontal merge (colspan): within a header row, a non-empty,
+        // not-yet-covered cell that has not already gained a rowspan is
+        // followed by empty, not-yet-covered cells — assumed to span those
+        // columns.
+        for row in cells.iter_mut() {
+            let mut col = 0;
+            while col < row.len() {
+                let is_start =
+                    row[col].colspan != 0 && row[col].rowspan == 1 && !row[col].text.is_empty();
+                if !is_start {
+                    col += 1;
+                    continue;
+                }
+                let mut next = col + 1;
+                while next < row.len() && row[next].colspan != 0 && row[next].text.is_empty() {
+                    next += 1;
+                }
+                if next > col + 1 {
+                    row[col].colspan = next - col;
+                    for covered in row.iter_mut().take(next).skip(col + 1) {
+                        covered.colspan = 0;
+                        covered.rowspan = 0;
+                    }
+                }
+                col = next;
+            }
+        }
+
+        cells
     }
 
     /// Detect multi-row headers (e.g., spanning header + sub-headers).
@@ -413,5 +558,80 @@ mod tests {
         assert_eq!(grid.header.len(), 1, "only one header row");
         assert!(!grid.has_multi_header, "has_multi_header should be false");
         assert_eq!(grid.rows.len(), 1, "data row should remain");
+    }
+
+    /// A freshly built `Cell` defaults to an unmerged `colspan = 1, rowspan = 1`.
+    #[test]
+    fn cell_default_span_is_one() {
+        let cell = Cell::new("x");
+        assert_eq!(cell.text, "x");
+        assert_eq!(cell.colspan, 1);
+        assert_eq!(cell.rowspan, 1);
+    }
+
+    /// P2-8 best-effort colspan inference: a header cell ("Group") is placed
+    /// in only one column, leaving the other columns in its row blank — the
+    /// common "grouped header" layout where a single spanning label is
+    /// visually centered/left over several sub-columns. The blank run to
+    /// its right should be folded into its `colspan`.
+    #[test]
+    fn colspan_inferred_when_span_wide() {
+        // Row 0 (header): "Group" only at column 0; columns 1/2 blank under it.
+        // Row 1 (sub-header, bold, promoted): "A", "B", "C".
+        // Row 2 (data): "1", "2", "3".
+        let group = make_block_from_line(make_line("Group", 50.0, 200.0, 10.0, 0), 0);
+        let a = make_block_from_line(make_bold_line("A", 50.0, 180.0, 10.0, 0), 1);
+        let b = make_block_from_line(make_bold_line("B", 150.0, 180.0, 10.0, 0), 2);
+        let c = make_block_from_line(make_bold_line("C", 250.0, 180.0, 10.0, 0), 3);
+        let d1 = make_block_from_line(make_line("1", 50.0, 160.0, 10.0, 0), 4);
+        let d2 = make_block_from_line(make_line("2", 150.0, 160.0, 10.0, 0), 5);
+        let d3 = make_block_from_line(make_line("3", 250.0, 160.0, 10.0, 0), 6);
+
+        let blocks = vec![group, a, b, c, d1, d2, d3];
+        let indices: Vec<usize> = (0..7).collect();
+        let table_bbox = Rect::new(40.0, 210.0, 300.0, 150.0);
+
+        let grid = GridBuilder::build(&indices, &blocks, &table_bbox, false);
+
+        assert_eq!(
+            grid.header.len(),
+            2,
+            "bold sub-header row should be promoted"
+        );
+        assert_eq!(grid.header_rows.len(), 2);
+        assert_eq!(
+            grid.header_rows[0][0].colspan, 3,
+            "Group cell should span all 3 columns"
+        );
+        assert_eq!(grid.header_rows[0][1].colspan, 0, "covered by Group's span");
+        assert_eq!(grid.header_rows[0][2].colspan, 0, "covered by Group's span");
+        // The sub-header row itself is fully populated, so it stays unmerged.
+        for cell in &grid.header_rows[1] {
+            assert_eq!(cell.colspan, 1);
+            assert_eq!(cell.rowspan, 1);
+        }
+    }
+
+    /// When no header row has an empty-cell run, every inferred `Cell` stays
+    /// at the default `colspan = 1, rowspan = 1` (the common, non-merged case).
+    #[test]
+    fn no_span_inferred_when_header_fully_populated() {
+        let grid = GridBuilder::build(
+            &(0..4).collect::<Vec<usize>>(),
+            &[
+                make_cell("Name", 50.0, 100.0, 0),
+                make_cell("Value", 150.0, 100.0, 1),
+                make_cell("Alice", 50.0, 80.0, 2),
+                make_cell("42", 150.0, 80.0, 3),
+            ],
+            &Rect::new(40.0, 110.0, 220.0, 70.0),
+            false,
+        );
+
+        assert_eq!(grid.header_rows.len(), 1);
+        for cell in &grid.header_rows[0] {
+            assert_eq!(cell.colspan, 1);
+            assert_eq!(cell.rowspan, 1);
+        }
     }
 }

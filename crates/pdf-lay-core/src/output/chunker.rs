@@ -1123,6 +1123,7 @@ mod tests {
                 rows: vec![vec!["1".to_string(), "2".to_string()]],
                 caption: None,
                 markdown_text: "| A | B |\n| --- | --- |\n| 1 | 2 |\n".to_string(),
+                header_rows: vec![],
             },
             insertion_point: InsertionPoint {
                 page: 0,
@@ -1386,6 +1387,7 @@ mod tests {
                 rows: vec![vec!["1".to_string()]],
                 caption: None,
                 markdown_text: "| A |\n| --- |\n| 1 |\n".to_string(),
+                header_rows: vec![],
             },
             insertion_point: InsertionPoint {
                 page: 0,

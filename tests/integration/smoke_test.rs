@@ -825,6 +825,7 @@ fn make_doc_with_table() -> pdf_lay::PaperDocument {
             rows: vec![vec!["α".into(), "0.5".into()]],
             caption: Some("Table 1. Results".into()),
             markdown_text: markdown_text.clone(),
+            header_rows: vec![],
         },
         insertion_point: InsertionPoint {
             page: 0,
@@ -1127,6 +1128,7 @@ fn make_comprehensive_doc() -> pdf_lay::PaperDocument {
             markdown_text:
                 "| Method | Accuracy |\n| --- | --- |\n| Baseline | 0.72 |\n| Proposed | 0.91 |\n"
                     .to_string(),
+            header_rows: vec![],
         },
         insertion_point: InsertionPoint {
             page: 1,

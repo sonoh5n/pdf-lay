@@ -44,7 +44,19 @@ impl TableDetector {
         }
 
         if self.config.use_text_alignment {
-            let text_regions = self.detect_by_text_alignment(blocks, table_captions);
+            let mut text_regions = self.detect_by_text_alignment(blocks, table_captions);
+
+            // Best-effort, opt-in relaxation (P2-8): also accept column-aligned
+            // regions with no adjacent caption, under stricter alignment
+            // criteria. Deduplicate against both rule-based regions and the
+            // caption-anchored text-alignment regions just found, so the same
+            // physical table is never counted twice.
+            if self.config.allow_captionless_alignment {
+                let already: Vec<&TableRegion> =
+                    regions.iter().chain(text_regions.iter()).collect();
+                text_regions.extend(self.detect_captionless_alignment(blocks, &already));
+            }
+
             // Deduplicate: skip text-alignment regions that overlap with rule-based ones
             for tr in text_regions {
                 let dominated = regions
@@ -142,6 +154,95 @@ impl TableDetector {
                 regions.push(TableRegion {
                     bbox,
                     page: caption.page,
+                    block_indices,
+                    caption: None,
+                    has_rules: false,
+                    horizontal_rules: vec![],
+                    vertical_rules: vec![],
+                });
+            }
+        }
+
+        regions
+    }
+
+    /// Detect column-aligned table candidates that have **no** adjacent
+    /// table caption (best-effort; opt-in via
+    /// [`TableConfig::allow_captionless_alignment`], default off — see
+    /// `docs/refactor/phase2_llm_output.md#P2-8`).
+    ///
+    /// Unlike [`Self::detect_by_text_alignment`], which anchors its scan
+    /// below a "Table N" caption, this scans every page for runs of short,
+    /// column-aligned blocks and requires **both** enough distinct row
+    /// levels (`TableConfig::borderless_min_rows`) and enough distinct
+    /// column levels (`TableConfig::min_columns`) before accepting a
+    /// region — a stricter bar than the caption-anchored path, since there
+    /// is no caption to corroborate the classification. Regions that
+    /// overlap an `existing` (already-detected, caption-anchored or
+    /// rule-based) region are skipped so the same table is never counted
+    /// twice.
+    ///
+    /// This is a coarse heuristic, not a precision classifier: it can still
+    /// misclassify short aligned prose (e.g. a two-column list) as a table.
+    /// Full precision tuning against real-world PDFs is deferred (see the
+    /// design doc's "further investigation" note for this task); the
+    /// default (`allow_captionless_alignment = false`) means this path never
+    /// runs unless explicitly opted into.
+    fn detect_captionless_alignment(
+        &self,
+        blocks: &[TextBlock],
+        existing: &[&TableRegion],
+    ) -> Vec<TableRegion> {
+        let mut regions: Vec<TableRegion> = Vec::new();
+
+        let mut by_page: HashMap<u32, Vec<&TextBlock>> = HashMap::new();
+        for block in blocks {
+            if is_table_cell_like(block) {
+                by_page.entry(block.page).or_default().push(block);
+            }
+        }
+
+        for (page, page_blocks) in by_page {
+            let rows = cluster_rows(&page_blocks, self.config.column_alignment_tolerance);
+            let bands = group_rows_into_bands(rows, self.config.captionless_row_gap);
+
+            for band in bands {
+                if band.len() < self.config.borderless_min_rows {
+                    continue;
+                }
+
+                let band_blocks: Vec<&TextBlock> = band.iter().flatten().copied().collect();
+                let Some(first) = band_blocks.first() else {
+                    continue;
+                };
+
+                let x_coords: Vec<f64> = band_blocks.iter().map(|b| b.bbox.left).collect();
+                let n_clusters =
+                    count_x_clusters(&x_coords, self.config.column_alignment_tolerance);
+                if n_clusters < self.config.min_columns {
+                    continue;
+                }
+
+                let mut bbox = first.bbox.clone();
+                for b in &band_blocks[1..] {
+                    bbox = bbox.union(&b.bbox);
+                }
+
+                let dominated = existing
+                    .iter()
+                    .any(|r| r.page == page && r.bbox.overlaps(&bbox))
+                    || regions
+                        .iter()
+                        .any(|r| r.page == page && r.bbox.overlaps(&bbox));
+                if dominated {
+                    continue;
+                }
+
+                let block_indices: Vec<usize> =
+                    band_blocks.iter().map(|b| b.global_index).collect();
+                regions.push(TableRegion {
+                    bbox,
+                    page,
                     block_indices,
                     caption: None,
                     has_rules: false,
@@ -419,6 +520,79 @@ fn collect_candidates_below_caption<'a>(
     candidates
 }
 
+/// Returns `true` if `block` looks like a table cell — short text, not a
+/// section header. The same "table-like" filter as
+/// [`collect_candidates_below_caption`]'s final check, generalized for a
+/// caption-less, whole-page scan (see [`TableDetector::detect_captionless_alignment`]).
+fn is_table_cell_like(block: &TextBlock) -> bool {
+    !matches!(
+        block.block_type,
+        BlockType::SectionHeader | BlockType::SubsectionHeader
+    ) && (block.text.len() < 80 || block.lines.len() <= 2)
+}
+
+/// Cluster blocks into row-groups by Y-center proximity, sorted top to
+/// bottom (highest Y first, matching PDF Y-up coordinates) — the same
+/// clustering strategy as `GridBuilder::detect_rows`, applied to a
+/// caption-less, whole-page candidate scan.
+fn cluster_rows<'a>(blocks: &[&'a TextBlock], tolerance: f64) -> Vec<Vec<&'a TextBlock>> {
+    let mut sorted: Vec<&TextBlock> = blocks.to_vec();
+    sorted.sort_by(|a, b| {
+        b.bbox
+            .center_y()
+            .partial_cmp(&a.bbox.center_y())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    let mut rows: Vec<(f64, Vec<&TextBlock>)> = Vec::new();
+    for block in sorted {
+        let y = block.bbox.center_y();
+        if let Some((rep, members)) = rows.last_mut()
+            && (y - *rep).abs() <= tolerance
+        {
+            members.push(block);
+            continue;
+        }
+        rows.push((y, vec![block]));
+    }
+
+    rows.into_iter().map(|(_, members)| members).collect()
+}
+
+/// Group row-clusters (sorted top-to-bottom, from [`cluster_rows`]) into
+/// contiguous bands wherever the gap between consecutive rows exceeds
+/// `gap_threshold` points — the same banding idea
+/// [`TableDetector::detect_by_rules`] uses for rule lines, applied here to
+/// aligned text rows instead.
+fn group_rows_into_bands<'a>(
+    rows: Vec<Vec<&'a TextBlock>>,
+    gap_threshold: f64,
+) -> Vec<Vec<Vec<&'a TextBlock>>> {
+    let mut bands: Vec<Vec<Vec<&'a TextBlock>>> = Vec::new();
+    let mut current: Vec<Vec<&'a TextBlock>> = Vec::new();
+
+    for row in rows {
+        let Some(this_y) = row.first().map(|b| b.bbox.center_y()) else {
+            continue;
+        };
+        if let Some(last_row) = current.last() {
+            let last_y = last_row
+                .first()
+                .map(|b| b.bbox.center_y())
+                .unwrap_or(this_y);
+            if last_y - this_y > gap_threshold {
+                bands.push(std::mem::take(&mut current));
+            }
+        }
+        current.push(row);
+    }
+    if !current.is_empty() {
+        bands.push(current);
+    }
+
+    bands
+}
+
 /// Count distinct X-coordinate clusters using a simple sort-and-gap approach.
 fn count_x_clusters(x_coords: &[f64], tolerance: f64) -> usize {
     if x_coords.is_empty() {
@@ -609,6 +783,7 @@ mod tests {
             use_text_alignment: true,
             min_columns: 2,
             column_alignment_tolerance: 5.0,
+            ..TableConfig::default()
         });
 
         let caption = make_caption_info(0, CaptionType::Table, 1, "Results", 0);
@@ -642,6 +817,72 @@ mod tests {
         let blocks = vec![make_short_block("data", 50.0, 80.0, 0, 0)];
         let regions = detector.detect(&blocks, &[], &[]);
         assert!(regions.is_empty());
+    }
+
+    /// Helper: a 3-row x 2-column band of short, aligned blocks with no caption.
+    fn make_captionless_grid_blocks() -> Vec<TextBlock> {
+        vec![
+            make_short_block("A", 50.0, 200.0, 0, 0),
+            make_short_block("B", 150.0, 200.0, 0, 1),
+            make_short_block("C", 50.0, 180.0, 0, 2),
+            make_short_block("D", 150.0, 180.0, 0, 3),
+            make_short_block("E", 50.0, 160.0, 0, 4),
+            make_short_block("F", 150.0, 160.0, 0, 5),
+        ]
+    }
+
+    /// P2-8: `allow_captionless_alignment` defaults to `false`, so a
+    /// column-aligned region with no caption must NOT be detected as a table
+    /// (no regression from the pre-P2-8 caption-required behavior).
+    #[test]
+    fn captionless_alignment_disabled_by_default_no_table() {
+        let detector = TableDetector::new(TableConfig {
+            use_rule_detection: false,
+            use_text_alignment: true,
+            ..TableConfig::default()
+        });
+        let blocks = make_captionless_grid_blocks();
+        let regions = detector.detect(&blocks, &[], &[]);
+        assert!(
+            regions.is_empty(),
+            "captionless alignment must stay off by default"
+        );
+    }
+
+    /// P2-8: with `allow_captionless_alignment = true` and enough aligned
+    /// rows/columns, a caption-less region is accepted as a table.
+    #[test]
+    fn captionless_alignment_detects_table_when_enabled() {
+        let detector = TableDetector::new(TableConfig {
+            use_rule_detection: false,
+            use_text_alignment: true,
+            allow_captionless_alignment: true,
+            borderless_min_rows: 3,
+            ..TableConfig::default()
+        });
+        let blocks = make_captionless_grid_blocks();
+        let regions = detector.detect(&blocks, &[], &[]);
+        assert_eq!(regions.len(), 1, "expected 1 caption-less table region");
+        assert!(regions[0].caption.is_none());
+    }
+
+    /// P2-8: the relaxed path still enforces `borderless_min_rows` — fewer
+    /// aligned rows than required must not form a table.
+    #[test]
+    fn captionless_alignment_requires_min_rows() {
+        let detector = TableDetector::new(TableConfig {
+            use_rule_detection: false,
+            use_text_alignment: true,
+            allow_captionless_alignment: true,
+            borderless_min_rows: 5, // stricter than the 3 rows available below
+            ..TableConfig::default()
+        });
+        let blocks = make_captionless_grid_blocks();
+        let regions = detector.detect(&blocks, &[], &[]);
+        assert!(
+            regions.is_empty(),
+            "3 rows < borderless_min_rows(5) should not form a table"
+        );
     }
 
     #[test]

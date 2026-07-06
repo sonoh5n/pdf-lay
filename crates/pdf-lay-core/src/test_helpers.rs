@@ -90,6 +90,7 @@ pub fn make_table_info(id: &str, number: u32, markdown: &str) -> TableInfo {
             rows: vec![vec!["a".to_string(), "b".to_string()]],
             caption: Some(format!("Table {number}")),
             markdown_text: markdown.to_string(),
+            header_rows: vec![],
         },
         insertion_point: InsertionPoint {
             page: 0,

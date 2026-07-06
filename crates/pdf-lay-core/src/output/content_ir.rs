@@ -453,6 +453,7 @@ mod tests {
                 rows: vec![vec!["1".to_string()]],
                 caption: None,
                 markdown_text: "| A |\n| --- |\n| 1 |\n".to_string(),
+                header_rows: vec![],
             },
             insertion_point: InsertionPoint {
                 page: 1,

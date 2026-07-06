@@ -164,6 +164,34 @@ pub struct TableConfig {
     pub use_rule_detection: bool,
     /// Whether to use text X-alignment for table detection when no rules are found.
     pub use_text_alignment: bool,
+    /// Minimum number of distinct aligned row levels required to accept a
+    /// caption-less text-alignment candidate as a table (only consulted when
+    /// [`Self::allow_captionless_alignment`] is enabled — the legacy
+    /// caption-anchored path is unaffected by this value, so existing
+    /// detection results do not change unless the new path is opted into).
+    #[serde(default = "default_borderless_min_rows")]
+    pub borderless_min_rows: usize,
+    /// When `true`, text-alignment detection also accepts column-aligned
+    /// regions that have **no** adjacent "Table N" caption, provided they
+    /// meet `min_columns` and `borderless_min_rows`. Default `false`
+    /// preserves the legacy behavior of requiring a caption (no regression).
+    #[serde(default)]
+    pub allow_captionless_alignment: bool,
+    /// Maximum vertical gap (points) between consecutive aligned rows that
+    /// are still considered part of the same caption-less table candidate.
+    /// Only consulted when [`Self::allow_captionless_alignment`] is enabled.
+    #[serde(default = "default_captionless_row_gap")]
+    pub captionless_row_gap: f64,
+}
+
+/// Default value for [`TableConfig::borderless_min_rows`].
+fn default_borderless_min_rows() -> usize {
+    3
+}
+
+/// Default value for [`TableConfig::captionless_row_gap`].
+fn default_captionless_row_gap() -> f64 {
+    60.0
 }
 
 impl Default for TableConfig {
@@ -173,6 +201,9 @@ impl Default for TableConfig {
             column_alignment_tolerance: 5.0,
             use_rule_detection: true,
             use_text_alignment: true,
+            borderless_min_rows: default_borderless_min_rows(),
+            allow_captionless_alignment: false,
+            captionless_row_gap: default_captionless_row_gap(),
         }
     }
 }
@@ -499,6 +530,16 @@ mod tests {
         assert_eq!(tc.column_alignment_tolerance, 5.0);
         assert!(tc.use_rule_detection);
         assert!(tc.use_text_alignment);
+    }
+
+    /// P2-8: the borderless/caption-less relaxation knobs must default to
+    /// the pre-P2-8 behavior (caption required, no regression).
+    #[test]
+    fn table_config_borderless_default() {
+        let tc = TableConfig::default();
+        assert_eq!(tc.borderless_min_rows, 3);
+        assert!(!tc.allow_captionless_alignment);
+        assert_eq!(tc.captionless_row_gap, 60.0);
     }
 
     #[test]

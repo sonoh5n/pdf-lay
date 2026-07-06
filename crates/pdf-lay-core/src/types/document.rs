@@ -86,7 +86,9 @@ pub struct TableInfo {
 pub enum TableRepresentation {
     /// Full Markdown table (best, line-based detection succeeded).
     Markdown {
-        /// Header cells.
+        /// Header cells (the deepest/last header row — the one rendered as
+        /// the Markdown column labels). Kept for backward compatibility;
+        /// see [`Self::Markdown::header_rows`] for the full header stack.
         header: Vec<String>,
         /// Data rows, each a vector of cell strings.
         rows: Vec<Vec<String>>,
@@ -94,6 +96,17 @@ pub enum TableRepresentation {
         caption: Option<String>,
         /// The complete Markdown table string.
         markdown_text: String,
+        /// Every header row, top to bottom, in case the table had more than
+        /// one (e.g. a grouped/spanning header row above the column
+        /// labels). `markdown_text` renders these upper rows as a bold
+        /// annotation line before the table (Markdown itself has no
+        /// multi-row-header syntax) so the information is not silently
+        /// dropped; this field carries the un-flattened rows for consumers
+        /// that want them directly. Empty when the table had a single
+        /// header row (the common case) — old serialized data without this
+        /// field deserializes to an empty `Vec` (`#[serde(default)]`).
+        #[serde(default)]
+        header_rows: Vec<Vec<String>>,
     },
     /// CSV-style representation (text-alignment detection).
     Csv {
