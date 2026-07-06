@@ -1,64 +1,63 @@
 ---
 name: pdf-to-llm
-description: Convert academic paper PDF into LLM-optimized text chunks using pdf-lay for RAG or context window input
-argument-hint: "<pdf-path> [--max-tokens N] [--overlap N] [--strategy section|paragraph|token]"
-allowed-tools: Bash(pdf-lay *), Bash(cargo run *), Bash(python *), Read
+description: Convert an academic-paper PDF into LLM-ready text chunks (for RAG or context-window input) using pdf-lay. Use when the user gives a PDF path and wants chunked or LLM-optimized text; read max-tokens / overlap / strategy from the request as natural language. The pdf-lay CLI's `chunks` and `llm-text` subcommands are the primary path; the pdflay Python bindings are an alternative for programmatic use. No slash command, no variable substitution.
+allowed-tools: Bash(pdf-lay *), Bash(cargo run *), Bash(python3 *), Read
 ---
 
 # PDF to LLM Pipeline
 
 Extract and chunk academic paper content for LLM consumption (RAG, summarization, Q&A).
 
-## Usage
+## How to derive arguments from the request
 
-```
-/pdf-to-llm paper.pdf                              # Default: section-based chunks, 4000 tokens
-/pdf-to-llm paper.pdf --max-tokens 2000            # Smaller chunks for limited context
-/pdf-to-llm paper.pdf --max-tokens 8000            # Larger chunks for big context windows
-/pdf-to-llm paper.pdf --strategy paragraph          # Paragraph-level chunking
-/pdf-to-llm paper.pdf --section "Methods" "Results" # Chunk specific sections only
-```
+Read these from the user's natural-language message — nothing is substituted for you and
+there are no `$MAX_TOKENS`/`$OVERLAP`/`$STRATEGY` variables:
+- **max-tokens**: if the user says a number (e.g. "2000 token chunks"), pass that literal
+  number as `--max-tokens 2000` (CLI) or `max_tokens=2000` (Python). Default: 4000.
+- **overlap**: literal number the user gives, else default 200.
+- **strategy**: "section" (default, split at section boundaries), "paragraph" (split at
+  paragraph boundaries), or "token" (hard token-count splits) — derived from words like
+  "by paragraph" or "fixed size" in the request.
+- **section filter**: if the user names specific sections (e.g. "just Methods and
+  Results"), pass one `--section <NAME>` per section.
 
-## Instructions
+## 1. Generate chunks (CLI, JSONL)
 
-### 1. Detect pdf-lay and run analysis
+    pdf-lay chunks <PDF_PATH> --max-tokens 4000 --overlap 200 --strategy section
 
-Use Python API (preferred for chunking) or CLI:
+Smaller chunks, written to a file:
+
+    pdf-lay chunks <PDF_PATH> --max-tokens 2000 --overlap 100 -o chunks.jsonl
+
+Only specific sections, without the `[Context: ...]` breadcrumb prefix:
+
+    pdf-lay chunks <PDF_PATH> --section "Methods" --section "Results" --no-section-context
+
+Each JSONL line has: `chunk_id`, `paper_id`, `section`, `page_range`, `estimated_tokens`,
+`has_continuation`, `text`, `figures`, `tables`.
+
+## 2. LLM-optimized plain text (single context-window injection, no JSONL splitting)
+
+    pdf-lay llm-text <PDF_PATH> --section "Introduction" --section "Methods" --section "Results"
+
+## 3. Python bindings (alternative, for programmatic use in the current process)
 
 ```python
 import pdflay
+doc = pdflay.analyze("<PDF_PATH>", extract_images=False)
 
-doc = pdflay.analyze("$PDF_PATH", extract_images=False)
-```
-
-Fallback to CLI if Python not available:
-```bash
-pdf-lay markdown "$PDF_PATH" --no-page-numbers
-```
-
-### 2. Generate chunks
-
-**Via Python (full control)**:
-```python
 # Full document chunking
-chunks = doc.to_chunks(max_tokens=$MAX_TOKENS, overlap=$OVERLAP, strategy="$STRATEGY")
+chunks = doc.to_chunks(max_tokens=4000, overlap=200, strategy="section")
 
 # Section-filtered chunking
 sel = doc.select_sections(["Methods", "Results"])
-chunks = sel.to_chunks(max_tokens=$MAX_TOKENS, overlap=$OVERLAP)
+chunks = sel.to_chunks(max_tokens=4000, overlap=200)   # NOTE: selector.to_chunks has no `strategy` arg
 
 # LLM-optimized plain text (for single context window)
-sel = doc.select_sections(["Introduction", "Methods", "Results"])
 text = sel.to_llm_text(include_figures=True, include_tables=True)
 ```
 
-**Via CLI fallback** (manual chunking):
-```bash
-pdf-lay markdown "$PDF_PATH" --section "Introduction" --no-page-numbers
-```
-Then split the Markdown output by section boundaries.
-
-### 3. Present results
+## 4. Present results
 
 For each chunk, show:
 - **Chunk ID**: sequential number
@@ -73,22 +72,14 @@ Then show total stats:
 - Total estimated tokens
 - Section coverage
 
-### 4. Output for downstream use
+## 5. Output for downstream use
 
 Offer to:
 1. **Display chunks inline** — show each chunk's content
-2. **Save as JSONL** — one JSON object per line, with chunk_id, section, text, tokens, page_range
+2. **Save as JSONL** — via `pdf-lay chunks ... -o <file>.jsonl`
 3. **Feed to LLM** — directly use the chunks in the current conversation context
 
-## Defaults
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `max-tokens` | 4000 | Maximum tokens per chunk |
-| `overlap` | 200 | Overlap tokens between adjacent chunks |
-| `strategy` | `section` | Split at section boundaries first |
-
-## Chunking Strategies
+## Chunking strategies
 
 | Strategy | Behavior | Best For |
 |----------|----------|----------|
@@ -96,6 +87,16 @@ Offer to:
 | `paragraph` | Split at paragraph boundaries | Dense papers with long sections |
 | `token` | Hard token count splits | Fixed-size context windows |
 
-## Token Estimates
+## Defaults
 
-pdf-lay estimates: ~4 chars/token (English), ~1.5 chars/token (Japanese)
+| Parameter | Default | Description |
+|-----------|---------|--------------|
+| `max-tokens` | 4000 | Maximum tokens per chunk |
+| `overlap` | 200 | Overlap tokens between adjacent chunks |
+| `strategy` | `section` | Split at section boundaries first |
+
+## Token estimates
+
+pdf-lay's built-in heuristic tokenizer estimates ~4 chars/token (English), ~1.5 chars/token
+(Japanese). Pass `--tokenizer <hf-model-id-or-tokenizer.json>` to `pdf-lay chunks` for a real
+BPE tokenizer instead (requires a binary built with the `real-tokenizer` cargo feature).
