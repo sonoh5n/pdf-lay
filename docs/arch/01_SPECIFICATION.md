@@ -38,6 +38,43 @@
 
 ---
 
+### 1.5 実装状況（Implemented vs Planned）
+
+本表は「仕様が約束する表面」と「現時点の実装」の対応。✅=実装済み / 🅿=計画中（未実装）。
+CLI 列は `cargo run -p pdf-lay-cli -- --help` / 各サブコマンド `--help` と、Python 列は
+`crates/pdflay-python/src/lib.rs` の `#[getter]`/`#[pymethods]`/`#[pyfunction]` と照合済み。
+
+| 面 | 項目 | 状態 | 実体 / 備考 |
+|----|------|------|-------------|
+| CLI | `pdf-lay toc <PDF>` | ✅ | `main.rs` `Commands::Toc` |
+| CLI | `pdf-lay markdown <PDF>` | ✅ | `main.rs` `Commands::Markdown` |
+| CLI | `markdown --section NAME`（繰り返し可） | ✅ | 単数・repeatable・部分一致。**`--sections "A,B"` というカンマ区切りフラグは無い** |
+| CLI | `markdown --heading-offset / --no-page-numbers / --image-base / -o,--output / --image-dir / --no-extract-images` | ✅ | `main.rs` `MarkdownArgs` |
+| CLI | `markdown/json/chunks/llm-text --math-format latex\|unicode\|plain\|off` | ✅ | 全サブコマンドで有効（Phase 0 P0-3 実装済み。仕様書旧版は「未実装」としていたが現在は実装済み） |
+| CLI | `markdown --section-index` | 🅿 | 未実装 |
+| CLI | `pdf-lay json <PDF>`（フルダンプ / `--content-only`） | ✅ | `main.rs` `Commands::Json`（旧仕様書は「Phase 2 P2-6待ち」としていたが実装済み） |
+| CLI | `pdf-lay chunks <PDF>`（JSONL。`--strategy` / `--max-tokens` / `--overlap` / `--tokenizer` / `--no-section-context`） | ✅ | `main.rs` `Commands::Chunks` |
+| CLI | `pdf-lay llm-text <PDF>`（`--section` / `--figure-format` / `--image-base` / `--no-figures` / `--no-tables`） | ✅ | `main.rs` `Commands::LlmText` |
+| CLI | `pdf-lay analyze` / `pdf-lay debug-layout` / バッチ `--parallel` | 🅿 | 未実装・未計画（`AGENTS.md` の `debug-layout` 記述も未実装コマンドの前提） |
+| Python | `pdflay.analyze(path, image_dir, extract_images, detect_tables)` | ✅ | `lib.rs` `fn analyze` |
+| Python | `doc.paper_id / doc.pages / doc.title / doc.authors / doc.doi / doc.sections / doc.figures` | ✅ | `lib.rs` `PyPaperDocument`。**`doc.metadata.*` という属性は無い** |
+| Python | `doc.to_markdown / doc.to_json / doc.to_chunks / doc.toc() / doc.select_sections*` | ✅ | `lib.rs` `PyPaperDocument` |
+| Python | `PySectionEntry.page_start / page_end` | ✅ | `lib.rs` `PySectionEntry`。**`entry.page_range[0]/[1]` という属性は無い** |
+| Python | `selector.to_markdown / to_json / to_llm_text / to_chunks / total_estimated_tokens` | ✅ | `lib.rs` `PySectionSelector`。**`selector.to_chunks` に `strategy` 引数は無い**（`max_tokens`/`overlap` のみ）。**`to_llm_text` に `include_section_headers` 引数は無い**（常に true 固定） |
+| Python | `PyChunk.tables` getter | ✅ | `lib.rs` `PyChunk::tables`（旧仕様書は「Phase 2 P2-6待ち」としていたが実装済み） |
+| Python | `pdflay.Config(...)` / `analyze(..., config=...)` | 🅿 | 未実装。`analyze()` の引数は `path, image_dir, extract_images, detect_tables` のみ |
+| Python | `pdflay.extract_spans / reconstruct_lines / detect_layout / analyze_batch` | 🅿 | 未実装（モジュールに存在しない） |
+| Python | `doc.to_chunks(...)` / `selector.to_chunks(...)` の数式書式指定 | 🅿 | Python 側の chunk 生成は `math_config: None` 固定（数式は raw glyph のまま）。CLI の `pdf-lay chunks --math-format` のみ数式変換に対応 |
+| Rust | `analyze_pdf(path, config)` / `analyze_pdf_bytes(bytes, config)` | ✅（戻り値注意） | 戻り値は `PaperDocument` ではなく `Result<AnalysisResult, PdfLayError>`（`AnalysisResult.document` 経由でアクセス） |
+| Rust | 段階的API `extract_text_spans / reconstruct_lines / detect_layout / group_blocks / detect_sections / extract_images / match_figures` | 🅿 | `pdf-lay` crate から未再エクスポート（内部モジュール `extract`/`layout`/`structure`/`figure` のみに存在） |
+| Rust | 自由関数 `to_markdown(doc, config)` / `to_json(doc)` / `to_chunks(doc, config)` | 🅿 | 存在しない。実際は `SectionSelector::to_markdown/to_json/to_chunks`（メソッド）または `MarkdownGenerator`/`JsonGenerator`/`Chunker`（構造体API、`pdf-lay` から再エクスポート済み） |
+| 出力 | 数式変換（`--math-format` / `math_format=`） | ✅ | CLI 全経路（`markdown`/`json --content-only`/`chunks`/`llm-text`）で有効。Python は `to_markdown(math_format=...)` のみ対応、`to_chunks` は非対応（上記） |
+
+> P2-6・Phase 0 P0-3 は本表作成時点で既にマージ済みであることを実 CLI/実 Python で確認した
+> （`phase3_skills.md` 本文が書かれた時点の想定より実装が先行している）。
+
+---
+
 ## 2. 機能要件
 
 ### 2.1 コア機能一覧
@@ -479,9 +516,11 @@ doc = pdflay.analyze("paper.pdf")
 # --- セクション一覧の取得 ---
 toc = doc.toc()
 for entry in toc:
-    print(f"[L{entry.level}] {entry.header} (p.{entry.page_range[0]}-{entry.page_range[1]}, "
+    print(f"[L{entry.level}] {entry.header} (p.{entry.page_start}-{entry.page_end}, "
           f"~{entry.estimated_tokens} tokens, "
           f"fig:{entry.figure_count}, tab:{entry.table_count})")
+    # 注: `entry.page_range[0]/[1]` という属性は無い。実 API は `page_start`/`page_end`
+    # （`crates/pdflay-python/src/lib.rs` `PySectionEntry`）。
     for child in entry.children:
         print(f"  [L{child.level}] {child.header}")
 
@@ -529,8 +568,9 @@ json_str = selected.to_json()
 text = selected.to_llm_text(
     include_figures=True,     # 画像パスを [IMAGE: Fig. 1 path/to/img.png] として含める
     include_tables=True,      # テーブルをMarkdownテーブルとしてインライン表示
-    include_section_headers=True,
 )
+# 🅿 注意: 実 API に `include_section_headers` 引数は無い（セクション見出しは常に含まれる）。
+# 渡すと TypeError になる。
 
 # チャンク分割（選択セクションのみ）
 chunks = selected.to_chunks(max_tokens=4000)
@@ -589,14 +629,17 @@ pdf-lay toc paper.pdf
 # [1] CONCLUSION                    p.9-10  ~600 tokens
 # [1] REFERENCES                    p.10-12 ~1500 tokens
 
-# 選択セクションのMarkdown出力
-pdf-lay markdown paper.pdf -o results.md --sections "RESULTS,EXPERIMENTS"
+# 選択セクションのMarkdown出力（--section は単数・繰り返し可。カンマ区切りの
+# `--sections "A,B"` というフラグは存在しない）
+pdf-lay markdown paper.pdf -o results.md --section RESULTS --section EXPERIMENTS
 
-# インデックス指定
-pdf-lay markdown paper.pdf -o results.md --section-index 3,4
+# インデックス指定 🅿 未実装（--section-index フラグは無い。CLI では名前一致のみ）
+# pdf-lay markdown paper.pdf -o results.md --section-index 3,4
 
-# LLM向けテキスト出力
-pdf-lay llm-text paper.pdf --sections "RESULTS" --include-tables --include-figures
+# LLM向けテキスト出力（テーブル・図はデフォルトで含まれる。
+# `--include-tables`/`--include-figures` というフラグは無く、除外したい場合は
+# `--no-tables`/`--no-figures` を使う）
+pdf-lay llm-text paper.pdf --section RESULTS
 ```
 
 **名前マッチングルール:**
@@ -908,18 +951,23 @@ pub enum MathRepresentationPreference {
 ### 4.1 Rust API
 
 ```rust
-// メインエントリーポイント
-pub fn analyze_pdf(path: &Path, config: &Config) -> Result<PaperDocument, PdfLayError>;
-pub fn analyze_pdf_bytes(bytes: &[u8], config: &Config) -> Result<PaperDocument, PdfLayError>;
+// メインエントリーポイント（戻り値は `PaperDocument` 単体ではなく `AnalysisResult`
+// — `AnalysisResult.document: PaperDocument` と `.warnings` 等を持つラッパー。
+// `crates/pdf-lay-core/src/pipeline.rs`、`pdf-lay` crate から再エクスポート済み）
+pub fn analyze_pdf(path: &Path, config: &Config) -> Result<AnalysisResult, PdfLayError>;
+pub fn analyze_pdf_bytes(bytes: &[u8], config: &Config) -> Result<AnalysisResult, PdfLayError>;
 
-// 段階的API
-pub fn extract_text_spans(path: &Path) -> Result<Vec<TextSpan>, PdfLayError>;
-pub fn reconstruct_lines(spans: &[TextSpan]) -> Vec<TextLine>;
-pub fn detect_layout(lines: &[TextLine], page_dims: &PageDimensions) -> PageLayout;
-pub fn group_blocks(lines: &[TextLine], layout: &PageLayout) -> Vec<TextBlock>;
-pub fn detect_sections(blocks: &[TextBlock]) -> Vec<Section>;
-pub fn extract_images(path: &Path, output_dir: &Path) -> Result<Vec<ImageInfo>, PdfLayError>;
-pub fn match_figures(blocks: &[TextBlock], images: &[ImageInfo]) -> Vec<FigureInfo>;
+// 段階的API 🅿 未実装（`pdf-lay` crate から再エクスポートされていない。同等の内部実装は
+// 存在するが非公開: `extract::PdfReader`/`layout::LineReconstructor`/`layout::ColumnDetector`/
+// `structure::BlockGrouper`/`structure::SectionBuilder`/`extract::ImageExtractor`/
+// `figure::ImageMatcher` 等、いずれも `pdf-lay-core` 内部モジュールのみ）
+// pub fn extract_text_spans(path: &Path) -> Result<Vec<TextSpan>, PdfLayError>;
+// pub fn reconstruct_lines(spans: &[TextSpan]) -> Vec<TextLine>;
+// pub fn detect_layout(lines: &[TextLine], page_dims: &PageDimensions) -> PageLayout;
+// pub fn group_blocks(lines: &[TextLine], layout: &PageLayout) -> Vec<TextBlock>;
+// pub fn detect_sections(blocks: &[TextBlock]) -> Vec<Section>;
+// pub fn extract_images(path: &Path, output_dir: &Path) -> Result<Vec<ImageInfo>, PdfLayError>;
+// pub fn match_figures(blocks: &[TextBlock], images: &[ImageInfo]) -> Vec<FigureInfo>;
 
 // セクション操作
 impl PaperDocument {
@@ -940,10 +988,14 @@ impl<'a> SectionSelector<'a> {
     pub fn total_estimated_tokens(&self) -> usize;
 }
 
-// 出力生成
-pub fn to_markdown(doc: &PaperDocument, config: &MarkdownConfig) -> String;
-pub fn to_json(doc: &PaperDocument) -> Result<String, serde_json::Error>;
-pub fn to_chunks(doc: &PaperDocument, config: &ChunkConfig) -> Vec<Chunk>;
+// 出力生成 🅿 これらの自由関数は存在しない。実際は `SectionSelector` のメソッド
+// （上記 `to_markdown`/`to_json`/`to_chunks`）、または構造体API
+// `MarkdownGenerator::new(config).generate(&doc)` / `JsonGenerator::generate(&doc)` /
+// `Chunker::new(config).chunk(&doc)`（`pdf_lay::output::{MarkdownGenerator, JsonGenerator, Chunker}`
+// として再エクスポート済み）を使う。
+// pub fn to_markdown(doc: &PaperDocument, config: &MarkdownConfig) -> String;
+// pub fn to_json(doc: &PaperDocument) -> Result<String, serde_json::Error>;
+// pub fn to_chunks(doc: &PaperDocument, config: &ChunkConfig) -> Vec<Chunk>;
 
 // 設定
 pub struct Config {
@@ -987,9 +1039,10 @@ import pdflay
 # ワンショット解析
 doc = pdflay.analyze("paper.pdf", image_dir="./images")
 
-# 結果アクセス
-print(doc.metadata.title)
-print(doc.metadata.authors)
+# 結果アクセス（`doc.metadata.*` という属性は無い。実 API は doc.title / doc.authors 等の
+# トップレベル属性 — `crates/pdflay-python/src/lib.rs` `PyPaperDocument`）
+print(doc.title)
+print(doc.authors)
 print(len(doc.sections))
 
 for section in doc.sections:
@@ -1003,8 +1056,9 @@ for section in doc.sections:
 # --- セクション一覧（目次）取得 ---
 toc = doc.toc()
 for entry in toc:
+    # 注: `entry.page_range[0]/[1]` は存在しない。実 API は page_start / page_end。
     print(f"[L{entry.level}] {entry.header} "
-          f"(p.{entry.page_range[0]}-{entry.page_range[1]}, "
+          f"(p.{entry.page_start}-{entry.page_end}, "
           f"~{entry.estimated_tokens} tokens, "
           f"fig:{entry.figure_count}, tab:{entry.table_count})")
 
@@ -1043,32 +1097,36 @@ chunks = doc.to_chunks(max_tokens=4000, overlap=200)
 for chunk in chunks:
     print(f"Section: {chunk.section}, Tokens: ~{chunk.estimated_tokens}")
 
-# --- 数式表現の設定 ---
-config = pdflay.Config(
-    extract_images=True,
-    detect_tables=True,
-    math_representation="latex",   # "latex", "unicode", "plain", "auto"
-)
-doc = pdflay.analyze("paper.pdf", config=config)
+# --- 数式表現の設定 🅿 未実装 ---
+# `pdflay.Config` クラスは公開されておらず、`analyze()` は `config=` 引数を取らない。
+# `analyze()` の実引数は `path, image_dir, extract_images, detect_tables` のみ
+# （`crates/pdflay-python/src/lib.rs` `fn analyze`）。以下は将来 API の例:
+# config = pdflay.Config(
+#     extract_images=True,
+#     detect_tables=True,
+#     math_representation="latex",   # "latex", "unicode", "plain", "auto"
+# )
+# doc = pdflay.analyze("paper.pdf", config=config)
 
-# 段階的API
-spans = pdflay.extract_spans("paper.pdf")
-lines = pdflay.reconstruct_lines(spans)
-layout = pdflay.detect_layout(lines, page_width=612.0, page_height=792.0)
+# 段階的API 🅿 未実装（モジュールに存在しない関数）
+# spans = pdflay.extract_spans("paper.pdf")
+# lines = pdflay.reconstruct_lines(spans)
+# layout = pdflay.detect_layout(lines, page_width=612.0, page_height=792.0)
 
-# バッチ処理
-results = pdflay.analyze_batch(
-    ["paper1.pdf", "paper2.pdf", "paper3.pdf"],
-    image_dir="./images",
-    parallel=True,
-)
+# バッチ処理 🅿 未実装（モジュールに存在しない関数）
+# results = pdflay.analyze_batch(
+#     ["paper1.pdf", "paper2.pdf", "paper3.pdf"],
+#     image_dir="./images",
+#     parallel=True,
+# )
 ```
 
 ### 4.3 CLI
 
 ```bash
-# 基本使用
-pdf-lay analyze paper.pdf -o output/
+# 基本使用 🅿 未実装（`analyze` サブコマンドは存在しない。`toc`/`markdown`/`json`/
+# `chunks`/`llm-text` の5つのみが実サブコマンド）
+# pdf-lay analyze paper.pdf -o output/
 
 # --- セクション一覧表示 ---
 pdf-lay toc paper.pdf
@@ -1084,32 +1142,40 @@ pdf-lay toc paper.pdf
 # [1] REFERENCES                    p.10-12 ~1500 tokens
 
 # --- セクション選択出力 ---
-# ヘッダー名指定
-pdf-lay markdown paper.pdf -o results.md --sections "RESULTS,EXPERIMENTS"
+# ヘッダー名指定（`--section` は単数・繰り返し可。カンマ区切りの
+# `--sections "A,B"` というフラグは存在しない）
+pdf-lay markdown paper.pdf -o results.md --section RESULTS --section EXPERIMENTS
 
-# インデックス指定
-pdf-lay markdown paper.pdf -o results.md --section-index 3,4
+# インデックス指定 🅿 未実装（--section-index フラグは無い）
+# pdf-lay markdown paper.pdf -o results.md --section-index 3,4
 
-# LLM向けテキスト出力（テーブルインライン、図プレースホルダ）
-pdf-lay llm-text paper.pdf --sections "RESULTS" --include-tables --include-figures
+# LLM向けテキスト出力（テーブル・図はデフォルトで含まれる。`--include-tables`/
+# `--include-figures` というフラグは無く、除外時は `--no-tables`/`--no-figures` を使う）
+pdf-lay llm-text paper.pdf --section RESULTS
 
 # --- 全体出力 ---
 # Markdown出力
 pdf-lay markdown paper.pdf -o paper.md --image-dir ./images
 
-# JSON出力
+# JSON出力（フルダンプ、または `--content-only` で軽量な LLM 向け投影）
 pdf-lay json paper.pdf -o paper.json
+pdf-lay json paper.pdf -o paper.json --content-only
 
-# バッチ処理
-pdf-lay analyze papers/*.pdf -o output/ --parallel 4
+# チャンク分割（JSONL、RAG向け）
+pdf-lay chunks paper.pdf --max-tokens 4000 --overlap 200 --strategy section -o paper.chunks.jsonl
 
-# --- 数式設定 ---
+# バッチ処理 🅿 未実装（複数ファイル一括処理・`--parallel` フラグは無い）
+# pdf-lay analyze papers/*.pdf -o output/ --parallel 4
+
+# --- 数式設定（`markdown`/`json --content-only`/`chunks`/`llm-text` 全サブコマンドで有効）---
 pdf-lay markdown paper.pdf -o paper.md --math-format latex
 pdf-lay markdown paper.pdf -o paper.md --math-format unicode
 pdf-lay markdown paper.pdf -o paper.md --math-format plain
+pdf-lay markdown paper.pdf -o paper.md --math-format off
 
-# デバッグ（レイアウト可視化）
-pdf-lay debug-layout paper.pdf -o debug/ --page 2
+# デバッグ（レイアウト可視化） 🅿 未実装（`debug-layout` サブコマンドは無い。
+# `AGENTS.md` の同記述も同じく未実装コマンドを前提にしている）
+# pdf-lay debug-layout paper.pdf -o debug/ --page 2
 ```
 
 ---
