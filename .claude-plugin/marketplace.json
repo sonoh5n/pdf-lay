@@ -1,0 +1,11 @@
+{
+  "name": "pdf-lay-marketplace",
+  "owner": { "name": "sonoh5n" },
+  "plugins": [
+    {
+      "name": "pdf-lay",
+      "source": "./",
+      "description": "PDF analysis skills for academic papers (pdf, pdf-qa, pdf-summary, pdf-to-llm)."
+    }
+  ]
+}
