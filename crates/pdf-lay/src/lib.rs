@@ -87,4 +87,4 @@ pub use pdf_lay_core::{
 pub use pdf_lay_core::HfTokenizer;
 
 // Re-export output generators for CLI and advanced use cases.
-pub use pdf_lay_core::output::MarkdownGenerator;
+pub use pdf_lay_core::output::{Chunker, JsonGenerator, MarkdownGenerator};

@@ -1701,6 +1701,8 @@ dependencies = [
  "env_logger",
  "log",
  "pdf-lay",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -14,3 +14,12 @@ pdf-lay = { path = "../pdf-lay" }
 clap = { workspace = true, features = ["derive"] }
 log.workspace = true
 env_logger.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[features]
+# Forwards to pdf-lay's (and, transitively, pdf-lay-core's) opt-in real BPE
+# tokenizer seam so `chunks --tokenizer <model-or-path>` can load a real
+# tokenizer. Not part of the default feature set — see
+# crates/pdf-lay-core/Cargo.toml for why.
+real-tokenizer = ["pdf-lay/real-tokenizer"]
