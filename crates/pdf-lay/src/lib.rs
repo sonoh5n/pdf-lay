@@ -55,6 +55,9 @@ pub use pdf_lay_core::{
     NumberComponent,
     NumberingAnomalyKind,
     NumberingKey,
+    // OCR config (P4-2)
+    OcrConfig,
+    OcrEngineKind,
     PaperDocument,
     PdfLayError,
     PdfLayWarning,

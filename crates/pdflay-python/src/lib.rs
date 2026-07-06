@@ -8,7 +8,7 @@ use pdf_lay_core::{
     AnalysisResult, analyze_pdf,
     config::{
         CaptionStyle, ChunkConfig, Config, FigureTextFormat, LlmTextConfig, MarkdownConfig,
-        MathConfig, MathRepresentationPreference, SplitStrategy,
+        MathConfig, MathRepresentationPreference, OcrConfig, SplitStrategy,
     },
     output::{Chunker, JsonGenerator, MarkdownGenerator},
     selector::{SectionEntry, SectionSelector, TocGenerator},
@@ -860,6 +860,16 @@ fn flatten_entries(entries: &[SectionEntry]) -> Vec<&SectionEntry> {
 ///     image_dir: Output directory for extracted images (default: ``"./images"``).
 ///     extract_images: Whether to extract embedded images (default: ``True``).
 ///     detect_tables: Whether to detect tables (default: ``True``).
+///     ocr: Whether to attempt OCR recovery for scanned/image-only pages
+///         (default: ``False``). Regardless of this flag, such pages are
+///         always reported via a warning printed to stderr
+///         (``PageTextMissing``/``PageTextRecovered``). Requires this
+///         extension to have been built with the ``ocr`` Cargo feature and a
+///         ``tesseract`` binary on ``PATH``; otherwise OCR is skipped with a
+///         warning rather than raising.
+///     ocr_lang: Language(s) passed to the OCR engine, tesseract ``-l``
+///         syntax (default: ``"jpn+eng"``). Only consulted when ``ocr`` is
+///         ``True``.
 ///
 /// Returns:
 ///     :class:`PyPaperDocument` with sections, figures, and metadata.
@@ -867,17 +877,24 @@ fn flatten_entries(entries: &[SectionEntry]) -> Vec<&SectionEntry> {
 /// Raises:
 ///     RuntimeError: If the PDF cannot be read or parsed.
 #[pyfunction]
-#[pyo3(signature = (path, image_dir = "./images", extract_images = true, detect_tables = true))]
+#[pyo3(signature = (path, image_dir = "./images", extract_images = true, detect_tables = true, ocr = false, ocr_lang = "jpn+eng"))]
 fn analyze(
     path: &str,
     image_dir: &str,
     extract_images: bool,
     detect_tables: bool,
+    ocr: bool,
+    ocr_lang: &str,
 ) -> PyResult<PyPaperDocument> {
     let config = Config {
         image_output_dir: PathBuf::from(image_dir),
         extract_images,
         detect_tables,
+        ocr: OcrConfig {
+            enabled: ocr,
+            lang: ocr_lang.to_string(),
+            ..OcrConfig::default()
+        },
         ..Config::default()
     };
 

@@ -558,3 +558,145 @@ cargo test --workspace  => 全バイナリ緑（pdf-lay-core lib: 376 passed, 3 
 `vector_fig.pdf`実フィクスチャでの手動確認（`cargo run -p pdf-lay-cli -- markdown
 tests/fixtures/vector_fig.pdf`）は、フィクスチャ未整備（横断タスクX-1）のため
 未実施。フィクスチャ整備後にメンテナが実施し、本ノートに追記することを推奨する。
+
+---
+
+## P4-2: スキャン/画像onlyページのOCR連携 or 部分回復
+
+**実施日:** 2026-07-06
+**担当範囲:** 実装。P4-1 の観測結果とエスカレーション方針（本ノート §6「P4-2: GO（着手可能）」）を
+引き継ぎ、追加の実PDF調査は行わず着手した（フィクスチャ未整備の状況は P4-1 時点から変わっていない）。
+
+### 1. OCR方式の決定（設計書の A/B 二択）
+
+P4-1 findings §6 が既に「(B) tesseract シェルアウトの方が安全側というのは本調査でも支持する」と
+記録済みだったため、本タスクで新たな二択判断はせず、その結論をそのまま採用した。再確認した理由:
+
+- pdf_oxide 0.3.8 の `Cargo.toml` を再確認: `ocr = ["dep:ort", "dep:imageproc", "dep:ndarray"]`。
+  有効化には pdf-lay-core の `pdf_oxide` 依存に `features = ["ocr"]` を追加する必要があり、
+  ONNX Runtime (`ort`) を新規にビルド依存へ加えることになる。本タスクではこれを行っていない。
+- (B) tesseract シェルアウトは `std::process::Command` のみで実装でき、**新規 Cargo 依存はゼロ**
+  （`Cargo.lock` に変更なし。`cargo check -p pdf-lay-core --features ocr` 前後で依存グラフの差分は無し）。
+
+### 2. 実装したこと
+
+1. **ゼロ警告ギャップの解消（デフォルトfeatureで有効。P4-1 §2.5 が指摘したギャップ）**
+   - `PdfReader::image_xobject_hints`（`extract/pdf_reader.rs`）に `has_any_image: bool` を追加し、
+     可視性を `pub(super)` → `pub(crate)` に拡張（`pipeline.rs` から直接呼ぶため）。
+   - `pipeline.rs`: テキスト抽出をページ単位ループに変更（下記3.）した後、各ページについて
+     `native_chars_by_page[page] < config.ocr.min_native_chars` かつ `has_any_image` を
+     「スキャンの可能性があるページ」と判定する。画像も無いページ（真の空白ページ）は対象外とし、
+     誤検知を避ける。
+   - 該当ページは常に警告になる: OCR無効時は理由付き `PdfLayWarning::PageTextMissing`、
+     有効かつ回復成功時は `PdfLayWarning::PageTextRecovered`、有効だが失敗時も理由付き
+     `PageTextMissing`。
+   - `Coverage::ratio` の `extracted_chars == 0 → 1.0` を `→ 0.0` に修正（`pipeline.rs`
+     ＋ `error.rs` のドキュメントコメント）。`0.0` は既定の `min_coverage_ratio`（0.9）を必ず
+     下回るため、`extracted_chars == 0` のドキュメントは確実に `LowCoverage` 警告を出すようになった。
+   - 新規 `PdfLayWarning` バリアント: `PageTextRecovered { page, method }`,
+     `PageTextMissing { page, reason }`（`error.rs`、Display実装込み。PDF由来テキストは含めない）。
+
+2. **OCRシーム（`ocr` cargo feature、既定 off）**
+   - `crates/pdf-lay-core/src/extract/ocr.rs`（新規）。`#[cfg(feature = "ocr")]` で
+     `extract/mod.rs` から条件付きコンパイルされ、`engine_available(&OcrConfig) -> bool` と
+     `ocr_page(&mut PdfReader, page, &OcrConfig) -> Result<Vec<TextSpan>, String>` を
+     `pub(crate)` で再輸出。
+   - `OcrEngineKind::Tesseract`（既定）: `tesseract --version` の起動成功で可用性チェック。
+     `reader.inner_doc().extract_images(page)` から最大サイズの画像を取り出して一時PNGへ保存し、
+     `tesseract <path> stdout -l <lang>` を実行してテキストを回収する。ページ全体を1つの
+     `TextSpan` として合流させる（bboxは画像自身のbbox → 無ければ `page_media_box` →
+     無ければ Letter既定、の順にフォールバック）。
+   - `OcrEngineKind::Builtin`: pdf_oxide内蔵OCR用の**予約済みだが未実装**のプレースホルダ。
+     選択しても常に「利用不可」（`PageTextMissing`）として扱われ、パニックしない。方針書の
+     「わからないことを黙って埋めない」原則に沿って、将来 (A) 案を実装する場合の設定の受け皿を
+     明示的な形（コメント付きの列挙子）で残した。
+   - `crates/pdf-lay-core/Cargo.toml` に `ocr = []`（新規依存ゼロ、理由をコメントに明記）を追加。
+     `pdf-lay`/`pdf-lay-cli`/`pdflay-python` の各 `Cargo.toml` にも `ocr = ["...../ocr"]` を
+     forward（既存の `real-tokenizer` と同一パターン）。
+   - CLI（`pdf-lay-cli/src/main.rs`）: `--ocr`（bool）・`--ocr-lang`（既定 `jpn+eng`）を追加し、
+     `build_config` で `Config.ocr` にマップ。`ocr` cargo feature が未ビルドでも `--ocr` 自体は
+     常にパースでき、実行時に「未ビルドのため回復できない」旨の `PageTextMissing` に落ちる。
+   - Python（`pdflay-python/src/lib.rs`）: `pdflay.analyze(..., ocr=False, ocr_lang="jpn+eng")`
+     引数を追加し、同じ `Config.ocr` にマップ。
+
+3. **部分回復（1ページの抽出失敗が文書全体をゼロにしない）**
+   - `pipeline.rs`: `reader.extract_all_text_spans()`（内部の per-page エラーを `log::warn!` する
+     だけで `AnalysisResult.warnings` に載らない）の単発呼び出しをやめ、
+     `reader.extract_text_spans(page)` をページ単位ループで呼ぶ実装に変更した。ページごとの
+     `Err` は `PdfLayWarning::PageSkipped { page, reason }` として `warnings` に積み、
+     他ページの処理はそのまま継続する。
+   - `PdfReader::extract_all_text_spans`（公開API）自体はシグネチャ・実装とも変更していない
+     （設計書の後方互換方針どおり）。呼び出し元は `pipeline.rs` のみだったため実質的に
+     未使用になったが、外部呼び出し側との互換性のため残置した。
+   - 実証: `/Pages` の `/Count` が2ページを主張するが、2つ目の `Kids` エントリ（`99 0 R`）が
+     ファイル中に存在しないオブジェクトを指す合成PDFを構築し、`extract_text_spans(0)` は成功、
+     `extract_text_spans(1)` は `Err("... Invalid PDF: Page index 1 not found by scanning")` を
+     返すことを確認した
+     （`extract::pdf_reader::tests::dangling_second_page_extracts_the_good_page_and_errors_on_the_missing_one`、
+     および `pipeline::tests::single_page_extraction_failure_does_not_zero_the_whole_document`）。
+     pdf_oxideのページツリー走査とスキャンフォールバックの**両方**が失敗して初めて `Err` になる
+     ため、単に壊れたcontentストリームを持つページでは `Err` にならない
+     （`get_page_content_data` の失敗は `Ok(Vec::new())` に縮退される —
+     `pdf_oxide-0.3.8/src/document.rs:3450` 付近で実ソース確認済み）ことも実験的に確認した。
+
+### 3. 判断・逸脱事項（エスカレーション不要な範囲での判断）
+
+- **OCR対象ページの判定に画像存在チェックを追加した:** 設計書の記述は「テキスト総文字数 < N」の
+  みだったが、本ノート §6（P4-1の推奨）は「テキスト閾値 + 画像有無の組み合わせ」を推奨していたため
+  そちらを採用した。真に空白のページ（テキストも画像も無い）を誤って「スキャンページ」として
+  警告するのを避けるため（回帰テスト
+  `pipeline::tests::analyze_pdf_blank_page_is_not_flagged_as_scanned` で固定化）。
+- **`OcrConfig::min_native_chars` の既定値 50:** 設計書は「P4-1実測から決める」としていたが、
+  P4-1は実スキャンPDFフィクスチャが未整備のため定量的な実測値を残していなかった。代わりに
+  pdf_oxide自身の `ocr::needs_ocr`（`pdf_oxide-0.3.8/src/ocr/mod.rs:86`、
+  `native_text.trim().len() > 50`）が使っている閾値をソースから確認し、それに合わせた
+  （マジックナンバーの根拠を pdf_oxide 自身の実装に求めた）。
+- **`Coverage::ratio` の修正方法:** タスク指示どおり「1.0のまま隠れて動くこと」を避ける安全側
+  （`0.0`）を採用した。専用フラグ（例: `has_native_text: bool`）を追加する案も検討したが、
+  `ratio` 自体の意味を正しくする方がシンプルで、新しい公開フィールドを増やさずに済むため
+  `0.0` 化のみを採用した。
+- **OCR復元テキストの粒度:** 1ページ=1 `TextSpan`（行単位に分割しない）。設計書が
+  「OCRの精度チューニングは非スコープ」と明記しているため、レイアウト精度は追求していない。
+- **`OcrEngineKind::Builtin` を未実装のまま追加した:** 設計書の `Config` 項目（`engine:
+  OcrEngineKind (Tesseract/Builtin)`）をそのまま反映する一方、(A) 案自体は実装していない。
+  選択時は常に「利用不可」として扱われることをテストで固定化済み
+  （`extract::ocr::tests::engine_available_is_false_for_builtin_engine`,
+  `ocr_page_returns_err_for_builtin_engine_without_panicking`）。
+
+### 4. 検証結果
+
+```
+cargo fmt --all --check                                              => OK
+cargo clippy --workspace --all-targets -- -D warnings                => OK（警告0）
+cargo clippy --workspace --all-targets --all-features -- -D warnings => OK（警告0。ocr + real-tokenizer 含む）
+cargo test --workspace                                                => 全緑
+  pdf-lay-core lib（既定feature）: 382 passed, 3 ignored
+  pdf-lay-core lib（--features ocr）: 386 passed, 3 ignored（+4: extract::ocr::tests）
+  pdf-lay-cli: 25 passed（+2: ocr_flag_defaults_to_disabled, ocr_flag_and_lang_are_accepted_and_mapped_to_config）
+  pdf-lay (tests/e2e_api.rs): 5 passed
+  integration smoke_test: 29 passed, 11 ignored
+cargo check -p pdf-lay-core --features ocr             => OK（コンパイル成功、新規依存なし）
+cargo check -p pdf-lay --features ocr                  => OK
+cargo check -p pdf-lay-cli --features ocr              => OK
+cargo check -p pdflay-python --features ocr            => OK
+```
+
+**手動スモーク**（合成のスキャン形状PDF、`cargo run -p pdf-lay-cli -- toc <pdf> --no-extract-images`）:
+
+- `--ocr` 無し: `[warning] page 0 has no usable text: page has an embedded image but little/no
+  native text, and OCR is disabled ...` に続き `[warning] low text coverage: 0.0% ...` が出力される
+  （旧挙動: 警告ゼロで "正常終了"）。
+- `--ocr` あり・`ocr` cargo feature 未ビルド: `... OCR was requested (...) but this build was not
+  compiled with the "ocr" cargo feature`。
+- `--ocr` あり・`ocr` feature ビルド済み・本サンドボックス環境（`tesseract` 不在、`which tesseract`
+  で確認済み）: `... configured OCR engine is not available on this machine (e.g. the "tesseract"
+  binary was not found on PATH)`。
+- 上記いずれもパニック・エラー終了せず、CLIは正常終了コードで完了する。
+
+**未検証（tesseractバイナリが実際に利用可能な環境でのEnd-to-Endの成功パス）:** 本サンドボックス
+環境に `tesseract` が無いため、`PageTextRecovered` が実際に発火する経路（tesseract成功→テキスト
+回収→spanマージ）は自動テストでは「起動できない場合の失敗パスがグレースフルであること」までしか
+検証できていない。`extract::ocr::tests` はこの失敗パス（`Builtin`選択時、および本環境での
+tesseract不在時）のみを固定化している。tesseractが利用可能な環境での実際の recovery 成功と、
+実スキャンPDF（`tests/fixtures/scanned.pdf`、横断タスクX-1で未整備）での効果測定は、
+今後の宿題としてここに明記する。

@@ -14,6 +14,11 @@ pdf-lay-core = { path = "../pdf-lay-core" }
 # feature set.
 real-tokenizer = ["pdf-lay-core/real-tokenizer"]
 
+# Forwards to pdf-lay-core's opt-in OCR seam (P4-2); see
+# crates/pdf-lay-core/Cargo.toml for details. Not part of the default
+# feature set.
+ocr = ["pdf-lay-core/ocr"]
+
 [dev-dependencies]
 pdf-lay-core = { path = "../pdf-lay-core" }
 serde_json = { workspace = true }

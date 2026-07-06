@@ -60,6 +60,10 @@ pub struct Config {
     /// into a figure record when no raster image was extracted.
     #[serde(default)]
     pub figure_vector: VectorFigureConfig,
+    /// Configuration for OCR recovery of scanned/image-only pages (P4-2).
+    /// See [`OcrConfig`].
+    #[serde(default)]
+    pub ocr: OcrConfig,
 }
 
 /// Default value for [`Config::caption_max_chars`].
@@ -97,8 +101,94 @@ impl Default for Config {
             caption: CaptionConfig::default(),
             force_png: false,
             figure_vector: VectorFigureConfig::default(),
+            ocr: OcrConfig::default(),
         }
     }
+}
+
+/// Configuration for OCR recovery of scanned/image-only pages (P4-2).
+///
+/// A page whose native (embedded) text falls below [`Self::min_native_chars`]
+/// *and* which contains at least one embedded image is the shape of a
+/// scanned page (see `docs/refactor/phase4_findings.md` P4-1 §2.5). Such a
+/// page is **always** reported via a `PdfLayWarning`
+/// (`PdfLayWarning::PageTextRecovered` on success,
+/// `PdfLayWarning::PageTextMissing` otherwise) regardless of
+/// [`Self::enabled`] — detection/reporting is not gated behind OCR being
+/// turned on. [`Self::enabled`] only controls whether pdf-lay actually
+/// *attempts* OCR for those pages.
+///
+/// OCR is opt-in and off by default, and enabling it does not by itself pull
+/// in any heavy build dependency: the default [`OcrEngineKind::Tesseract`]
+/// shells out to a `tesseract` binary that must already be installed and on
+/// `PATH` (and requires this crate to be built with the `ocr` cargo feature —
+/// see `crates/pdf-lay-core/Cargo.toml`). If the feature is not compiled in,
+/// or the binary is not found, or OCR itself fails, analysis still completes
+/// normally; the affected page is reported via `PageTextMissing` rather than
+/// causing an error or a panic.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OcrConfig {
+    /// Whether to actually attempt OCR for pages under the native-text
+    /// threshold. Default `false`. Detection/warnings fire either way (see
+    /// the struct docs); this flag only gates the OCR attempt itself.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Minimum number of native (non-OCR) characters a page must contain to
+    /// be considered to have "real" text rather than being likely-scanned.
+    /// Default `50`, matching pdf_oxide's own internal `needs_ocr` heuristic
+    /// (`ocr/mod.rs::needs_ocr`, gated behind pdf_oxide's own `ocr` feature —
+    /// see `docs/refactor/phase4_findings.md` P4-1 §1 for how this crate
+    /// confirmed that threshold from the pdf_oxide source).
+    #[serde(default = "default_min_native_chars")]
+    pub min_native_chars: usize,
+    /// Language(s) passed to the OCR engine (tesseract `-l` syntax, e.g.
+    /// `"eng"`, `"jpn"`, `"jpn+eng"`). Default `"jpn+eng"`.
+    #[serde(default = "default_ocr_lang")]
+    pub lang: String,
+    /// Which OCR engine to use when [`Self::enabled`] is `true`. See
+    /// [`OcrEngineKind`].
+    #[serde(default)]
+    pub engine: OcrEngineKind,
+}
+
+/// Default value for [`OcrConfig::min_native_chars`].
+fn default_min_native_chars() -> usize {
+    50
+}
+
+/// Default value for [`OcrConfig::lang`].
+fn default_ocr_lang() -> String {
+    "jpn+eng".to_string()
+}
+
+impl Default for OcrConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_native_chars: default_min_native_chars(),
+            lang: default_ocr_lang(),
+            engine: OcrEngineKind::default(),
+        }
+    }
+}
+
+/// Which OCR engine [`OcrConfig`] should use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum OcrEngineKind {
+    /// Shell out to a `tesseract` binary on `PATH` (default). Chosen over
+    /// pdf_oxide's built-in `ocr` feature (ONNX Runtime + PaddleOCR-style
+    /// models) because it adds no heavy build dependency or bundled model
+    /// files — see `docs/refactor/phase4_findings.md` P4-1 §6 and
+    /// `docs/refactor/phase4_extraction.md` P4-2 for the A/B decision.
+    #[default]
+    Tesseract,
+    /// Reserved for pdf_oxide's built-in OCR (its own `ocr` feature: ONNX
+    /// Runtime + PaddleOCR-style det/rec/dict models). **Not wired up** in
+    /// this crate — selecting it always behaves as "OCR engine unavailable"
+    /// (a `PdfLayWarning::PageTextMissing`, never a panic or a build-time
+    /// dependency on `ort`). Kept as an explicit, honest placeholder for a
+    /// future task rather than omitted silently.
+    Builtin,
 }
 
 /// Configuration for vector-figure detection ([`crate::figure::VectorFigureClusterer`]).
@@ -714,5 +804,16 @@ mod tests {
         assert!(cfg.figure_vector.enabled);
         assert_eq!(cfg.figure_vector.cluster_gap_pt, 15.0);
         assert_eq!(cfg.figure_vector.min_paths, 4);
+    }
+
+    /// P4-2: OCR is off by default (no behavior change, no heavy dependency
+    /// pulled in), with the documented tesseract-matching threshold/lang.
+    #[test]
+    fn ocr_config_defaults() {
+        let cfg = Config::default();
+        assert!(!cfg.ocr.enabled);
+        assert_eq!(cfg.ocr.min_native_chars, 50);
+        assert_eq!(cfg.ocr.lang, "jpn+eng");
+        assert_eq!(cfg.ocr.engine, OcrEngineKind::Tesseract);
     }
 }

@@ -5,10 +5,14 @@
 
 mod coordinate;
 mod image_extractor;
+#[cfg(feature = "ocr")]
+mod ocr;
 mod pdf_reader;
 mod span_builder;
 
 pub use coordinate::CoordinateNormalizer;
 pub use image_extractor::ImageExtractor;
+#[cfg(feature = "ocr")]
+pub(crate) use ocr::{engine_available, ocr_page};
 pub use pdf_reader::PdfReader;
 pub use span_builder::SpanBuilder;

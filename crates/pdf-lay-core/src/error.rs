@@ -149,6 +149,25 @@ pub enum PdfLayWarning {
         /// Human-readable description of why the image was skipped.
         reason: String,
     },
+    /// A page had little/no native text but at least one embedded image (the
+    /// shape of a scanned page), and OCR recovered usable text for it (P4-2).
+    PageTextRecovered {
+        /// Zero-based page index.
+        page: u32,
+        /// Which mechanism recovered the text (e.g. `"ocr:tesseract"`).
+        method: &'static str,
+    },
+    /// A page had little/no native text and at least one embedded image (the
+    /// shape of a scanned page), and no text could be recovered for it — OCR
+    /// was disabled, unavailable, or itself failed (P4-2). Emitted
+    /// regardless of whether OCR is enabled, so a fully-scanned document can
+    /// never analyze "successfully" with zero signal.
+    PageTextMissing {
+        /// Zero-based page index.
+        page: u32,
+        /// Human-readable description of why no text is available.
+        reason: String,
+    },
 }
 
 /// The kind of section-numbering anomaly detected during hierarchy validation.
@@ -223,6 +242,12 @@ impl std::fmt::Display for PdfLayWarning {
             Self::ImageDecodeFailed { page, reason } => {
                 write!(f, "image on page {page} failed to decode/save: {reason}")
             }
+            Self::PageTextRecovered { page, method } => {
+                write!(f, "page {page} text recovered via {method}")
+            }
+            Self::PageTextMissing { page, reason } => {
+                write!(f, "page {page} has no usable text: {reason}")
+            }
         }
     }
 }
@@ -241,8 +266,17 @@ pub struct Coverage {
     /// Number of blocks classified into render-skipped types (caption, page
     /// number, running header/footer).
     pub dropped_blocks: usize,
-    /// `emitted_chars / extracted_chars`, clamped to `[0, 1]` (1.0 when nothing
-    /// was extracted).
+    /// `emitted_chars / extracted_chars`, clamped to `[0, 1]`.
+    ///
+    /// `0.0` when `extracted_chars == 0` (nothing was extracted at all —
+    /// e.g. a fully scanned/image-only document). Earlier this short-
+    /// circuited to `1.0` ("full coverage"), which let a document with zero
+    /// extracted text pass through with no `LowCoverage` warning at all
+    /// (see `docs/refactor/phase4_findings.md` P4-1 §2.5 / P4-2). `0.0`
+    /// cannot masquerade as complete coverage, so it always triggers
+    /// `PdfLayWarning::LowCoverage` against the default
+    /// `Config::min_coverage_ratio`; per-page detail is additionally
+    /// reported via `PdfLayWarning::PageTextMissing`/`PageTextRecovered`.
     pub ratio: f64,
 }
 

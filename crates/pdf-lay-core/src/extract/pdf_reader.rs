@@ -253,7 +253,13 @@ impl PdfReader {
     /// verified. Returns all-`false` hints (rather than an error) when the
     /// page/resources/XObject dictionary cannot be read, since this is a
     /// best-effort diagnostic, not a required extraction step.
-    pub(super) fn image_xobject_hints(&mut self, page: u32) -> ImageXObjectHints {
+    ///
+    /// `pub(crate)` (not `pub(super)`): in addition to `ImageExtractor`
+    /// (within this module's parent, `extract`), `pipeline.rs` also calls
+    /// this directly to detect scanned/image-only pages for P4-2 (a page
+    /// with an image but no/little native text), which needs the
+    /// [`ImageXObjectHints::has_any_image`] flag below.
+    pub(crate) fn image_xobject_hints(&mut self, page: u32) -> ImageXObjectHints {
         let mut hints = ImageXObjectHints::default();
 
         let Ok(page_obj) = self.inner.get_page_for_debug(page as usize) else {
@@ -291,6 +297,7 @@ impl PdfReader {
             if dict.get("Subtype").and_then(|o| o.as_name()) != Some("Image") {
                 continue;
             }
+            hints.has_any_image = true;
             if dict.contains_key("SMask") {
                 hints.has_smask = true;
             }
@@ -327,16 +334,22 @@ impl PdfReader {
 
 /// Hints about a page's Image XObjects gathered by [`PdfReader::image_xobject_hints`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(super) struct ImageXObjectHints {
+pub(crate) struct ImageXObjectHints {
     /// At least one Image XObject on the page has an `/SMask` entry.
     /// pdf_oxide does not apply soft masks, so the extracted raster may be
     /// missing the intended transparency/alpha.
-    pub(super) has_smask: bool,
+    pub(crate) has_smask: bool,
     /// At least one Image XObject on the page uses a `/Filter` pdf_oxide
     /// cannot decode (currently: `JPXDecode`/JPEG2000). That image is silently
     /// absent from `extract_images`'s result — this is the only way pdf-lay
     /// can detect that a page had an image it lost.
-    pub(super) has_unsupported_filter: bool,
+    pub(crate) has_unsupported_filter: bool,
+    /// At least one Image XObject is declared in the page's own
+    /// `/Resources`, regardless of whether pdf_oxide could decode it. Used
+    /// by `pipeline.rs` (P4-2) to tell "a page with no native text and no
+    /// image at all" (nothing lost) apart from "a page with no native text
+    /// but an image" (the shape of a scanned page).
+    pub(crate) has_any_image: bool,
 }
 
 // ---- Private conversion helpers ------------------------------------------------
@@ -1449,10 +1462,73 @@ mod tests {
 
     #[test]
     fn image_xobject_hints_is_all_false_for_a_plain_image() {
+        // "all false" refers to the SMask/unsupported-filter *problem* hints;
+        // `has_any_image` is true (the page does contain a plain image) —
+        // see the dedicated P4-2 test below for the "no image at all" case.
         let pdf = build_image_only_pdf();
         let mut reader = PdfReader::from_bytes(&pdf).expect("plain image PDF should open");
         let hints = reader.image_xobject_hints(0);
         assert!(!hints.has_smask);
         assert!(!hints.has_unsupported_filter);
+        assert!(hints.has_any_image);
+    }
+
+    #[test]
+    fn image_xobject_hints_has_any_image_is_false_with_no_xobjects() {
+        // P4-2: a page with only text operators (no /Resources/XObject at
+        // all) must not be flagged as having an image — this is what tells
+        // the pipeline's scanned-page detection apart a genuinely blank/
+        // text-only page (nothing lost) from a scanned one (image but no
+        // native text).
+        let pdf = build_text_sanity_pdf();
+        let mut reader = PdfReader::from_bytes(&pdf).expect("text-only PDF should open");
+        let hints = reader.image_xobject_hints(0);
+        assert!(!hints.has_any_image);
+    }
+
+    /// Two-page PDF whose `/Pages` dictionary claims `/Count 2`, but the
+    /// second `Kids` entry (`99 0 R`) references an object that does not
+    /// exist anywhere in the file. `PdfReader::page_count()` trusts `/Count`
+    /// (so callers see 2 pages), but `extract_text_spans(1)` genuinely fails
+    /// (pdf_oxide's page-tree walk and its scanning fallback both come up
+    /// empty for the dangling kid) while `extract_text_spans(0)` — a normal,
+    /// valid page — succeeds. This is pdf-lay's P4-2 partial-recovery
+    /// regression fixture: see `pipeline::tests::
+    /// single_page_extraction_failure_does_not_zero_the_whole_document`
+    /// (which duplicates this construction rather than importing it, since
+    /// `mod tests` is private to this module — same precedent as
+    /// `pipeline.rs`'s `build_image_only_pdf_bytes`).
+    fn build_pdf_with_one_dangling_page() -> Vec<u8> {
+        let mut b = TestPdfBuilder::new();
+        let catalog = b.add_obj(b"<< /Type /Catalog /Pages 2 0 R >>");
+        assert_eq!(catalog, 1);
+        b.add_obj(b"<< /Type /Pages /Kids [3 0 R 99 0 R] /Count 2 >>");
+        b.add_obj(
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.add_stream_obj("", b"BT /F1 12 Tf 72 700 Td (Good Page) Tj ET");
+        b.add_obj(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
+        b.finish(1)
+    }
+
+    #[test]
+    fn dangling_second_page_extracts_the_good_page_and_errors_on_the_missing_one() {
+        // Sanity-check for the fixture above: page 0 (real) succeeds, page 1
+        // (dangling Kids entry) genuinely errors rather than silently
+        // returning an empty Vec — the failure mode `pipeline.rs`'s
+        // per-page loop is meant to surface as `PdfLayWarning::PageSkipped`.
+        let pdf = build_pdf_with_one_dangling_page();
+        let mut reader = PdfReader::from_bytes(&pdf).expect("should open despite dangling kid");
+        assert_eq!(reader.page_count(), 2);
+        let page0 = reader
+            .extract_text_spans(0)
+            .expect("the real page must still extract");
+        assert_eq!(page0.len(), 1);
+        assert_eq!(page0[0].text, "Good Page");
+        assert!(
+            reader.extract_text_spans(1).is_err(),
+            "the dangling Kids entry must surface as an error, not an empty Vec"
+        );
     }
 }

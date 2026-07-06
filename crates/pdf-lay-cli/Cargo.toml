@@ -23,3 +23,11 @@ serde_json.workspace = true
 # tokenizer. Not part of the default feature set — see
 # crates/pdf-lay-core/Cargo.toml for why.
 real-tokenizer = ["pdf-lay/real-tokenizer"]
+
+# Forwards to pdf-lay's (and, transitively, pdf-lay-core's) opt-in OCR seam
+# (P4-2) so the `--ocr` flag can actually shell out to `tesseract`. Not part
+# of the default feature set. Without it, `--ocr` still parses and is
+# honored as a `Config.ocr.enabled` value, but analysis reports
+# `PageTextMissing` warnings for scanned pages instead of attempting OCR
+# (graceful degradation — see `crates/pdf-lay-core/src/extract/ocr.rs`).
+ocr = ["pdf-lay/ocr"]
