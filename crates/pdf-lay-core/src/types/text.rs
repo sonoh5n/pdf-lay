@@ -175,6 +175,14 @@ impl Section {
     }
 
     /// Concatenates all body text in this section (excluding captions, page numbers, etc.).
+    ///
+    /// This is a raw join of `block.text` with **no** math conversion, table
+    /// markdown, or figure placeholders. It remains in use for size estimates
+    /// (`PaperDocument::estimated_text_size`) and other callers that only need
+    /// approximate content length. LLM-facing output (Markdown / LLM text /
+    /// chunk) must go through `output::render_core::render_section_content`
+    /// instead, which applies the same high-fidelity rendering across all
+    /// three outputs.
     pub fn full_text(&self) -> String {
         self.blocks
             .iter()

@@ -16,5 +16,13 @@ rayon.workspace      = true
 pdf_oxide.workspace  = true
 pathdiff.workspace   = true
 tempfile.workspace   = true
+tokenizers = { workspace = true, optional = true }
+
+[features]
+# Opt-in real BPE tokenizer seam (`output::tokenizer::HfTokenizer`) for
+# `Chunker::with_tokenizer`. Not part of the default feature set: the
+# `tokenizers` crate and its transitive dependencies (onig, hf-hub, ureq,
+# etc.) are heavy and unnecessary for the default HeuristicTokenizer path.
+real-tokenizer = ["dep:tokenizers"]
 
 [dev-dependencies]

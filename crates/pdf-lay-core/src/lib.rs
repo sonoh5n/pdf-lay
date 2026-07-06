@@ -42,6 +42,9 @@ pub use math::{
     MathContext, MathConverter, MathDetector, MathFormatter, MathRegion, math_symbols,
     to_latex_map, to_unicode_map,
 };
+#[cfg(feature = "real-tokenizer")]
+pub use output::HfTokenizer;
+pub use output::{HeuristicTokenizer, Tokenizer};
 pub use pipeline::{analyze_pdf, analyze_pdf_bytes};
 pub use selector::{LlmTextGenerator, SectionEntry, SectionSelector, TocGenerator};
 pub use table::{GridBuilder, TableDetector, TableGrid, TableTextConverter};

@@ -1,76 +1,8 @@
 //! Generates LLM-optimized plain text from selected sections.
 
-use crate::config::{FigureTextFormat, LlmTextConfig, MathConfig, MathRepresentationPreference};
-use crate::math::{MathContext, MathConverter, MathDetector, MathFormatter};
-use crate::types::{BlockType, FigureInfo, Section, TableRepresentation, TextBlock};
-
-/// Convert a block's text, replacing contiguous math spans with formatted math notation
-/// for LLM text output.
-///
-/// Behaves identically to the Markdown variant but uses
-/// [`MathFormatter::format_for_llm`] for wrapping.
-fn convert_block_text_for_llm(
-    block: &TextBlock,
-    detector: &MathDetector,
-    converter: &MathConverter,
-    config: &MathConfig,
-) -> String {
-    let mut result = String::new();
-
-    for (line_idx, line) in block.lines.iter().enumerate() {
-        if line_idx > 0 {
-            result.push('\n');
-        }
-
-        let math_regions = detector.detect_in_line(line);
-
-        if math_regions.is_empty() {
-            let line_text: String = line.spans.iter().map(|s| s.text.as_str()).collect();
-            result.push_str(&line_text);
-        } else {
-            let mut span_idx = 0usize;
-
-            for region in &math_regions {
-                while span_idx < line.spans.len() {
-                    let span = &line.spans[span_idx];
-                    let is_region_start = region
-                        .spans
-                        .first()
-                        .is_some_and(|rs| rs.bbox.left == span.bbox.left && rs.text == span.text);
-                    if is_region_start {
-                        break;
-                    }
-                    result.push_str(&span.text);
-                    span_idx += 1;
-                }
-
-                let converted = converter.convert(&region.text, &region.spans);
-                let is_display = region.context == MathContext::Display;
-                let formatted = MathFormatter::format_for_llm(
-                    &converted,
-                    is_display,
-                    region.equation_number.as_deref(),
-                    config,
-                );
-                result.push_str(&formatted);
-
-                span_idx += region.spans.len();
-            }
-
-            while span_idx < line.spans.len() {
-                result.push_str(&line.spans[span_idx].text);
-                span_idx += 1;
-            }
-        }
-    }
-
-    // Fall back to block.text if lines are empty (defensive).
-    if result.is_empty() && !block.text.is_empty() {
-        return block.text.clone();
-    }
-
-    result
-}
+use crate::config::{LlmTextConfig, MathConfig, MathRepresentationPreference};
+use crate::output::render_core::{self, EscapeMode, RenderOptions};
+use crate::types::Section;
 
 /// Build a [`MathConfig`] from the representation preference stored in [`LlmTextConfig`].
 ///
@@ -106,7 +38,9 @@ impl LlmTextGenerator {
     }
 
     fn write_section(&self, out: &mut String, section: &Section) {
-        // Section header.
+        // Section header. Kept as llm_text's own "#"-per-level heading style
+        // (distinct from render-core's plain heading line), so this is
+        // handled here rather than via `RenderOptions::include_headers`.
         if self.config.include_section_headers
             && let Some(header) = &section.header
         {
@@ -114,97 +48,30 @@ impl LlmTextGenerator {
             out.push_str(&format!("{} {}\n\n", hashes, header.clean_text));
         }
 
-        // Prepare math detector/converter once per section (from LlmTextConfig).
-        let math_components = math_config_from_llm(&self.config).map(|mc| {
-            (
-                MathDetector::new(mc.clone()),
-                MathConverter::new(mc.clone()),
-                mc,
-            )
-        });
-
-        // Body blocks.
-        for block in &section.blocks {
-            match block.block_type {
-                BlockType::BodyText | BlockType::Abstract | BlockType::ListItem => {
-                    let text = if let Some((ref detector, ref converter, ref mc)) = math_components
-                    {
-                        convert_block_text_for_llm(block, detector, converter, mc)
-                    } else {
-                        block.text.clone()
-                    };
-                    out.push_str(&text);
-                    out.push_str("\n\n");
-                }
-                BlockType::Caption
-                | BlockType::PageNumber
-                | BlockType::RunningHeader
-                | BlockType::RunningFooter => {
-                    // Skip non-content blocks.
-                }
-                _ => {
-                    // Include other types (Title, Footnote, etc.) by default.
-                    let text = if let Some((ref detector, ref converter, ref mc)) = math_components
-                    {
-                        convert_block_text_for_llm(block, detector, converter, mc)
-                    } else {
-                        block.text.clone()
-                    };
-                    out.push_str(&text);
-                    out.push_str("\n\n");
-                }
-            }
-        }
-
-        // Tables (inline text representation).
-        if self.config.include_tables {
-            for table in &section.tables {
-                if let Some(caption) = &table.caption {
-                    out.push_str(&format!("**{}**\n\n", caption));
-                }
-                match &table.representation {
-                    TableRepresentation::Markdown { markdown_text, .. } => {
-                        out.push_str(markdown_text);
-                    }
-                    TableRepresentation::Csv { csv_text, .. } => {
-                        out.push_str(csv_text);
-                    }
-                    TableRepresentation::PlainText { text, .. } => {
-                        out.push_str(text);
-                    }
-                }
-                out.push_str("\n\n");
-            }
-        }
-
-        // Figures.
-        if self.config.include_figures {
-            for fig in &section.figures {
-                self.write_figure(out, fig);
-            }
+        // Body blocks, figures, and tables. Delegates to render-core's
+        // single section-body implementation (shared with markdown/chunker),
+        // which interleaves figures/tables at their `insertion_point` instead
+        // of draining them all at the section end, and builds figure links
+        // from `image_base` + filename rather than the raw on-disk path.
+        let math_config = math_config_from_llm(&self.config);
+        let opts = RenderOptions {
+            math_config: math_config.as_ref(),
+            escape: EscapeMode::Plain,
+            include_headers: false,
+            include_figures: self.config.include_figures,
+            include_tables: self.config.include_tables,
+            figure_format: self.config.figure_format.clone(),
+            image_base: self.config.image_base.clone(),
+        };
+        let body = render_core::render_section_content(section, &opts);
+        if !body.is_empty() {
+            out.push_str(&body);
+            out.push_str("\n\n");
         }
 
         // Child sections (recursive).
         for child in &section.children {
             self.write_section(out, child);
-        }
-    }
-
-    fn write_figure(&self, out: &mut String, fig: &FigureInfo) {
-        let path_str = fig.image.path.display().to_string();
-        match self.config.figure_format {
-            FigureTextFormat::Placeholder => {
-                out.push_str(&format!("[IMAGE: {} {}]\n\n", fig.figure_id, path_str));
-            }
-            FigureTextFormat::MarkdownLink => {
-                out.push_str(&format!("![{}]({})\n\n", fig.figure_id, path_str));
-            }
-            FigureTextFormat::CaptionOnly => {
-                out.push_str(&format!("[{}]\n\n", fig.caption_text));
-            }
-            FigureTextFormat::Omit => {
-                // Do not include.
-            }
         }
     }
 }
@@ -215,7 +82,7 @@ mod tests {
     use crate::config::{FigureTextFormat, LlmTextConfig, MathRepresentationPreference};
     use crate::types::{
         BlockType, FigureInfo, ImageFormat, ImageInfo, InsertionPoint, Rect, Section,
-        SectionHeader, TextBlock,
+        SectionHeader, TableInfo, TableRepresentation, TextBlock,
     };
     use std::path::PathBuf;
 
@@ -226,6 +93,7 @@ mod tests {
             include_section_headers: true,
             math_representation: MathRepresentationPreference::Auto,
             figure_format: FigureTextFormat::Placeholder,
+            image_base: String::new(),
         }
     }
 
@@ -349,6 +217,165 @@ mod tests {
         });
         let output = generator.generate(&[&section]);
         assert!(!output.contains("IMAGE"));
+    }
+
+    #[test]
+    fn figure_uses_image_base_not_raw_path() {
+        let mut config = default_config();
+        config.image_base = "./img".to_string();
+        let generator = LlmTextGenerator::new(config);
+        let mut section = make_section("SEC", "Text.", 1);
+        section.figures.push(FigureInfo {
+            figure_id: "Fig. 1".to_string(),
+            figure_number: Some(1),
+            caption_text: "Fig. 1: A figure.".to_string(),
+            image: ImageInfo {
+                path: PathBuf::from("/abs/images/p000_img000.png"),
+                page: 0,
+                raw_bbox: Rect::new(0.0, 0.0, 0.0, 0.0),
+                normalized_bbox: Rect::new(0.0, 0.0, 0.0, 0.0),
+                width_px: 100,
+                height_px: 100,
+                format: ImageFormat::Png,
+            },
+            context_text: String::new(),
+            insertion_point: InsertionPoint {
+                page: 0,
+                after_block_index: None,
+                y_position: 0.0,
+            },
+        });
+        let output = generator.generate(&[&section]);
+        assert!(
+            output.contains("./img/p000_img000.png"),
+            "expected image_base-prefixed filename in output:\n{output}"
+        );
+        assert!(
+            !output.contains("/abs/images/"),
+            "raw on-disk directory must not leak into output:\n{output}"
+        );
+    }
+
+    #[test]
+    fn figure_base_empty_is_filename_only() {
+        // default_config() leaves image_base empty.
+        let generator = LlmTextGenerator::new(default_config());
+        let mut section = make_section("SEC", "Text.", 1);
+        section.figures.push(FigureInfo {
+            figure_id: "Fig. 1".to_string(),
+            figure_number: Some(1),
+            caption_text: "Fig. 1: A figure.".to_string(),
+            image: ImageInfo {
+                path: PathBuf::from("/abs/images/p000_img000.png"),
+                page: 0,
+                raw_bbox: Rect::new(0.0, 0.0, 0.0, 0.0),
+                normalized_bbox: Rect::new(0.0, 0.0, 0.0, 0.0),
+                width_px: 100,
+                height_px: 100,
+                format: ImageFormat::Png,
+            },
+            context_text: String::new(),
+            insertion_point: InsertionPoint {
+                page: 0,
+                after_block_index: None,
+                y_position: 0.0,
+            },
+        });
+        let output = generator.generate(&[&section]);
+        assert!(
+            output.contains("[IMAGE: Fig. 1 p000_img000.png]"),
+            "expected filename-only image path (no raw disk path):\n{output}"
+        );
+        assert!(!output.contains("/abs/"));
+    }
+
+    #[test]
+    fn figure_inserted_at_insertion_point() {
+        let generator = LlmTextGenerator::new(default_config());
+        let mut first = make_body_block("BEFORE_MARKER");
+        first.global_index = 0;
+        let mut second = make_body_block("AFTER_MARKER");
+        second.global_index = 1;
+        let mut section = Section {
+            header: None,
+            level: 1,
+            blocks: vec![first, second],
+            figures: vec![],
+            tables: vec![],
+            children: vec![],
+            page_range: (0, 0),
+        };
+        section.figures.push(FigureInfo {
+            figure_id: "Fig. 1".to_string(),
+            figure_number: Some(1),
+            caption_text: "Fig. 1: A figure.".to_string(),
+            image: ImageInfo {
+                path: PathBuf::from("img.png"),
+                page: 0,
+                raw_bbox: Rect::new(0.0, 0.0, 0.0, 0.0),
+                normalized_bbox: Rect::new(0.0, 0.0, 0.0, 0.0),
+                width_px: 10,
+                height_px: 10,
+                format: ImageFormat::Png,
+            },
+            context_text: String::new(),
+            insertion_point: InsertionPoint {
+                page: 0,
+                after_block_index: Some(0),
+                y_position: 0.0,
+            },
+        });
+
+        let output = generator.generate(&[&section]);
+        let before_pos = output.find("BEFORE_MARKER").expect("first block present");
+        let image_pos = output.find("[IMAGE:").expect("figure placeholder present");
+        let after_pos = output.find("AFTER_MARKER").expect("second block present");
+        assert!(
+            before_pos < image_pos && image_pos < after_pos,
+            "figure anchored after block 0 must appear between the two blocks, not dumped at section end:\n{output}"
+        );
+    }
+
+    #[test]
+    fn table_inserted_at_insertion_point() {
+        let generator = LlmTextGenerator::new(default_config());
+        let mut first = make_body_block("BEFORE_MARKER");
+        first.global_index = 0;
+        let mut second = make_body_block("AFTER_MARKER");
+        second.global_index = 1;
+        let mut section = Section {
+            header: None,
+            level: 1,
+            blocks: vec![first, second],
+            figures: vec![],
+            tables: vec![],
+            children: vec![],
+            page_range: (0, 0),
+        };
+        section.tables.push(TableInfo {
+            table_id: "Table 1".to_string(),
+            table_number: Some(1),
+            caption: None,
+            representation: TableRepresentation::PlainText {
+                text: "TABLE_MARKER".to_string(),
+                caption: None,
+            },
+            insertion_point: InsertionPoint {
+                page: 0,
+                after_block_index: Some(0),
+                y_position: 0.0,
+            },
+            page: 0,
+        });
+
+        let output = generator.generate(&[&section]);
+        let before_pos = output.find("BEFORE_MARKER").expect("first block present");
+        let table_pos = output.find("TABLE_MARKER").expect("table text present");
+        let after_pos = output.find("AFTER_MARKER").expect("second block present");
+        assert!(
+            before_pos < table_pos && table_pos < after_pos,
+            "table anchored after block 0 must appear between the two blocks, not dumped at section end:\n{output}"
+        );
     }
 
     #[test]

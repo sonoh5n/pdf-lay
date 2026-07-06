@@ -37,3 +37,10 @@ tempfile    = "3"
 
 pdf_oxide = "0.3.8"
 pathdiff  = "0.2"
+
+# Optional: real BPE tokenizer for `output::tokenizer::HfTokenizer`, gated
+# behind the `real-tokenizer` feature (see crates/pdf-lay-core/Cargo.toml) so
+# the default build does not pull it in. `http` enables
+# `tokenizers::Tokenizer::from_pretrained` (loading by Hugging Face Hub model
+# id); `from_file` (loading a local tokenizer.json) works without it.
+tokenizers = { version = "0.23", features = ["http"] }

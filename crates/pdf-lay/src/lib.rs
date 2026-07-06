@@ -35,6 +35,7 @@ pub use pdf_lay_core::{
     FigureTextFormat,
     // Table processing types
     GridBuilder,
+    HeuristicTokenizer,
     ImageFormat,
     ImageInfo,
     InsertionPoint,
@@ -72,6 +73,8 @@ pub use pdf_lay_core::{
     TextLine,
     TextSpan,
     TocGenerator,
+    // Tokenizer trait (pluggable token counting for `Chunker`)
+    Tokenizer,
     // Pipeline entry points
     analyze_pdf,
     analyze_pdf_bytes,
@@ -80,5 +83,8 @@ pub use pdf_lay_core::{
     to_unicode_map,
 };
 
+#[cfg(feature = "real-tokenizer")]
+pub use pdf_lay_core::HfTokenizer;
+
 // Re-export output generators for CLI and advanced use cases.
-pub use pdf_lay_core::output::MarkdownGenerator;
+pub use pdf_lay_core::output::{Chunker, JsonGenerator, MarkdownGenerator};

@@ -37,6 +37,7 @@ fn chunk_config_defaults_compile() {
         overlap_tokens: 200,
         split_strategy: SplitStrategy::SectionBoundary,
         include_section_context: true,
+        math_config: None,
     };
     assert_eq!(config.max_tokens, 4000);
 }
@@ -49,6 +50,7 @@ fn llm_text_config_compiles() {
         include_section_headers: true,
         math_representation: MathRepresentationPreference::Auto,
         figure_format: pdf_lay::FigureTextFormat::Placeholder,
+        image_base: String::new(),
     };
     assert!(config.include_figures);
 }

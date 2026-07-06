@@ -12,7 +12,7 @@ use pdf_lay_core::{
     },
     output::{Chunker, JsonGenerator, MarkdownGenerator},
     selector::{SectionEntry, SectionSelector, TocGenerator},
-    types::{Chunk, FigureInfo, PaperDocument, Section},
+    types::{Chunk, FigureInfo, PaperDocument, Section, TableInfo, TableRepresentation},
 };
 
 // ---------------------------------------------------------------------------
@@ -146,6 +146,7 @@ impl PyPaperDocument {
             overlap_tokens: overlap,
             split_strategy,
             include_section_context: true,
+            math_config: None,
         };
         Ok(Chunker::new(config)
             .chunk(&self.inner)
@@ -341,12 +342,15 @@ impl PySectionSelector {
     ///     include_tables: Whether to include inline table text.
     ///     figure_format: One of ``"placeholder"`` (default), ``"markdown"``,
     ///         ``"caption"``, or ``"omit"``.
-    #[pyo3(signature = (include_figures = true, include_tables = true, figure_format = "placeholder"))]
+    ///     image_base: Base path prepended to figure image filenames (e.g.
+    ///         ``"./images"``). Empty emits the filename only.
+    #[pyo3(signature = (include_figures = true, include_tables = true, figure_format = "placeholder", image_base = "./images"))]
     fn to_llm_text(
         &self,
         include_figures: bool,
         include_tables: bool,
         figure_format: &str,
+        image_base: &str,
     ) -> String {
         let config = LlmTextConfig {
             include_figures,
@@ -359,6 +363,7 @@ impl PySectionSelector {
                 _ => FigureTextFormat::Placeholder,
             },
             math_representation: MathRepresentationPreference::Auto,
+            image_base: image_base.to_string(),
         };
         self.rebuild_selector().to_llm_text(&config)
     }
@@ -380,6 +385,7 @@ impl PySectionSelector {
             overlap_tokens: overlap,
             split_strategy: SplitStrategy::SectionBoundary,
             include_section_context: true,
+            math_config: None,
         };
         Ok(self
             .rebuild_selector()
@@ -638,6 +644,72 @@ impl PyFigureInfo {
 }
 
 // ---------------------------------------------------------------------------
+// PyTableInfo
+// ---------------------------------------------------------------------------
+
+/// A table extracted from the PDF (representation + caption + metadata).
+#[pyclass(name = "PyTableInfo")]
+#[derive(Clone)]
+struct PyTableInfo {
+    inner: TableInfo,
+}
+
+#[pymethods]
+impl PyTableInfo {
+    /// Identifier string such as ``"Table 1"`` or ``"Tab. 2"``.
+    #[getter]
+    fn table_id(&self) -> &str {
+        &self.inner.table_id
+    }
+
+    /// Numeric table number if present, otherwise None.
+    #[getter]
+    fn table_number(&self) -> Option<u32> {
+        self.inner.table_number
+    }
+
+    /// Table caption text, if any.
+    #[getter]
+    fn caption(&self) -> Option<&str> {
+        self.inner.caption.as_deref()
+    }
+
+    /// Page where this table appears (0-based).
+    #[getter]
+    fn page(&self) -> u32 {
+        self.inner.page
+    }
+
+    /// The table as a Markdown table string, or ``None`` if it was detected
+    /// via text alignment (CSV) or fell back to plain text — those tiers have
+    /// no Markdown rendering.
+    fn markdown(&self) -> Option<String> {
+        match &self.inner.representation {
+            TableRepresentation::Markdown { markdown_text, .. } => Some(markdown_text.clone()),
+            _ => None,
+        }
+    }
+
+    /// The table's textual representation regardless of which quality tier it
+    /// resolved to: the Markdown table text, the CSV text, or the plain-text
+    /// fallback.
+    fn as_text(&self) -> String {
+        match &self.inner.representation {
+            TableRepresentation::Markdown { markdown_text, .. } => markdown_text.clone(),
+            TableRepresentation::Csv { csv_text, .. } => csv_text.clone(),
+            TableRepresentation::PlainText { text, .. } => text.clone(),
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "PyTableInfo(id='{}', page={})",
+            self.inner.table_id, self.inner.page
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
 // PyChunk
 // ---------------------------------------------------------------------------
 
@@ -705,6 +777,16 @@ impl PyChunk {
             .figures
             .iter()
             .map(|f| PyFigureInfo { inner: f.clone() })
+            .collect()
+    }
+
+    /// Tables whose insertion points fall within this chunk.
+    #[getter]
+    fn tables(&self) -> Vec<PyTableInfo> {
+        self.inner
+            .tables
+            .iter()
+            .map(|t| PyTableInfo { inner: t.clone() })
             .collect()
     }
 
@@ -819,6 +901,7 @@ fn pdflay(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PySectionEntry>()?;
     m.add_class::<PySectionSelector>()?;
     m.add_class::<PyFigureInfo>()?;
+    m.add_class::<PyTableInfo>()?;
     m.add_class::<PyChunk>()?;
     Ok(())
 }

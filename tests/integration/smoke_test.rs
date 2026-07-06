@@ -47,6 +47,7 @@ fn default_llm_config() -> LlmTextConfig {
         include_section_headers: true,
         figure_format: FigureTextFormat::Placeholder,
         math_representation: MathRepresentationPreference::Auto,
+        image_base: String::new(),
     }
 }
 
@@ -356,6 +357,7 @@ fn chunker_on_constructed_document() {
         overlap_tokens: 100,
         split_strategy: SplitStrategy::SectionBoundary,
         include_section_context: true,
+        math_config: None,
     };
 
     let chunker = Chunker::new(config);
@@ -391,6 +393,7 @@ fn chunker_token_count_strategy() {
         overlap_tokens: 10,
         split_strategy: SplitStrategy::TokenCount,
         include_section_context: false,
+        math_config: None,
     };
 
     let chunker = Chunker::new(config);
@@ -413,6 +416,7 @@ fn chunker_paragraph_strategy() {
         overlap_tokens: 10,
         split_strategy: SplitStrategy::Paragraph,
         include_section_context: false,
+        math_config: None,
     };
 
     let chunker = Chunker::new(config);
@@ -706,6 +710,7 @@ fn ieee_paper_chunking_produces_chunks() {
         overlap_tokens: 100,
         split_strategy: SplitStrategy::SectionBoundary,
         include_section_context: true,
+        math_config: None,
     };
     let chunker = Chunker::new(config);
     let chunks = chunker.chunk(&result.document);
@@ -731,6 +736,7 @@ fn ieee_paper_section_selector_by_name() {
         include_section_headers: true,
         figure_format: FigureTextFormat::Omit,
         math_representation: MathRepresentationPreference::Auto,
+        image_base: String::new(),
     });
 
     if !selector.sections().is_empty() {
@@ -783,6 +789,7 @@ fn ieee_paper_all_strategies_produce_chunks() {
             overlap_tokens: 50,
             split_strategy: strategy,
             include_section_context: true,
+            math_config: None,
         };
         let chunker = Chunker::new(config);
         let chunks = chunker.chunk(&result.document);
@@ -818,6 +825,7 @@ fn make_doc_with_table() -> pdf_lay::PaperDocument {
             rows: vec![vec!["α".into(), "0.5".into()]],
             caption: Some("Table 1. Results".into()),
             markdown_text: markdown_text.clone(),
+            header_rows: vec![],
         },
         insertion_point: InsertionPoint {
             page: 0,
@@ -943,6 +951,7 @@ fn test_table_excluded_when_include_tables_false() {
         include_section_headers: true,
         figure_format: FigureTextFormat::Placeholder,
         math_representation: MathRepresentationPreference::Auto,
+        image_base: String::new(),
     };
     let llm_gen = LlmTextGenerator::new(no_table_config);
     let text = llm_gen.generate(&sections);
@@ -1119,6 +1128,7 @@ fn make_comprehensive_doc() -> pdf_lay::PaperDocument {
             markdown_text:
                 "| Method | Accuracy |\n| --- | --- |\n| Baseline | 0.72 |\n| Proposed | 0.91 |\n"
                     .to_string(),
+            header_rows: vec![],
         },
         insertion_point: InsertionPoint {
             page: 1,

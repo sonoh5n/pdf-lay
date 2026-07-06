@@ -8,6 +8,12 @@ description = "PDF Layout Analysis for Academic Papers"
 [dependencies]
 pdf-lay-core = { path = "../pdf-lay-core" }
 
+[features]
+# Forwards to pdf-lay-core's opt-in real BPE tokenizer seam; see
+# crates/pdf-lay-core/Cargo.toml for details. Not part of the default
+# feature set.
+real-tokenizer = ["pdf-lay-core/real-tokenizer"]
+
 [dev-dependencies]
 pdf-lay-core = { path = "../pdf-lay-core" }
 serde_json = { workspace = true }

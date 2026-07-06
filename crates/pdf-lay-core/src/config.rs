@@ -164,6 +164,34 @@ pub struct TableConfig {
     pub use_rule_detection: bool,
     /// Whether to use text X-alignment for table detection when no rules are found.
     pub use_text_alignment: bool,
+    /// Minimum number of distinct aligned row levels required to accept a
+    /// caption-less text-alignment candidate as a table (only consulted when
+    /// [`Self::allow_captionless_alignment`] is enabled — the legacy
+    /// caption-anchored path is unaffected by this value, so existing
+    /// detection results do not change unless the new path is opted into).
+    #[serde(default = "default_borderless_min_rows")]
+    pub borderless_min_rows: usize,
+    /// When `true`, text-alignment detection also accepts column-aligned
+    /// regions that have **no** adjacent "Table N" caption, provided they
+    /// meet `min_columns` and `borderless_min_rows`. Default `false`
+    /// preserves the legacy behavior of requiring a caption (no regression).
+    #[serde(default)]
+    pub allow_captionless_alignment: bool,
+    /// Maximum vertical gap (points) between consecutive aligned rows that
+    /// are still considered part of the same caption-less table candidate.
+    /// Only consulted when [`Self::allow_captionless_alignment`] is enabled.
+    #[serde(default = "default_captionless_row_gap")]
+    pub captionless_row_gap: f64,
+}
+
+/// Default value for [`TableConfig::borderless_min_rows`].
+fn default_borderless_min_rows() -> usize {
+    3
+}
+
+/// Default value for [`TableConfig::captionless_row_gap`].
+fn default_captionless_row_gap() -> f64 {
+    60.0
 }
 
 impl Default for TableConfig {
@@ -173,6 +201,9 @@ impl Default for TableConfig {
             column_alignment_tolerance: 5.0,
             use_rule_detection: true,
             use_text_alignment: true,
+            borderless_min_rows: default_borderless_min_rows(),
+            allow_captionless_alignment: false,
+            captionless_row_gap: default_captionless_row_gap(),
         }
     }
 }
@@ -391,6 +422,12 @@ pub struct LlmTextConfig {
     pub math_representation: MathRepresentationPreference,
     /// How figures are represented in the LLM text output.
     pub figure_format: FigureTextFormat,
+    /// Base path prepended to figure image filenames in LLM text output
+    /// (e.g. `"./images"`). Empty (the default) emits only the filename
+    /// component of `fig.image.path` — the raw on-disk path (which may be
+    /// absolute) is never embedded. Mirrors `MarkdownConfig::image_base_path`.
+    #[serde(default)]
+    pub image_base: String,
 }
 
 impl Default for LlmTextConfig {
@@ -401,6 +438,7 @@ impl Default for LlmTextConfig {
             include_section_headers: true,
             math_representation: MathRepresentationPreference::Auto,
             figure_format: FigureTextFormat::Placeholder,
+            image_base: String::new(),
         }
     }
 }
@@ -428,8 +466,23 @@ pub struct ChunkConfig {
     pub overlap_tokens: usize,
     /// Strategy for determining chunk boundaries.
     pub split_strategy: SplitStrategy,
-    /// Whether to prepend the section path as context at the start of each chunk.
+    /// Whether to prepend a breadcrumb of ancestor section headings plus the
+    /// section's own heading line to the start of each chunk's text, e.g.
+    /// `[Context: METHODS > Data Collection]\n# Data Collection`. Ancestor
+    /// headings are joined with `" > "`; headerless sections contribute no
+    /// path segment. Applies to the `SectionBoundary` split strategy
+    /// (including its oversized-section sub-splits, where every sub-chunk
+    /// carries the same prefix); `TokenCount` and `Paragraph` do not yet
+    /// carry per-chunk section attribution to prefix (see P2-4).
     pub include_section_context: bool,
+    /// Optional math configuration used to render chunk body text.
+    ///
+    /// `None` (the default) keeps the legacy behavior of chunk text carrying
+    /// unconverted math glyphs; `Some` routes chunk rendering through the same
+    /// math detector/converter used by Markdown and LLM text output, via
+    /// `output::render_core`.
+    #[serde(default)]
+    pub math_config: Option<MathConfig>,
 }
 
 impl Default for ChunkConfig {
@@ -439,6 +492,7 @@ impl Default for ChunkConfig {
             overlap_tokens: 200,
             split_strategy: SplitStrategy::SectionBoundary,
             include_section_context: true,
+            math_config: None,
         }
     }
 }
@@ -476,6 +530,16 @@ mod tests {
         assert_eq!(tc.column_alignment_tolerance, 5.0);
         assert!(tc.use_rule_detection);
         assert!(tc.use_text_alignment);
+    }
+
+    /// P2-8: the borderless/caption-less relaxation knobs must default to
+    /// the pre-P2-8 behavior (caption required, no regression).
+    #[test]
+    fn table_config_borderless_default() {
+        let tc = TableConfig::default();
+        assert_eq!(tc.borderless_min_rows, 3);
+        assert!(!tc.allow_captionless_alignment);
+        assert_eq!(tc.captionless_row_gap, 60.0);
     }
 
     #[test]

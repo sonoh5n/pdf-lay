@@ -26,6 +26,27 @@ impl TableTextConverter {
             grid.header.last().unwrap().clone()
         };
 
+        // Markdown has no multi-row-header syntax, so upper header rows
+        // (group/spanning labels above the column labels) would otherwise be
+        // silently dropped. Emit them as a bold annotation line immediately
+        // before the table instead (No Silent Drop; see
+        // docs/refactor/phase2_llm_output.md#P2-8). The full, un-flattened
+        // rows are also carried in `header_rows` below.
+        if grid.header.len() > 1 {
+            for upper_row in &grid.header[..grid.header.len() - 1] {
+                let non_empty: Vec<String> = upper_row
+                    .iter()
+                    .filter(|c| !c.is_empty())
+                    .map(|c| Self::escape_pipe(c))
+                    .collect();
+                if !non_empty.is_empty() {
+                    md.push_str("**");
+                    md.push_str(&non_empty.join(" | "));
+                    md.push_str("**\n\n");
+                }
+            }
+        }
+
         // | Col1 | Col2 | Col3 |
         md.push_str("| ");
         md.push_str(
@@ -63,6 +84,7 @@ impl TableTextConverter {
             rows: grid.rows.clone(),
             caption: caption.map(|s| s.to_string()),
             markdown_text: md,
+            header_rows: grid.header.clone(),
         }
     }
 
@@ -78,15 +100,30 @@ impl TableTextConverter {
             grid.header.last().unwrap().clone()
         };
 
-        // Header row.
-        csv.push_str(
-            &header_strs
-                .iter()
-                .map(|h| Self::escape_csv(h))
-                .collect::<Vec<_>>()
-                .join(","),
-        );
-        csv.push('\n');
+        // Header row(s). Unlike Markdown, CSV has no column-label
+        // restriction, so every header row is emitted as its own leading
+        // CSV line — multi-row headers are not flattened away (No Silent
+        // Drop; see docs/refactor/phase2_llm_output.md#P2-8).
+        if grid.header.is_empty() {
+            csv.push_str(
+                &header_strs
+                    .iter()
+                    .map(|h| Self::escape_csv(h))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
+            csv.push('\n');
+        } else {
+            for row in &grid.header {
+                csv.push_str(
+                    &row.iter()
+                        .map(|h| Self::escape_csv(h))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                );
+                csv.push('\n');
+            }
+        }
 
         // Data rows.
         for row in &grid.rows {
@@ -163,6 +200,7 @@ mod tests {
             ],
             column_count: 2,
             has_multi_header: false,
+            header_rows: vec![],
         }
     }
 
@@ -297,6 +335,7 @@ mod tests {
             rows: vec![vec!["x|y".into(), "z".into()]],
             column_count: 2,
             has_multi_header: false,
+            header_rows: vec![],
         };
         if let TableRepresentation::Markdown { markdown_text, .. } =
             TableTextConverter::to_markdown(&grid, None)
@@ -321,6 +360,7 @@ mod tests {
             rows: vec![vec!["val1".into(), "val2".into()]],
             column_count: 2,
             has_multi_header: false,
+            header_rows: vec![],
         };
         if let TableRepresentation::Markdown { markdown_text, .. } =
             TableTextConverter::to_markdown(&grid, None)
@@ -331,6 +371,75 @@ mod tests {
             );
         } else {
             panic!("expected TableRepresentation::Markdown");
+        }
+    }
+
+    /// P2-8: a 2-row header (grouped label + sub-headers) must not be
+    /// flattened to only the last row in Markdown output — the upper row
+    /// should still appear somewhere in `markdown_text`, and `header_rows`
+    /// should carry every row un-flattened.
+    #[test]
+    fn multi_header_not_flattened_markdown() {
+        let grid = TableGrid {
+            header: vec![
+                vec!["Metrics".into(), "Metrics".into(), "Other".into()],
+                vec!["Accuracy".into(), "Precision".into(), "X".into()],
+            ],
+            rows: vec![vec!["0.9".into(), "0.8".into(), "1".into()]],
+            column_count: 3,
+            has_multi_header: true,
+            header_rows: vec![],
+        };
+        if let TableRepresentation::Markdown {
+            markdown_text,
+            header_rows,
+            ..
+        } = TableTextConverter::to_markdown(&grid, None)
+        {
+            assert!(
+                markdown_text.contains("Metrics"),
+                "upper header text should be preserved:\n{markdown_text}"
+            );
+            assert!(
+                markdown_text.contains("| Accuracy | Precision | X |"),
+                "last header row should become the Markdown column labels:\n{markdown_text}"
+            );
+            assert_eq!(header_rows.len(), 2, "both header rows should be carried");
+            assert_eq!(
+                header_rows[0],
+                vec![
+                    "Metrics".to_string(),
+                    "Metrics".to_string(),
+                    "Other".to_string()
+                ]
+            );
+        } else {
+            panic!("expected TableRepresentation::Markdown");
+        }
+    }
+
+    /// P2-8: CSV output emits every header row as its own leading line,
+    /// rather than flattening to the last row only.
+    #[test]
+    fn multi_header_preserved_csv() {
+        let grid = TableGrid {
+            header: vec![
+                vec!["Group".into(), "Group".into()],
+                vec!["A".into(), "B".into()],
+            ],
+            rows: vec![vec!["1".into(), "2".into()]],
+            column_count: 2,
+            has_multi_header: true,
+            header_rows: vec![],
+        };
+        if let TableRepresentation::Csv { csv_text, .. } = TableTextConverter::to_csv(&grid, None) {
+            let lines: Vec<&str> = csv_text.lines().collect();
+            assert_eq!(lines.len(), 3, "2 header rows + 1 data row:\n{csv_text}");
+            assert_eq!(lines[0], "Group,Group");
+            assert_eq!(lines[1], "A,B");
+            assert_eq!(lines[2], "1,2");
+        } else {
+            panic!("expected TableRepresentation::Csv");
         }
     }
 }
