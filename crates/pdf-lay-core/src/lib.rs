@@ -47,7 +47,7 @@ pub use math::{
 pub use output::HfTokenizer;
 pub use output::{HeuristicTokenizer, Tokenizer};
 pub use pipeline::{analyze_pdf, analyze_pdf_bytes};
-pub use selector::{LlmTextGenerator, SectionEntry, SectionSelector, TocGenerator};
+pub use selector::{LlmTextGenerator, MatchMode, SectionEntry, SectionSelector, TocGenerator};
 pub use table::{GridBuilder, TableDetector, TableGrid, TableTextConverter};
 pub use types::{
     BlockType, Chunk, DocumentMetadata, FigureInfo, ImageFormat, ImageInfo, InsertionPoint,

@@ -1,10 +1,36 @@
 //! Multi-mode section selector providing borrowed views over a PaperDocument.
 
+use serde::{Deserialize, Serialize};
+
 use crate::config::{ChunkConfig, LlmTextConfig, MarkdownConfig};
 use crate::output::{Chunker, JsonGenerator, MarkdownGenerator};
 use crate::selector::llm_text::LlmTextGenerator;
 use crate::selector::toc::{SectionEntry, TocGenerator};
 use crate::types::{Chunk, PaperDocument, Section};
+
+/// How [`SectionSelector::by_names_with`] compares a query name against a
+/// section's header text.
+///
+/// `Substring` is the legacy, unbounded `contains` behavior kept as the
+/// default for backward compatibility (see `docs/refactor/phase1_sections.md`
+/// P1-7); it is prone to over-firing (e.g. `"in"` matching `INTRODUCTION`).
+/// The other modes are additive and opt-in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum MatchMode {
+    /// Legacy unbounded case-insensitive substring match (the historical
+    /// `by_names` behavior). Kept as the default for backward compatibility.
+    #[default]
+    Substring,
+    /// Case-insensitive full-string match only (no substring matching).
+    Exact,
+    /// Case-insensitive match at a Unicode word boundary, so a short query
+    /// like `"method"` does not match inside `"METHODOLOGY"`.
+    WordBoundary,
+    /// Match after normalizing both the query and the header text (trim,
+    /// full-width-to-half-width folding, uppercase). Intended for CJK
+    /// headers where case/width variants should be treated as equal.
+    Normalized,
+}
 
 /// A borrowed selection of sections from a `PaperDocument`.
 ///
@@ -19,9 +45,32 @@ impl<'a> SectionSelector<'a> {
 
     /// Select sections by header name (partial match, case-insensitive).
     ///
-    /// If a parent section matches, its children are automatically included.
+    /// If a parent section matches, its children are automatically included
+    /// (subtree "swallow"). This is equivalent to
+    /// `by_names_with(doc, names, MatchMode::Substring, true)` and is kept
+    /// unchanged for backward compatibility; use [`Self::by_names_with`] to
+    /// pick a different match mode or to disable subtree swallowing.
     pub fn by_names(doc: &'a PaperDocument, names: &[&str]) -> Self {
-        let selected = Self::collect_by_names(&doc.sections, names);
+        Self::by_names_with(doc, names, MatchMode::Substring, true)
+    }
+
+    /// Select sections by header name with an explicit [`MatchMode`] and
+    /// subtree-inclusion policy.
+    ///
+    /// When `include_subtree` is `true`, a matching parent section is
+    /// returned and its children are *not* independently walked (they are
+    /// still reachable through `Section::children` on the returned parent,
+    /// but they are not added as separate entries) — this is the legacy
+    /// "swallow" behavior. When `false`, children are always walked
+    /// regardless of whether the parent matched, so a child can be selected
+    /// on its own and a matching parent no longer implicitly swallows it.
+    pub fn by_names_with(
+        doc: &'a PaperDocument,
+        names: &[&str],
+        mode: MatchMode,
+        include_subtree: bool,
+    ) -> Self {
+        let selected = Self::collect_by_names(&doc.sections, names, mode, include_subtree);
         Self { doc, selected }
     }
 
@@ -118,7 +167,12 @@ impl<'a> SectionSelector<'a> {
 
     // ---- private helpers ----
 
-    fn collect_by_names(sections: &'a [Section], names: &[&str]) -> Vec<&'a Section> {
+    fn collect_by_names(
+        sections: &'a [Section],
+        names: &[&str],
+        mode: MatchMode,
+        include_subtree: bool,
+    ) -> Vec<&'a Section> {
         let mut result = Vec::new();
         for section in sections {
             let header_upper = section.header_text().to_uppercase();
@@ -128,23 +182,54 @@ impl<'a> SectionSelector<'a> {
                 .map(|h| h.clean_text.to_uppercase())
                 .unwrap_or_default();
 
-            let matches = names.iter().any(|name| {
+            let matched = names
+                .iter()
+                .any(|name| Self::name_matches(&header_upper, &clean_upper, name, mode));
+
+            if matched {
+                // Include the section (children are included via Section::children).
+                result.push(section);
+            }
+            if !matched || !include_subtree {
+                // Recurse into children: either the parent didn't match, or
+                // subtree-swallow is disabled and children must be walked
+                // (and can match) independently of the parent.
+                result.extend(Self::collect_by_names(
+                    &section.children,
+                    names,
+                    mode,
+                    include_subtree,
+                ));
+            }
+        }
+        result
+    }
+
+    /// Whether `name` matches a section's header text under the given
+    /// [`MatchMode`]. `header_upper`/`clean_upper` are already
+    /// uppercased (see `collect_by_names`).
+    fn name_matches(header_upper: &str, clean_upper: &str, name: &str, mode: MatchMode) -> bool {
+        match mode {
+            MatchMode::Substring => {
                 let upper_name = name.to_uppercase();
                 header_upper == upper_name
                     || clean_upper == upper_name
                     || header_upper.contains(&upper_name)
                     || clean_upper.contains(&upper_name)
-            });
-
-            if matches {
-                // Include the section (children are included via Section::children).
-                result.push(section);
-            } else {
-                // Recurse into children.
-                result.extend(Self::collect_by_names(&section.children, names));
+            }
+            MatchMode::Exact => {
+                let upper_name = name.to_uppercase();
+                header_upper == upper_name || clean_upper == upper_name
+            }
+            MatchMode::Normalized => {
+                let norm_name = normalize(name);
+                normalize(header_upper) == norm_name || normalize(clean_upper) == norm_name
+            }
+            MatchMode::WordBoundary => {
+                word_boundary_matches(header_upper, name)
+                    || word_boundary_matches(clean_upper, name)
             }
         }
-        result
     }
 
     fn flatten(sections: &'a [Section]) -> Vec<&'a Section> {
@@ -166,6 +251,49 @@ impl<'a> SectionSelector<'a> {
     }
 }
 
+/// Normalize a string for [`MatchMode::Normalized`] comparisons: trim, fold
+/// full-width ASCII to half-width, then uppercase (a no-op for CJK scripts).
+///
+/// This mirrors `structure::header_detector::normalize` (added in P1-5) but
+/// is kept as an independent copy rather than a cross-module `pub(crate)`
+/// export: `structure/` is owned by a concurrently-in-progress task (P1-6)
+/// and this selector module has no other reason to depend on it. If the two
+/// ever drift, keeping them in sync is a small follow-up.
+fn normalize(s: &str) -> String {
+    s.trim()
+        .chars()
+        .map(|c| {
+            if ('\u{FF01}'..='\u{FF5E}').contains(&c) {
+                char::from_u32(c as u32 - 0xFEE0).unwrap_or(c)
+            } else {
+                c
+            }
+        })
+        .collect::<String>()
+        .to_uppercase()
+}
+
+/// Whether `name` occurs in `haystack` at a Unicode word boundary, so a
+/// short query like `"method"` does not match inside `"METHODOLOGY"` (S7).
+///
+/// CJK scripts have no inter-word spaces, so `\b` there only fires at the
+/// string's own edges or at a transition to/from non-word punctuation —
+/// in practice this degenerates to "exact match, or delimited by a
+/// non-word character", which is the safety property CJK headers need too.
+fn word_boundary_matches(haystack: &str, name: &str) -> bool {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let pattern = format!(r"(?i)\b{}\b", regex::escape(trimmed));
+    match regex::Regex::new(&pattern) {
+        Ok(re) => re.is_match(haystack),
+        // Escaped patterns should always compile; fall back to an exact
+        // comparison rather than panicking if one somehow doesn't.
+        Err(_) => haystack.to_uppercase() == trimmed.to_uppercase(),
+    }
+}
+
 impl PaperDocument {
     /// Generate the table of contents.
     pub fn toc(&self) -> Vec<SectionEntry> {
@@ -173,8 +301,24 @@ impl PaperDocument {
     }
 
     /// Select sections by header name (partial match, case-insensitive).
+    ///
+    /// Equivalent to `select_sections_with(names, MatchMode::Substring,
+    /// true)`. Kept unchanged for backward compatibility; use
+    /// [`Self::select_sections_with`] for other match modes or to disable
+    /// subtree swallowing.
     pub fn select_sections<'a>(&'a self, names: &[&str]) -> SectionSelector<'a> {
         SectionSelector::by_names(self, names)
+    }
+
+    /// Select sections by header name with an explicit [`MatchMode`] and
+    /// subtree-inclusion policy. See [`SectionSelector::by_names_with`].
+    pub fn select_sections_with<'a>(
+        &'a self,
+        names: &[&str],
+        mode: MatchMode,
+        include_subtree: bool,
+    ) -> SectionSelector<'a> {
+        SectionSelector::by_names_with(self, names, mode, include_subtree)
     }
 
     /// Select sections by flat index.
@@ -203,6 +347,7 @@ impl PaperDocument {
 
 #[cfg(test)]
 mod tests {
+    use super::{MatchMode, SectionSelector};
     use crate::types::{DocumentMetadata, PaperDocument, Rect, Section, SectionHeader};
 
     fn make_section_with_children(
@@ -297,5 +442,123 @@ mod tests {
         let total = sel.total_estimated_tokens();
         // All sections have empty blocks → 0 tokens each
         assert_eq!(total, 0);
+    }
+
+    // ---- P1-7: match modes and subtree-swallow control ----
+
+    #[test]
+    fn legacy_by_names_unchanged() {
+        // `by_names` / `select_sections` must behave exactly as before:
+        // unbounded substring match with subtree swallow.
+        let doc = make_doc();
+        let sel = doc.select_sections(&["RESULT"]);
+        assert_eq!(sel.sections().len(), 1);
+        assert_eq!(sel.sections()[0].header_text(), "RESULTS");
+
+        let sel2 = SectionSelector::by_names_with(&doc, &["RESULT"], MatchMode::Substring, true);
+        assert_eq!(sel2.sections().len(), 1);
+        assert_eq!(sel2.sections()[0].header_text(), "RESULTS");
+    }
+
+    #[test]
+    fn word_boundary_no_substring_overfire() {
+        let doc = PaperDocument {
+            paper_id: "test".to_string(),
+            source_file: std::path::PathBuf::from("test.pdf"),
+            metadata: DocumentMetadata::default(),
+            sections: vec![make_section_with_children("METHODOLOGY", 1, 0, vec![])],
+            all_figures: vec![],
+            all_tables: vec![],
+        };
+
+        // "method" must not match inside "METHODOLOGY" under word-boundary mode.
+        let sel = SectionSelector::by_names_with(&doc, &["method"], MatchMode::WordBoundary, true);
+        assert!(sel.sections().is_empty());
+
+        // The full word does match.
+        let sel2 =
+            SectionSelector::by_names_with(&doc, &["methodology"], MatchMode::WordBoundary, true);
+        assert_eq!(sel2.sections().len(), 1);
+
+        // Legacy Substring mode does over-fire on the same query (sanity check
+        // that the new mode is actually doing something different).
+        let sel3 = SectionSelector::by_names_with(&doc, &["method"], MatchMode::Substring, true);
+        assert_eq!(sel3.sections().len(), 1);
+    }
+
+    #[test]
+    fn exact_mode_requires_full_match() {
+        let doc = make_doc();
+
+        // "RESULT" is a substring of "RESULTS" but not an exact match.
+        let sel = SectionSelector::by_names_with(&doc, &["RESULT"], MatchMode::Exact, true);
+        assert!(sel.sections().is_empty());
+
+        let sel2 = SectionSelector::by_names_with(&doc, &["RESULTS"], MatchMode::Exact, true);
+        assert_eq!(sel2.sections().len(), 1);
+        assert_eq!(sel2.sections()[0].header_text(), "RESULTS");
+    }
+
+    #[test]
+    fn normalized_mode_fullwidth() {
+        let doc = PaperDocument {
+            paper_id: "test".to_string(),
+            source_file: std::path::PathBuf::from("test.pdf"),
+            metadata: DocumentMetadata::default(),
+            sections: vec![make_section_with_children("ＲＥＳＵＬＴＳ", 1, 0, vec![])],
+            all_figures: vec![],
+            all_tables: vec![],
+        };
+
+        let sel = SectionSelector::by_names_with(&doc, &["RESULTS"], MatchMode::Normalized, true);
+        assert_eq!(sel.sections().len(), 1);
+
+        // Exact mode (no normalization) must not match the full-width variant.
+        let sel2 = SectionSelector::by_names_with(&doc, &["RESULTS"], MatchMode::Exact, true);
+        assert!(sel2.sections().is_empty());
+    }
+
+    #[test]
+    fn select_child_only_without_subtree() {
+        let doc = make_doc();
+        let sel =
+            SectionSelector::by_names_with(&doc, &["Data Collection"], MatchMode::Substring, false);
+        assert_eq!(sel.sections().len(), 1);
+        assert_eq!(sel.sections()[0].header_text(), "Data Collection");
+    }
+
+    #[test]
+    fn select_parent_without_swallowing_children() {
+        let doc = make_doc();
+        let names = ["METHODS", "Data Collection"];
+
+        // include_subtree=true (legacy): parent match stops recursion, so the
+        // child is not returned as a separate entry even though its name also
+        // appears in `names`.
+        let swallowed = SectionSelector::by_names_with(&doc, &names, MatchMode::Exact, true);
+        assert_eq!(swallowed.sections().len(), 1);
+        assert_eq!(swallowed.sections()[0].header_text(), "METHODS");
+
+        // include_subtree=false: children are always walked independently, so
+        // both the matching parent and the matching child come back.
+        let not_swallowed = SectionSelector::by_names_with(&doc, &names, MatchMode::Exact, false);
+        assert_eq!(not_swallowed.sections().len(), 2);
+        let texts: Vec<_> = not_swallowed
+            .sections()
+            .iter()
+            .map(|s| s.header_text())
+            .collect();
+        assert!(texts.contains(&"METHODS".to_string()));
+        assert!(texts.contains(&"Data Collection".to_string()));
+    }
+
+    #[test]
+    fn select_sections_with_exposes_match_mode_on_document() {
+        // Verifies the `PaperDocument::select_sections_with` caller surface.
+        let doc = make_doc();
+        let sel = doc.select_sections_with(&["method"], MatchMode::WordBoundary, true);
+        assert!(sel.sections().is_empty());
+        let sel2 = doc.select_sections_with(&["METHODS"], MatchMode::Exact, true);
+        assert_eq!(sel2.sections().len(), 1);
     }
 }

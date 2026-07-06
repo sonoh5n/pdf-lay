@@ -6,5 +6,5 @@ mod selector;
 mod toc;
 
 pub use llm_text::LlmTextGenerator;
-pub use selector::SectionSelector;
+pub use selector::{MatchMode, SectionSelector};
 pub use toc::{SectionEntry, TocGenerator};

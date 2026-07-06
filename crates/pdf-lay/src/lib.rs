@@ -44,6 +44,7 @@ pub use pdf_lay_core::{
     // Selector types
     LlmTextGenerator,
     MarkdownConfig,
+    MatchMode,
     MathConfig,
     // Math processing types
     MathContext,
