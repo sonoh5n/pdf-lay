@@ -662,4 +662,111 @@ mod tests {
             "Expected ResourceLimitExceeded, got: {result:?}"
         );
     }
+
+    /// Minimal xref-correct single-page PDF with an Image XObject and **no
+    /// text operators** — the minimal shape of a scanned/image-only page.
+    /// Mirrors `extract::pdf_reader::tests::build_image_only_pdf` (duplicated
+    /// here rather than shared, since that helper is private to its module);
+    /// see `docs/refactor/phase4_findings.md` item 5 for the full observation
+    /// this test is a regression guard for.
+    fn build_image_only_pdf_bytes() -> Vec<u8> {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut offsets: Vec<usize> = Vec::new();
+        buf.extend_from_slice(b"%PDF-1.4\n");
+
+        let push_obj = |buf: &mut Vec<u8>, offsets: &mut Vec<usize>, body: &[u8]| {
+            offsets.push(buf.len());
+            let num = offsets.len();
+            buf.extend_from_slice(format!("{num} 0 obj\n").as_bytes());
+            buf.extend_from_slice(body);
+            buf.extend_from_slice(b"\nendobj\n");
+        };
+
+        push_obj(&mut buf, &mut offsets, b"<< /Type /Catalog /Pages 2 0 R >>");
+        push_obj(
+            &mut buf,
+            &mut offsets,
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        );
+        push_obj(
+            &mut buf,
+            &mut offsets,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        let content = b"q 500 0 0 700 50 50 cm /Im0 Do Q";
+        offsets.push(buf.len());
+        buf.extend_from_slice(b"4 0 obj\n");
+        buf.extend_from_slice(format!("<< /Length {} >>\nstream\n", content.len()).as_bytes());
+        buf.extend_from_slice(content);
+        buf.extend_from_slice(b"\nendstream\nendobj\n");
+        let img_data = [0xFFu8, 0x00, 0xFF, 0x00];
+        offsets.push(buf.len());
+        buf.extend_from_slice(b"5 0 obj\n");
+        buf.extend_from_slice(
+            format!(
+                "<< /Type /XObject /Subtype /Image /Width 2 /Height 2 \
+                 /BitsPerComponent 8 /ColorSpace /DeviceGray /Length {} >>\nstream\n",
+                img_data.len()
+            )
+            .as_bytes(),
+        );
+        buf.extend_from_slice(&img_data);
+        buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let xref_offset = buf.len();
+        let size = offsets.len() + 1;
+        buf.extend_from_slice(format!("xref\n0 {size}\n").as_bytes());
+        buf.extend_from_slice(b"0000000000 65535 f \n");
+        for off in &offsets {
+            buf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        buf.extend_from_slice(
+            format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+        buf
+    }
+
+    #[test]
+    fn analyze_pdf_image_only_page_does_not_panic_and_yields_empty_document() {
+        // Regression guard for phase4_findings.md item 5 (P4-1): a page with
+        // zero text operators (minimal shape of a scanned/image-only page)
+        // must run through the full pipeline without panicking, and must
+        // produce an empty (not garbage) document.
+        //
+        // KNOWN GAP (documented, not fixed by P4-1 — routed to P4-2): because
+        // `extracted_chars == 0`, the coverage-ratio calculation special-cases
+        // to `ratio = 1.0` (avoiding a divide-by-zero) rather than flagging
+        // "zero text was extracted". As a result NO warning is currently
+        // emitted for a fully-scanned document, even though the whole page's
+        // text was silently unavailable. This test locks in that current,
+        // verified behavior; P4-2 should decide whether a dedicated
+        // "page has images but no native text" warning belongs in the
+        // OCR-candidate detection it introduces.
+        let pdf = build_image_only_pdf_bytes();
+        let config = Config {
+            extract_images: false, // avoid writing files to disk in this test
+            ..Default::default()
+        };
+        let result = analyze_pdf_bytes(&pdf, &config).expect("analysis should not panic or error");
+        assert_eq!(result.document.metadata.pages, 1);
+        // SectionBuilder always emits a trailing "final section" placeholder
+        // even with zero blocks/headers, so there is exactly one (empty) one.
+        assert_eq!(result.document.sections.len(), 1);
+        assert!(result.document.sections[0].header.is_none());
+        assert!(result.document.sections[0].blocks.is_empty());
+        assert_eq!(result.coverage.extracted_chars, 0);
+        assert_eq!(result.coverage.emitted_chars, 0);
+        // Documents the current gap: no LowCoverage (or any other) warning is
+        // raised for a document with zero extracted text (see comment above).
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|w| matches!(w, PdfLayWarning::LowCoverage { .. })),
+            "current behavior: ratio short-circuits to 1.0 when extracted_chars == 0, \
+             so no LowCoverage warning fires (tracked for P4-2)"
+        );
+    }
 }

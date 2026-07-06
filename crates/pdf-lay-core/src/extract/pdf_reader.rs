@@ -696,4 +696,334 @@ mod tests {
         // width=50 > 5.0 and height=0 < 2.0 → Horizontal
         assert!(matches!(obj.path_type, PathType::Horizontal));
     }
+
+    // ---- P4-1 investigation: synthetic-PDF observation of pdf_oxide 0.3.8 ----
+    //
+    // See docs/refactor/phase4_findings.md for the write-up these tests support.
+    // The repo has no real Japanese/scanned/vertical-text PDF fixtures, so these
+    // build minimal hand-crafted PDFs (xref-correct, following `build_minimal_pdf`
+    // above) to observe pdf_oxide behavior that IS reachable without a real
+    // embedded CJK font: ToUnicode-only CID text, an image-only ("scanned-like")
+    // page, and page /Rotate handling. Building an actual vertical-writing-mode
+    // rendering test is out of reach offline (would need real vertical metrics /
+    // a real font), but Identity-V *decoding* can be probed the same way as
+    // Identity-H because pdf_oxide treats both through the same CID→ToUnicode path.
+
+    /// Minimal xref-correct multi-object PDF builder for the investigation tests
+    /// below. Objects are added in call order (object numbers are 1-based);
+    /// `finish()` emits the xref table + trailer. Mirrors `build_minimal_pdf`'s
+    /// approach but supports multiple objects and stream objects with a
+    /// `/Length` computed from the actual payload.
+    struct TestPdfBuilder {
+        buf: Vec<u8>,
+        offsets: Vec<usize>,
+    }
+
+    impl TestPdfBuilder {
+        fn new() -> Self {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(b"%PDF-1.4\n");
+            Self {
+                buf,
+                offsets: Vec::new(),
+            }
+        }
+
+        fn next_obj_num(&self) -> usize {
+            self.offsets.len() + 1
+        }
+
+        /// Add a non-stream object (dictionary/array body only, no `N 0 obj` wrapper).
+        fn add_obj(&mut self, body: &[u8]) -> usize {
+            let num = self.next_obj_num();
+            self.offsets.push(self.buf.len());
+            self.buf
+                .extend_from_slice(format!("{num} 0 obj\n").as_bytes());
+            self.buf.extend_from_slice(body);
+            self.buf.extend_from_slice(b"\nendobj\n");
+            num
+        }
+
+        /// Add a stream object. `dict_body` is the dictionary entries (no
+        /// surrounding `<<`/`>>`, no `/Length` — that is computed here).
+        fn add_stream_obj(&mut self, dict_body: &str, data: &[u8]) -> usize {
+            let num = self.next_obj_num();
+            self.offsets.push(self.buf.len());
+            self.buf
+                .extend_from_slice(format!("{num} 0 obj\n").as_bytes());
+            self.buf.extend_from_slice(
+                format!("<< {dict_body} /Length {} >>\nstream\n", data.len()).as_bytes(),
+            );
+            self.buf.extend_from_slice(data);
+            self.buf.extend_from_slice(b"\nendstream\nendobj\n");
+            num
+        }
+
+        fn finish(mut self, root_obj: usize) -> Vec<u8> {
+            let xref_offset = self.buf.len();
+            let size = self.offsets.len() + 1;
+            self.buf
+                .extend_from_slice(format!("xref\n0 {size}\n").as_bytes());
+            self.buf.extend_from_slice(b"0000000000 65535 f \n");
+            for off in &self.offsets {
+                self.buf
+                    .extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            self.buf.extend_from_slice(
+                format!(
+                    "trailer\n<< /Size {size} /Root {root_obj} 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n"
+                )
+                .as_bytes(),
+            );
+            self.buf
+        }
+    }
+
+    /// A page with a standard (non-embedded) Type1 font and one `Tj` text
+    /// operator. Sanity-checks the harness itself (not a pdf_oxide limitation
+    /// probe): confirms `TestPdfBuilder`-produced PDFs open and extract cleanly.
+    fn build_text_sanity_pdf() -> Vec<u8> {
+        let mut b = TestPdfBuilder::new();
+        let catalog = b.add_obj(b"<< /Type /Catalog /Pages 2 0 R >>");
+        assert_eq!(catalog, 1);
+        b.add_obj(b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.add_obj(
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.add_stream_obj("", b"BT /F1 12 Tf 72 700 Td (Hello World) Tj ET");
+        b.add_obj(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
+        b.finish(1)
+    }
+
+    /// A page with **no text operators**, only a single Image XObject drawn via
+    /// `Do` — the minimal shape of a "scanned page" (no embedded text at all).
+    /// 2x2 DeviceGray, 8 bits/component, unfiltered raw data (no JPEG/CCITT
+    /// decoder needed).
+    fn build_image_only_pdf() -> Vec<u8> {
+        let mut b = TestPdfBuilder::new();
+        let catalog = b.add_obj(b"<< /Type /Catalog /Pages 2 0 R >>");
+        assert_eq!(catalog, 1);
+        b.add_obj(b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.add_obj(
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.add_stream_obj("", b"q 500 0 0 700 50 50 cm /Im0 Do Q");
+        let img_data = [0xFFu8, 0x00, 0xFF, 0x00];
+        b.add_stream_obj(
+            "/Type /XObject /Subtype /Image /Width 2 /Height 2 \
+             /BitsPerComponent 8 /ColorSpace /DeviceGray",
+            &img_data,
+        );
+        b.finish(1)
+    }
+
+    /// A page whose only text is two CID codes (`<0001>`, `<0002>`) run through
+    /// a synthetic `/ToUnicode` CMap mapping them to U+65E5 ("日") and U+672C
+    /// ("本"). The descendant `CIDFontType2` has **no embedded `FontFile2`** —
+    /// this tests whether pdf_oxide can recover correct Unicode text from the
+    /// ToUnicode CMap alone (as claimed in `phase4_extraction.md`'s capability
+    /// table), without requiring a real embedded CJK font (infeasible offline).
+    ///
+    /// `writing_mode` selects `/Identity-H` or `/Identity-V` in `/Encoding` —
+    /// used to compare horizontal vs. vertical decoding (see
+    /// `identity_v_bbox_matches_identity_h_bbox_ignore` below).
+    fn build_cjk_tounicode_pdf(writing_mode: &str) -> Vec<u8> {
+        let mut b = TestPdfBuilder::new();
+        let catalog = b.add_obj(b"<< /Type /Catalog /Pages 2 0 R >>");
+        assert_eq!(catalog, 1);
+        b.add_obj(b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.add_obj(
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.add_stream_obj("", b"BT /F1 24 Tf 72 700 Td <00010002> Tj ET");
+        let font_dict = format!(
+            "<< /Type /Font /Subtype /Type0 /BaseFont /FakeCJK /Encoding /{writing_mode} \
+             /DescendantFonts [6 0 R] /ToUnicode 8 0 R >>"
+        );
+        b.add_obj(font_dict.as_bytes());
+        b.add_obj(
+            b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /FakeCJK \
+              /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
+              /FontDescriptor 7 0 R /DW 1000 /CIDToGIDMap /Identity >>",
+        );
+        b.add_obj(
+            b"<< /Type /FontDescriptor /FontName /FakeCJK /Flags 4 \
+              /FontBBox [0 0 1000 1000] /ItalicAngle 0 /Ascent 1000 /Descent 0 \
+              /CapHeight 1000 /StemV 80 >>",
+        );
+        let cmap = "/CIDInit /ProcSet findresource begin\n\
+                    12 dict begin\n\
+                    begincmap\n\
+                    1 begincodespacerange\n\
+                    <0000> <FFFF>\n\
+                    endcodespacerange\n\
+                    2 beginbfchar\n\
+                    <0001> <65E5>\n\
+                    <0002> <672C>\n\
+                    endbfchar\n\
+                    endcmap\n\
+                    CMapName currentdict /CMapName put\n\
+                    end\nend\n";
+        b.add_stream_obj("", cmap.as_bytes());
+        b.finish(1)
+    }
+
+    /// A page with `/Rotate 90` and a single text span, used to check whether
+    /// `extract_spans`'s bbox coordinates are adjusted for page rotation.
+    fn build_rotated_text_pdf() -> Vec<u8> {
+        let mut b = TestPdfBuilder::new();
+        let catalog = b.add_obj(b"<< /Type /Catalog /Pages 2 0 R >>");
+        assert_eq!(catalog, 1);
+        b.add_obj(b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.add_obj(
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Rotate 90 \
+              /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.add_stream_obj("", b"BT /F1 12 Tf 72 700 Td (Rotated) Tj ET");
+        b.add_obj(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
+        b.finish(1)
+    }
+
+    #[test]
+    fn text_sanity_pdf_extracts_via_pdf_lay_wrapper() {
+        // Harness sanity check: TestPdfBuilder output opens and extracts through
+        // pdf-lay's own PdfReader wrapper (not just raw pdf_oxide).
+        let pdf = build_text_sanity_pdf();
+        let mut reader = PdfReader::from_bytes(&pdf).expect("sanity PDF should open");
+        let spans = reader
+            .extract_text_spans(0)
+            .expect("extract_text_spans should succeed");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].text, "Hello World");
+    }
+
+    #[test]
+    fn cjk_tounicode_only_text_decodes_through_pdf_lay_wrapper() {
+        // Verifies (via pdf-lay's own PdfReader, not raw pdf_oxide) that CID
+        // text with only a ToUnicode CMap — no embedded font program — decodes
+        // to correct Unicode. Confirms the capability-table claim "ToUnicode
+        // CMap: 対応" end-to-end through the pdf-lay wrapper.
+        let pdf = build_cjk_tounicode_pdf("Identity-H");
+        let mut reader = PdfReader::from_bytes(&pdf).expect("CJK PDF should open");
+        let spans = reader
+            .extract_text_spans(0)
+            .expect("extract_text_spans should succeed");
+        assert_eq!(spans.len(), 1, "expected a single merged CJK span");
+        assert_eq!(spans[0].text, "日本");
+        assert!(spans[0].bbox.width() > 0.0);
+        assert!(spans[0].bbox.height() > 0.0);
+    }
+
+    #[test]
+    fn identity_v_decodes_text_but_bbox_matches_identity_h_shape() {
+        // OBSERVED pdf_oxide 0.3.8 LIMITATION (see phase4_findings.md item 3):
+        // Identity-V (vertical writing mode) correctly decodes the same
+        // Unicode text as Identity-H via the same ToUnicode/CID path, but the
+        // returned bbox has the *same wide/short shape* as the horizontal
+        // case — pdf_oxide does not transpose the span geometry for vertical
+        // writing mode. `pdf_oxide::layout::TextSpan` has no rotation/writing
+        // -mode field pdf-lay could use to detect this itself (per the
+        // capability table). This test locks in the current (horizontal-
+        // shaped) bbox so a future pdf_oxide upgrade that starts rotating
+        // vertical spans will be caught by a test failure here, not silently.
+        let h_pdf = build_cjk_tounicode_pdf("Identity-H");
+        let v_pdf = build_cjk_tounicode_pdf("Identity-V");
+
+        let mut h_reader = PdfReader::from_bytes(&h_pdf).expect("H PDF should open");
+        let h_spans = h_reader.extract_text_spans(0).unwrap();
+        let mut v_reader = PdfReader::from_bytes(&v_pdf).expect("V PDF should open");
+        let v_spans = v_reader.extract_text_spans(0).unwrap();
+
+        assert_eq!(h_spans.len(), 1);
+        assert_eq!(v_spans.len(), 1);
+        assert_eq!(
+            v_spans[0].text, "日本",
+            "Identity-V should still decode text"
+        );
+        // Same bbox width/height as Identity-H: wide (multiple wide CJK glyphs
+        // side-by-side), not tall/narrow as true vertical layout would be.
+        assert!(
+            v_spans[0].bbox.width() > v_spans[0].bbox.height(),
+            "Identity-V span bbox is horizontal-shaped (width {} > height {}), \
+             confirming pdf_oxide does not lay out vertical writing mode",
+            v_spans[0].bbox.width(),
+            v_spans[0].bbox.height()
+        );
+        assert_eq!(h_spans[0].bbox.width(), v_spans[0].bbox.width());
+        assert_eq!(h_spans[0].bbox.height(), v_spans[0].bbox.height());
+    }
+
+    #[test]
+    fn image_only_page_yields_no_spans_and_no_panic() {
+        // Regression guard: a page with zero text operators (the minimal shape
+        // of a scanned/image-only page) must not panic anywhere in the
+        // pdf_reader extraction path, and must yield zero spans (not garbage).
+        // See phase4_findings.md item 5: pdf-lay currently reports NO warning
+        // for this case at the pipeline level (tracked for P4-2), so this test
+        // only asserts the pdf_reader-level contract (no panic, empty result).
+        let pdf = build_image_only_pdf();
+        let mut reader = PdfReader::from_bytes(&pdf).expect("image-only PDF should open");
+        let spans = reader
+            .extract_text_spans(0)
+            .expect("extract_text_spans should succeed even with zero text");
+        assert!(spans.is_empty(), "image-only page should yield zero spans");
+    }
+
+    #[test]
+    fn image_only_page_image_is_still_extracted() {
+        // Companion to the above: the page's image XObject IS visible via
+        // pdf_oxide's extract_images (used by ImageExtractor), even though no
+        // text spans exist. Confirms "no text" != "no content" for a
+        // scanned-like page, which matters for the OCR-candidate heuristic
+        // P4-2 will need (page has images but ~0 native text chars).
+        let pdf = build_image_only_pdf();
+        let mut reader = PdfReader::from_bytes(&pdf).expect("image-only PDF should open");
+        let images = reader
+            .inner_doc()
+            .extract_images(0)
+            .expect("extract_images should succeed");
+        assert_eq!(
+            images.len(),
+            1,
+            "the page's single image XObject should be found"
+        );
+    }
+
+    #[test]
+    fn rotated_page_span_bbox_is_not_adjusted_for_rotate_entry() {
+        // OBSERVED pdf_oxide 0.3.8 LIMITATION (see phase4_findings.md item 4):
+        // `page_media_box` correctly swaps width/height for a /Rotate 90 page
+        // (P0-1 behavior), but `extract_spans`'s bbox coordinates are returned
+        // in the page's *original* (pre-rotation) coordinate frame. A span
+        // whose un-rotated Y-coordinate (700pt) fits inside the un-rotated
+        // page height (792pt) therefore ends up *outside* the swapped
+        // (rotated) page height (612pt) pdf-lay now reports for that page.
+        // This is a real geometric mismatch a downstream layout step would
+        // need to correct (out of scope for P4-1 — see findings for options).
+        let pdf = build_rotated_text_pdf();
+        let mut reader = PdfReader::from_bytes(&pdf).expect("rotated PDF should open");
+
+        let (_w, swapped_height, rotation) = reader
+            .page_media_box(0)
+            .expect("MediaBox should be readable");
+        assert_eq!(rotation, 90);
+        assert!((swapped_height - 612.0).abs() < 1.0);
+
+        let spans = reader.extract_text_spans(0).expect("spans should extract");
+        assert_eq!(spans.len(), 1);
+        // The span's bbox is still expressed in the *un-rotated* frame (top
+        // near the original MediaBox's 792pt height), which exceeds the
+        // rotated page's reported height (612pt) — the mismatch this test
+        // documents.
+        assert!(
+            spans[0].bbox.top > swapped_height,
+            "expected the un-rotated span bbox.top ({}) to exceed the \
+             swapped rotated page height ({swapped_height}), demonstrating \
+             the coordinate-frame mismatch",
+            spans[0].bbox.top
+        );
+    }
 }
