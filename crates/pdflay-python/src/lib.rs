@@ -623,10 +623,16 @@ impl PyFigureInfo {
         &self.inner.caption_text
     }
 
-    /// Path to the extracted image on disk.
+    /// Path to the extracted image on disk, or `None` for a vector figure
+    /// (a caption matched to a cluster of vector-graphic paths rather than a
+    /// raster image — no file was extracted).
     #[getter]
-    fn image_path(&self) -> String {
-        self.inner.image.path.display().to_string()
+    fn image_path(&self) -> Option<String> {
+        self.inner
+            .image
+            .path
+            .as_ref()
+            .map(|p| p.display().to_string())
     }
 
     /// Page where this figure appears (0-based).

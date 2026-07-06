@@ -982,7 +982,7 @@ fn cmd_json(args: &JsonArgs) {
 struct ChunkFigureView {
     figure_id: String,
     caption: String,
-    image_path: String,
+    image_path: Option<String>,
     page: u32,
 }
 
@@ -1057,13 +1057,9 @@ fn table_view(table: &TableInfo) -> ChunkTableView {
 /// Reduce a figure's image reference to its filename, never the raw on-disk
 /// path (which may be absolute) — same fallback as `render_core::write_figure`
 /// and `output::content_ir::project_figure` when the path has no file name
-/// component.
-fn figure_image_filename(fig: &FigureInfo) -> String {
-    fig.image
-        .path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| fig.image.path.display().to_string())
+/// component. `None` for a vector figure (no raster image was extracted).
+fn figure_image_filename(fig: &FigureInfo) -> Option<String> {
+    fig.image.filename()
 }
 
 /// Flatten whichever `TableRepresentation` tier a table resolved to into a

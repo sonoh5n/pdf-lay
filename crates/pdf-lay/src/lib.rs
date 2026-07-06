@@ -38,6 +38,7 @@ pub use pdf_lay_core::{
     HeuristicTokenizer,
     ImageFormat,
     ImageInfo,
+    ImageOutputFormat,
     InsertionPoint,
     LlmTextConfig,
     // Selector types

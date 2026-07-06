@@ -98,7 +98,12 @@ impl ImageMatcher {
         images
             .iter()
             .enumerate()
-            .filter(|(idx, img)| img.page == caption.page && !used.contains(idx))
+            // `bbox_known == false` means pdf_oxide reported no usable
+            // position for this image (P4-3): matching it anyway would risk
+            // pairing a caption with the wrong image based on a fabricated
+            // bbox, so it is excluded here (a `PdfLayWarning::ImageBboxUnknown`
+            // is emitted where the image was extracted instead).
+            .filter(|(idx, img)| img.page == caption.page && !used.contains(idx) && img.bbox_known)
             .filter_map(|(idx, img)| {
                 let v_dist = self.vertical_distance(caption, img);
                 if v_dist > self.max_gap_pt {
@@ -197,13 +202,14 @@ mod tests {
     fn make_image(page: u32, top: f64, bottom: f64, left: f64, right: f64) -> ImageInfo {
         let bbox = Rect::new(left, top, right, bottom);
         ImageInfo {
-            path: PathBuf::from("p000_img000.png"),
+            path: Some(PathBuf::from("p000_img000.png")),
             page,
             raw_bbox: bbox.clone(),
             normalized_bbox: bbox,
             width_px: 300,
             height_px: 200,
             format: ImageFormat::Png,
+            bbox_known: true,
         }
     }
 
@@ -303,6 +309,19 @@ mod tests {
         let figures = matcher.match_all(&captions, &images, &[]);
         // At most one figure should be produced (the image can only be used once).
         assert!(figures.len() <= 1);
+    }
+
+    #[test]
+    fn image_with_unknown_bbox_is_not_matched() {
+        // P4-3: an image whose bbox pdf_oxide could not determine
+        // (`bbox_known == false`) must never be matched to a caption — doing
+        // so would fabricate a position from a placeholder rect.
+        let matcher = ImageMatcher::new();
+        let caption = make_caption(0, 0, 200.0);
+        let mut image = make_image(0, 220.0, 210.0, 72.0, 540.0);
+        image.bbox_known = false;
+        let figures = matcher.match_all(&[caption], &[image], &[]);
+        assert!(figures.is_empty());
     }
 
     #[test]

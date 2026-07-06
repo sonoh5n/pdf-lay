@@ -228,6 +228,115 @@ impl PdfReader {
     pub(super) fn inner_doc(&mut self) -> &mut PdfDocument {
         &mut self.inner
     }
+
+    /// Scan a page's `/Resources /XObject` dictionary directly (not the
+    /// content stream) for Image XObject features that `pdf_oxide::extract_images`
+    /// does not surface on its own.
+    ///
+    /// `pdf_oxide::PdfDocument::extract_images` silently omits any image it
+    /// fails to decode from its `Ok(Vec<PdfImage>)` result — an XObject whose
+    /// `/Filter` it cannot decode (e.g. `JPXDecode`, which pdf_oxide 0.3.8 has
+    /// no decoder for — see `docs/refactor/phase4_findings.md` P4-1) never
+    /// appears as an `Err`, it just vanishes with no signal at all. Likewise,
+    /// `PdfImage` never exposes whether the image had an `/SMask` (pdf_oxide
+    /// does not apply the soft mask, so a transparent image may render with a
+    /// solid background — again with no indication in the returned
+    /// `PdfImage`). This method reads the dictionary itself (the same
+    /// non-rendering dictionary-walk pattern as [`Self::page_media_box`]) so
+    /// `ImageExtractor` can at least warn when either gap is present on a
+    /// page, even though it cannot recover the specific lost image.
+    ///
+    /// Best-effort: only inspects Image XObjects referenced directly from the
+    /// page's own `/Resources` dictionary. Does not recurse into Form
+    /// XObjects or parse inline images (`BI`/`ID`/`EI`) in the content
+    /// stream — see `phase4_findings.md` P4-3 for what was and was not
+    /// verified. Returns all-`false` hints (rather than an error) when the
+    /// page/resources/XObject dictionary cannot be read, since this is a
+    /// best-effort diagnostic, not a required extraction step.
+    pub(super) fn image_xobject_hints(&mut self, page: u32) -> ImageXObjectHints {
+        let mut hints = ImageXObjectHints::default();
+
+        let Ok(page_obj) = self.inner.get_page_for_debug(page as usize) else {
+            return hints;
+        };
+        let Some(page_dict) = page_obj.as_dict() else {
+            return hints;
+        };
+        let Some(resources) = Self::resolve_dict_entry(&mut self.inner, page_dict, "Resources")
+        else {
+            return hints;
+        };
+        let Some(res_dict) = resources.as_dict() else {
+            return hints;
+        };
+        let Some(xobjects) = Self::resolve_dict_entry(&mut self.inner, res_dict, "XObject") else {
+            return hints;
+        };
+        let Some(xobj_dict) = xobjects.as_dict() else {
+            return hints;
+        };
+
+        for entry in xobj_dict.values() {
+            let resolved = if let Some(r) = entry.as_reference() {
+                match self.inner.load_object(r) {
+                    Ok(o) => o,
+                    Err(_) => continue,
+                }
+            } else {
+                entry.clone()
+            };
+            let Some(dict) = resolved.as_dict() else {
+                continue;
+            };
+            if dict.get("Subtype").and_then(|o| o.as_name()) != Some("Image") {
+                continue;
+            }
+            if dict.contains_key("SMask") {
+                hints.has_smask = true;
+            }
+            if let Some(filter) = dict.get("Filter") {
+                let is_jpx = filter.as_name() == Some("JPXDecode")
+                    || filter
+                        .as_array()
+                        .map(|arr| arr.iter().any(|o| o.as_name() == Some("JPXDecode")))
+                        .unwrap_or(false);
+                if is_jpx {
+                    hints.has_unsupported_filter = true;
+                }
+            }
+        }
+
+        hints
+    }
+
+    /// Resolve a dictionary entry that may be a direct object or an indirect
+    /// reference, returning the loaded `Object` in either case.
+    fn resolve_dict_entry(
+        inner: &mut PdfDocument,
+        dict: &std::collections::HashMap<String, Object>,
+        key: &str,
+    ) -> Option<Object> {
+        let entry = dict.get(key)?;
+        if let Some(r) = entry.as_reference() {
+            inner.load_object(r).ok()
+        } else {
+            Some(entry.clone())
+        }
+    }
+}
+
+/// Hints about a page's Image XObjects gathered by [`PdfReader::image_xobject_hints`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ImageXObjectHints {
+    /// At least one Image XObject on the page has an `/SMask` entry.
+    /// pdf_oxide does not apply soft masks, so the extracted raster may be
+    /// missing the intended transparency/alpha.
+    pub(super) has_smask: bool,
+    /// At least one Image XObject on the page uses a `/Filter` pdf_oxide
+    /// cannot decode (currently: `JPXDecode`/JPEG2000). That image is silently
+    /// absent from `extract_images`'s result — this is the only way pdf-lay
+    /// can detect that a page had an image it lost.
+    pub(super) has_unsupported_filter: bool,
 }
 
 // ---- Private conversion helpers ------------------------------------------------
@@ -1025,5 +1134,325 @@ mod tests {
              the coordinate-frame mismatch",
             spans[0].bbox.top
         );
+    }
+
+    // ---- P4-3 investigation: synthetic-PDF observation of pdf_oxide 0.3.8's
+    // inline-image / Form-XObject / SMask / JPX handling ----
+    //
+    // See docs/refactor/phase4_findings.md's "P4-3" section for the write-up
+    // these tests support. Builds on the same `TestPdfBuilder` used by P4-1.
+
+    /// A page with a single Image XObject (drawn via `Do`) whose stream has
+    /// `/Filter /DCTDecode`. `DctDecoder` (pdf_oxide `src/decoders/dct.rs`) is
+    /// a pure byte passthrough — it does not validate JPEG magic bytes — so
+    /// arbitrary bytes are sufficient to observe that pdf_oxide tags the
+    /// resulting `PdfImage` as `ImageData::Jpeg` end-to-end through a real PDF
+    /// (not just via a hand-built `PdfImage`, which `image_extractor.rs`'s own
+    /// unit tests already cover for the save/format-selection logic).
+    fn build_dct_image_pdf() -> Vec<u8> {
+        let mut b = TestPdfBuilder::new();
+        let catalog = b.add_obj(b"<< /Type /Catalog /Pages 2 0 R >>");
+        assert_eq!(catalog, 1);
+        b.add_obj(b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.add_obj(
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.add_stream_obj("", b"q 100 0 0 100 50 50 cm /Im0 Do Q");
+        // Not a real decodable JPEG — DctDecoder passes bytes through
+        // unchanged, and this test only checks that pdf_oxide *tags* the
+        // image as `ImageData::Jpeg`, not that it can be decoded/rendered.
+        let dummy_jpeg = b"not-a-real-jpeg-but-DCTDecode-is-a-byte-passthrough";
+        b.add_stream_obj(
+            "/Type /XObject /Subtype /Image /Width 4 /Height 4 \
+             /BitsPerComponent 8 /ColorSpace /DeviceRGB /Filter /DCTDecode",
+            dummy_jpeg,
+        );
+        b.finish(1)
+    }
+
+    #[test]
+    fn dct_filtered_xobject_image_is_tagged_as_jpeg_source() {
+        let pdf = build_dct_image_pdf();
+        let mut reader = PdfReader::from_bytes(&pdf).expect("DCT PDF should open");
+        let images = reader
+            .inner_doc()
+            .extract_images(0)
+            .expect("extract_images should succeed");
+        assert_eq!(images.len(), 1);
+        assert!(
+            matches!(images[0].data(), pdf_oxide::extractors::ImageData::Jpeg(_)),
+            "an Image XObject with /Filter /DCTDecode must be tagged ImageData::Jpeg"
+        );
+    }
+
+    #[test]
+    fn dct_filtered_xobject_image_saves_as_jpg_through_image_extractor() {
+        // End-to-end: pdf-lay's own `ImageExtractor` (not just raw pdf_oxide)
+        // must save this as `.jpg` losslessly (no re-encode), per P4-3's
+        // format-honoring behavior.
+        use crate::extract::ImageExtractor;
+        let pdf = build_dct_image_pdf();
+        let mut reader = PdfReader::from_bytes(&pdf).expect("DCT PDF should open");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let extractor = ImageExtractor::new(tmp.path().to_path_buf());
+        let (images, warnings) = extractor
+            .extract_all(&mut reader)
+            .expect("extraction should succeed");
+        assert_eq!(images.len(), 1);
+        assert!(matches!(images[0].format, crate::types::ImageFormat::Jpeg));
+        let path = images[0].path.as_ref().unwrap();
+        assert_eq!(path.extension().unwrap(), "jpg");
+        assert!(warnings.is_empty(), "a clean DCT image should not warn");
+    }
+
+    /// 2x2 DeviceGray inline image (unfiltered, raw pixel bytes), in the
+    /// dictionary shape the PDF spec actually requires: no `/Subtype` key
+    /// inside the `BI`/`ID` dictionary (ISO 32000-1:2008 §8.9.7 — the
+    /// abbreviated keys are `W`/`H`/`CS`/`BPC`/…; `Subtype` is XObject
+    /// vocabulary, not inline-image vocabulary, and the `BI` operator itself
+    /// already says "this is an image"). Real PDF producers do not emit
+    /// `/Subtype` here.
+    fn build_spec_conformant_inline_image_pdf() -> Vec<u8> {
+        let mut b = TestPdfBuilder::new();
+        let catalog = b.add_obj(b"<< /Type /Catalog /Pages 2 0 R >>");
+        assert_eq!(catalog, 1);
+        b.add_obj(b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.add_obj(b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << >> /Contents 4 0 R >>");
+        let content =
+            b"q 100 0 0 100 50 50 cm BI /W 2 /H 2 /CS /DeviceGray /BPC 8 ID \xFF\x00\xFF\x00 EI Q";
+        b.add_stream_obj("", content);
+        b.finish(1)
+    }
+
+    /// Same image, but with a non-conformant `/Subtype /Image` key added
+    /// inside the `BI` dictionary (real producers do not write this, but the
+    /// PDF spec does not forbid extra keys either).
+    fn build_inline_image_pdf_with_redundant_subtype() -> Vec<u8> {
+        let mut b = TestPdfBuilder::new();
+        let catalog = b.add_obj(b"<< /Type /Catalog /Pages 2 0 R >>");
+        assert_eq!(catalog, 1);
+        b.add_obj(b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.add_obj(b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << >> /Contents 4 0 R >>");
+        let content = b"q 100 0 0 100 50 50 cm BI /Subtype /Image /W 2 /H 2 /CS /DeviceGray /BPC 8 ID \xFF\x00\xFF\x00 EI Q";
+        b.add_stream_obj("", content);
+        b.finish(1)
+    }
+
+    #[test]
+    fn spec_conformant_inline_image_is_silently_not_extracted() {
+        // KEY P4-3 FINDING (see docs/refactor/phase4_findings.md): pdf_oxide
+        // 0.3.8's `extract_image_from_inline` (`document.rs:5791`) reuses
+        // `extract_image_from_xobject`, which unconditionally requires a
+        // `/Subtype /Image` key (`extractors/images.rs` — "XObject missing
+        // /Subtype" otherwise). Inline image dictionaries never carry
+        // `/Subtype` in spec-conformant PDFs (confirmed by hand — see the
+        // sibling test below, which adds a non-conformant `/Subtype /Image`
+        // key and DOES get an image back). The failure inside
+        // `extract_image_from_inline` is swallowed by `extract_images`'s
+        // `if let Ok(image) = ... { images.push(image) }` (document.rs:5527),
+        // so a page with a perfectly ordinary inline image silently yields
+        // zero images for it — no error, no warning, indistinguishable from a
+        // page with no inline image at all. P4-1's source-reading claim
+        // ("inline images: 対応") is true only in the narrow, non-standard
+        // case; it does not hold for real-world inline images. Deferred (per
+        // the design's explicit "do not hand-roll a content-stream image
+        // parser" instruction) rather than worked around here.
+        let pdf = build_spec_conformant_inline_image_pdf();
+        let mut reader = PdfReader::from_bytes(&pdf).expect("inline-image PDF should open");
+        let images = reader
+            .inner_doc()
+            .extract_images(0)
+            .expect("extract_images must not error even though the inline image is lost");
+        assert!(
+            images.is_empty(),
+            "a spec-conformant inline image (no /Subtype key) is currently NOT extracted by \
+             pdf_oxide 0.3.8 — see the finding note above; if this starts passing, pdf_oxide has \
+             fixed the gap and P4-3's inline-image deferral should be revisited"
+        );
+    }
+
+    #[test]
+    fn inline_image_is_extracted_only_with_a_non_conformant_subtype_key() {
+        // Companion to the finding above: isolates exactly what makes
+        // `extract_image_from_inline` succeed (a redundant `/Subtype /Image`
+        // key no real producer writes), so the gap is pinned down precisely
+        // rather than asserted as "inline images don't work at all".
+        let pdf = build_inline_image_pdf_with_redundant_subtype();
+        let mut reader = PdfReader::from_bytes(&pdf).expect("inline-image PDF should open");
+        let images = reader
+            .inner_doc()
+            .extract_images(0)
+            .expect("extract_images should succeed");
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].width(), 2);
+        assert_eq!(images[0].height(), 2);
+    }
+
+    /// A page whose content stream draws a Form XObject (`/Fm0 Do`), and the
+    /// Form's *own* `/Resources` contains an Image XObject drawn via its own
+    /// nested `Do` operator — the minimal shape needed to observe whether
+    /// pdf_oxide's image extraction recurses into Form XObjects.
+    fn build_form_xobject_with_image_pdf() -> Vec<u8> {
+        let mut b = TestPdfBuilder::new();
+        let catalog = b.add_obj(b"<< /Type /Catalog /Pages 2 0 R >>");
+        assert_eq!(catalog, 1);
+        b.add_obj(b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.add_obj(
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Resources << /XObject << /Fm0 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.add_stream_obj("", b"q 1 0 0 1 0 0 cm /Fm0 Do Q");
+        // Form XObject: its content stream draws Im0 (object 6), declared in
+        // the Form's *own* /Resources (not the page's).
+        b.add_stream_obj(
+            "/Type /XObject /Subtype /Form /BBox [0 0 200 200] \
+             /Resources << /XObject << /Im0 6 0 R >> >>",
+            b"q 100 0 0 100 10 10 cm /Im0 Do Q",
+        );
+        let img_data = [0xFFu8, 0x00, 0xFF, 0x00];
+        b.add_stream_obj(
+            "/Type /XObject /Subtype /Image /Width 2 /Height 2 \
+             /BitsPerComponent 8 /ColorSpace /DeviceGray",
+            &img_data,
+        );
+        b.finish(1)
+    }
+
+    #[test]
+    fn image_inside_form_xobject_is_extracted_recursively_by_pdf_oxide() {
+        // P4-3 kickoff verification (per phase4_findings.md P4-1 §6 "条件付き
+        // GO"): confirms pdf_oxide 0.3.8 actually recurses into a Form
+        // XObject and finds the image nested in the *Form's own* /Resources
+        // (P4-1 only verified this by reading the `document.rs` source, not
+        // by running a synthetic PDF through it).
+        let pdf = build_form_xobject_with_image_pdf();
+        let mut reader = PdfReader::from_bytes(&pdf).expect("Form XObject PDF should open");
+        let images = reader
+            .inner_doc()
+            .extract_images(0)
+            .expect("extract_images should succeed");
+        assert_eq!(
+            images.len(),
+            1,
+            "an image nested inside a Form XObject's own /Resources should be found"
+        );
+    }
+
+    /// An Image XObject with `/SMask 6 0 R` pointing to a second (grayscale)
+    /// Image XObject used as its soft mask.
+    fn build_image_with_smask_pdf() -> Vec<u8> {
+        let mut b = TestPdfBuilder::new();
+        let catalog = b.add_obj(b"<< /Type /Catalog /Pages 2 0 R >>");
+        assert_eq!(catalog, 1);
+        b.add_obj(b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.add_obj(
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.add_stream_obj("", b"q 100 0 0 100 50 50 cm /Im0 Do Q");
+        let img_data = [
+            0x10u8, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0xA0, 0xB0, 0xC0,
+        ];
+        b.add_stream_obj(
+            "/Type /XObject /Subtype /Image /Width 2 /Height 2 \
+             /BitsPerComponent 8 /ColorSpace /DeviceRGB /SMask 6 0 R",
+            &img_data,
+        );
+        let mask_data = [0xFFu8, 0x80, 0x40, 0x00];
+        b.add_stream_obj(
+            "/Type /XObject /Subtype /Image /Width 2 /Height 2 \
+             /BitsPerComponent 8 /ColorSpace /DeviceGray",
+            &mask_data,
+        );
+        b.finish(1)
+    }
+
+    #[test]
+    fn image_xobject_hints_detects_smask() {
+        // P4-1 established (by reading source) that pdf_oxide never applies
+        // or surfaces `/SMask` on the returned `PdfImage`. This confirms, via
+        // a synthetic PDF, that `image_xobject_hints` (the dictionary-level
+        // workaround added in P4-3) detects its *presence* even though
+        // pdf_oxide's own `PdfImage` says nothing about it.
+        let pdf = build_image_with_smask_pdf();
+        let mut reader = PdfReader::from_bytes(&pdf).expect("SMask PDF should open");
+
+        // Confirm the base image itself still extracts fine (SMask presence
+        // does not break extraction, it is just silently unapplied).
+        let images = reader
+            .inner_doc()
+            .extract_images(0)
+            .expect("extract_images should succeed");
+        assert_eq!(images.len(), 1);
+
+        let hints = reader.image_xobject_hints(0);
+        assert!(hints.has_smask, "the SMask entry must be detected");
+        assert!(!hints.has_unsupported_filter);
+    }
+
+    /// An Image XObject whose sole filter is `/JPXDecode` (JPEG2000), which
+    /// pdf_oxide 0.3.8 has no decoder for (confirmed by P4-1: no `jpx`/
+    /// `jpeg2000` module under `src/decoders/`).
+    fn build_jpx_image_pdf() -> Vec<u8> {
+        let mut b = TestPdfBuilder::new();
+        let catalog = b.add_obj(b"<< /Type /Catalog /Pages 2 0 R >>");
+        assert_eq!(catalog, 1);
+        b.add_obj(b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.add_obj(
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.add_stream_obj("", b"q 100 0 0 100 50 50 cm /Im0 Do Q");
+        // Not real JPEG2000 codestream data — only the /Filter tag matters
+        // for this test (pdf_oxide has no JPX decoder to invoke regardless).
+        let jpx_data = b"not-a-real-jpx-codestream";
+        b.add_stream_obj(
+            "/Type /XObject /Subtype /Image /Width 4 /Height 4 \
+             /BitsPerComponent 8 /ColorSpace /DeviceRGB /Filter /JPXDecode",
+            jpx_data,
+        );
+        b.finish(1)
+    }
+
+    #[test]
+    fn jpx_filtered_image_is_silently_absent_from_extract_images_with_no_error() {
+        // KEY P4-3 FINDING: pdf_oxide's `extract_images` does not return an
+        // `Err` for a page containing an undecodable image — the image is
+        // just missing from the `Ok(Vec<PdfImage>)`, indistinguishable from a
+        // page that legitimately has zero images. This is *why*
+        // `image_xobject_hints` has to read the Resources/XObject dictionary
+        // itself instead of reacting to an error from `extract_images`.
+        let pdf = build_jpx_image_pdf();
+        let mut reader = PdfReader::from_bytes(&pdf).expect("JPX PDF should open");
+        let images = reader
+            .inner_doc()
+            .extract_images(0)
+            .expect("extract_images must not error even though the image is undecodable");
+        assert!(
+            images.is_empty(),
+            "the JPX-filtered image must be silently absent, not present or an Err"
+        );
+    }
+
+    #[test]
+    fn image_xobject_hints_detects_unsupported_jpx_filter() {
+        let pdf = build_jpx_image_pdf();
+        let mut reader = PdfReader::from_bytes(&pdf).expect("JPX PDF should open");
+        let hints = reader.image_xobject_hints(0);
+        assert!(
+            hints.has_unsupported_filter,
+            "a /Filter /JPXDecode Image XObject must be flagged as unsupported"
+        );
+        assert!(!hints.has_smask);
+    }
+
+    #[test]
+    fn image_xobject_hints_is_all_false_for_a_plain_image() {
+        let pdf = build_image_only_pdf();
+        let mut reader = PdfReader::from_bytes(&pdf).expect("plain image PDF should open");
+        let hints = reader.image_xobject_hints(0);
+        assert!(!hints.has_smask);
+        assert!(!hints.has_unsupported_filter);
     }
 }

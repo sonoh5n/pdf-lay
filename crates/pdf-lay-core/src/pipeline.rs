@@ -7,7 +7,7 @@ use crate::{
     config::Config,
     error::{AnalysisResult, PdfLayError, PdfLayWarning},
     extract::{CoordinateNormalizer, ImageExtractor, PdfReader, SpanBuilder},
-    figure::{CaptionDetector, CaptionInfo, CaptionType, ImageMatcher},
+    figure::{CaptionDetector, CaptionInfo, CaptionType, ImageMatcher, VectorFigureClusterer},
     layout::{ColumnDetector, LineReconstructor},
     structure::{BlockClassifier, BlockGrouper, HeaderDetector, MetadataExtractor, SectionBuilder},
     table::{GridBuilder, TableDetector, TableRegion, TableTextConverter},
@@ -108,9 +108,14 @@ pub fn analyze_pdf(path: &Path, config: &Config) -> Result<AnalysisResult, PdfLa
     // Extract images (optional).
     let mut images = Vec::new();
     if config.extract_images {
-        let extractor = ImageExtractor::new(config.image_output_dir.clone());
+        let extractor = ImageExtractor::new(config.image_output_dir.clone())
+            .with_image_format(config.image_format.clone())
+            .with_force_png(config.force_png);
         match extractor.extract_all(&mut reader) {
-            Ok(imgs) => images = imgs,
+            Ok((imgs, image_warnings)) => {
+                images = imgs;
+                warnings.extend(image_warnings);
+            }
             Err(e) => {
                 warnings.push(PdfLayWarning::PageSkipped {
                     page: 0,
@@ -207,9 +212,44 @@ pub fn analyze_pdf(path: &Path, config: &Config) -> Result<AnalysisResult, PdfLa
     let captions = caption_detector.detect(&blocks);
 
     let image_matcher = ImageMatcher::new().with_max_gap(config.caption_max_gap_pt);
-    let figures = image_matcher.match_all(&captions, &images, &blocks);
+    let mut figures = image_matcher.match_all(&captions, &images, &blocks);
 
-    // Warn about unmatched figure captions.
+    // Path objects (vector graphics) feed both table rule detection (below)
+    // and vector-figure clustering (immediately below) — extract once and
+    // share, rather than parsing the page content streams twice.
+    let paths = if config.detect_tables || config.figure_vector.enabled {
+        reader.extract_all_paths()?
+    } else {
+        Vec::new()
+    };
+
+    // Vector figures (P4-3): a caption not matched to any raster image may
+    // still be matched to a nearby spatial cluster of vector-graphic paths
+    // (line art/diagrams drawn with path operators, not embedded as an Image
+    // XObject), so it is recorded as a figure with a region bbox instead of
+    // silently becoming an `UnmatchedCaption`.
+    if config.figure_vector.enabled {
+        let matched_so_far: std::collections::HashSet<String> =
+            figures.iter().map(|f| f.caption_text.clone()).collect();
+        let unmatched_image_captions: Vec<&CaptionInfo> = captions
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c.caption_type,
+                    CaptionType::Figure | CaptionType::Scheme | CaptionType::Chart
+                ) && !matched_so_far.contains(&c.full_text)
+            })
+            .collect();
+        let clusterer = VectorFigureClusterer::new(
+            config.figure_vector.cluster_gap_pt,
+            config.figure_vector.min_paths,
+            config.caption_max_gap_pt,
+        );
+        figures.extend(clusterer.match_captions(&unmatched_image_captions, &paths, &blocks));
+    }
+
+    // Warn about unmatched figure captions (still unmatched after both
+    // raster image matching and vector-figure clustering).
     let matched_caption_texts: std::collections::HashSet<String> =
         figures.iter().map(|f| f.caption_text.clone()).collect();
 
@@ -228,7 +268,6 @@ pub fn analyze_pdf(path: &Path, config: &Config) -> Result<AnalysisResult, PdfLa
     // Must happen before Section Assembly because SectionBuilder::build consumes `blocks`.
 
     let tables = if config.detect_tables {
-        let paths = reader.extract_all_paths()?;
         let table_detector = TableDetector::new(config.table_config.clone());
         let table_captions: Vec<&CaptionInfo> = captions
             .iter()
@@ -586,13 +625,14 @@ mod tests {
             figure_number: Some(1),
             caption_text: "Fig. 1: X".to_string(), // 9 chars
             image: ImageInfo {
-                path: std::path::PathBuf::from("images/p000_img000.png"),
+                path: Some(std::path::PathBuf::from("images/p000_img000.png")),
                 page: 0,
                 raw_bbox: Rect::new(0.0, 0.0, 0.0, 0.0),
                 normalized_bbox: Rect::new(0.0, 0.0, 0.0, 0.0),
                 width_px: 1,
                 height_px: 1,
                 format: ImageFormat::Png,
+                bbox_known: true,
             },
             context_text: String::new(),
             insertion_point: InsertionPoint {

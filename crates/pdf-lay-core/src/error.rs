@@ -125,6 +125,30 @@ pub enum PdfLayWarning {
         /// The regex compiler's error message.
         reason: String,
     },
+    /// An Image XObject had an `/SMask` (soft mask / alpha) entry that
+    /// pdf_oxide does not apply when decoding the image. The extracted raster
+    /// may be missing transparency it had in the original PDF (e.g. a
+    /// checkerboard or colored background where the source was transparent).
+    ImageSMaskIgnored {
+        /// Zero-based page index.
+        page: u32,
+    },
+    /// An image's bounding box could not be determined (pdf_oxide reported no
+    /// bbox, or reported a degenerate one with zero width/height). The image
+    /// is still extracted and saved, but is excluded from caption matching
+    /// (a fabricated position would risk pairing it with the wrong caption).
+    ImageBboxUnknown {
+        /// Zero-based page index.
+        page: u32,
+    },
+    /// An image on the page could not be decoded or saved. Only that image
+    /// is skipped; the rest of the page's images are still extracted.
+    ImageDecodeFailed {
+        /// Zero-based page index.
+        page: u32,
+        /// Human-readable description of why the image was skipped.
+        reason: String,
+    },
 }
 
 /// The kind of section-numbering anomaly detected during hierarchy validation.
@@ -189,6 +213,15 @@ impl std::fmt::Display for PdfLayWarning {
             }
             Self::InvalidCaptionPattern { pattern, reason } => {
                 write!(f, "invalid caption pattern {pattern:?} ignored: {reason}")
+            }
+            Self::ImageSMaskIgnored { page } => {
+                write!(f, "image on page {page} has an ignored SMask (soft mask)")
+            }
+            Self::ImageBboxUnknown { page } => {
+                write!(f, "image on page {page} has an unknown bounding box")
+            }
+            Self::ImageDecodeFailed { page, reason } => {
+                write!(f, "image on page {page} failed to decode/save: {reason}")
             }
         }
     }

@@ -7,22 +7,44 @@ use serde::{Deserialize, Serialize};
 use super::geometry::Rect;
 
 /// A single image extracted from the PDF.
+///
+/// `path` is `None` for a **vector figure**: a caption matched to a spatial
+/// cluster of vector-graphic paths (see [`crate::figure::VectorFigureClusterer`])
+/// rather than to a raster image, so there is no file on disk to point to.
+/// `raw_bbox`/`normalized_bbox` are still populated in that case (the
+/// clustered path region), and `format` is `ImageFormat::Other("vector")`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageInfo {
-    /// Path where the image was saved on disk.
-    pub path: PathBuf,
+    /// Path where the image was saved on disk, or `None` for a vector figure
+    /// (no raster file was extracted — see the struct docs).
+    pub path: Option<PathBuf>,
     /// Zero-based page index where the image appears.
     pub page: u32,
     /// Bounding box as returned by pdf_oxide (may be in a different scale).
     pub raw_bbox: Rect,
     /// Bounding box normalized to the same coordinate space as text spans.
     pub normalized_bbox: Rect,
-    /// Image width in pixels.
+    /// Image width in pixels. `0` for a vector figure (not applicable).
     pub width_px: u32,
-    /// Image height in pixels.
+    /// Image height in pixels. `0` for a vector figure (not applicable).
     pub height_px: u32,
     /// File format of the saved image.
     pub format: ImageFormat,
+    /// Whether `raw_bbox`/`normalized_bbox` reflect a real position read from
+    /// the PDF. `false` when pdf_oxide reported no bbox or a degenerate one
+    /// (zero width/height) — in that case the bbox fields hold a harmless
+    /// zero-size placeholder that callers must not treat as a real position
+    /// (e.g. [`crate::figure::ImageMatcher`] excludes such images from
+    /// caption matching and a `PdfLayWarning::ImageBboxUnknown` is emitted).
+    /// Defaults to `true` on deserialization of older data (no bbox
+    /// degradation is assumed for data written before this field existed).
+    #[serde(default = "default_bbox_known")]
+    pub bbox_known: bool,
+}
+
+/// Default value for [`ImageInfo::bbox_known`] (backward-compat deserialization).
+fn default_bbox_known() -> bool {
+    true
 }
 
 /// Supported image formats for extracted images.
@@ -156,6 +178,22 @@ pub struct PaperDocument {
     pub all_figures: Vec<FigureInfo>,
     /// All tables (flat list).
     pub all_tables: Vec<TableInfo>,
+}
+
+impl ImageInfo {
+    /// Filename component of `path`, or `None` for a vector figure with no
+    /// extracted raster image.
+    ///
+    /// Never returns the raw (possibly absolute) on-disk path when a file
+    /// name component can be extracted — callers must not leak filesystem
+    /// layout into user-facing output (Markdown links, LLM text, JSON).
+    pub fn filename(&self) -> Option<String> {
+        self.path.as_ref().map(|p| {
+            p.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| p.display().to_string())
+        })
+    }
 }
 
 impl FigureInfo {

@@ -284,17 +284,25 @@ pub(crate) fn render_section_content(section: &Section, opts: &RenderOptions) ->
 
 /// Render a figure placeholder/link per `opts.figure_format`, using
 /// `opts.image_base` + the image filename (never the raw on-disk path).
+///
+/// A vector figure (`fig.image.path.is_none()` — a caption matched to a
+/// cluster of vector-graphic paths rather than a raster image, see
+/// [`crate::figure::VectorFigureClusterer`]) has no file to link to. Rather
+/// than fabricate a path, every format except `Omit` falls back to stating
+/// plainly that no image was extracted (No Silent Drop: the figure is still
+/// reported, just honestly).
 fn write_figure(out: &mut String, fig: &FigureInfo, opts: &RenderOptions) {
     if matches!(opts.figure_format, FigureTextFormat::Omit) {
         return;
     }
 
-    let filename = fig
-        .image
-        .path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| fig.image.path.display().to_string());
+    let Some(filename) = fig.image.filename() else {
+        out.push_str(&format!(
+            "[{} (vector figure, no extracted image): {}]\n\n",
+            fig.figure_id, fig.caption_text
+        ));
+        return;
+    };
     let path = if opts.image_base.is_empty() {
         filename
     } else {
@@ -459,13 +467,14 @@ mod tests {
                 figure_number: Some(1),
                 caption_text: "Fig. 1: X.".to_string(),
                 image: ImageInfo {
-                    path: PathBuf::from("images/p000_img000.png"),
+                    path: Some(PathBuf::from("images/p000_img000.png")),
                     page: 0,
                     raw_bbox: Rect::new(0.0, 0.0, 0.0, 0.0),
                     normalized_bbox: Rect::new(0.0, 0.0, 0.0, 0.0),
                     width_px: 10,
                     height_px: 10,
                     format: ImageFormat::Png,
+                    bbox_known: true,
                 },
                 context_text: String::new(),
                 insertion_point: InsertionPoint {

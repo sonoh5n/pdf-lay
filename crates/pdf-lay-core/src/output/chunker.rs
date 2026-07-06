@@ -1156,13 +1156,14 @@ mod tests {
             figure_number: Some(1),
             caption_text: "Fig. 1: A diagram.".to_string(),
             image: ImageInfo {
-                path: PathBuf::from("images/p000_img000.png"),
+                path: Some(PathBuf::from("images/p000_img000.png")),
                 page: 0,
                 raw_bbox: Rect::new(0.0, 0.0, 0.0, 0.0),
                 normalized_bbox: Rect::new(0.0, 0.0, 0.0, 0.0),
                 width_px: 10,
                 height_px: 10,
                 format: ImageFormat::Png,
+                bbox_known: true,
             },
             context_text: String::new(),
             insertion_point: InsertionPoint {
@@ -1358,13 +1359,14 @@ mod tests {
             figure_number: Some(1),
             caption_text: format!("{id}: A diagram."),
             image: ImageInfo {
-                path: PathBuf::from(format!("images/{id}.png")),
+                path: Some(PathBuf::from(format!("images/{id}.png"))),
                 page: 0,
                 raw_bbox: Rect::new(0.0, 0.0, 0.0, 0.0),
                 normalized_bbox: Rect::new(0.0, 0.0, 0.0, 0.0),
                 width_px: 10,
                 height_px: 10,
                 format: ImageFormat::Png,
+                bbox_known: true,
             },
             context_text: String::new(),
             insertion_point: InsertionPoint {

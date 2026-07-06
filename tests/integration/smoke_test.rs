@@ -576,7 +576,7 @@ fn figure_info_caption_description() {
         figure_number: Some(1),
         caption_text: "Fig. 1: A schematic of the system architecture.".to_string(),
         image: ImageInfo {
-            path: PathBuf::from("images/fig1.png"),
+            path: Some(PathBuf::from("images/fig1.png")),
             page: 0,
             // Rect::new(left, top, right, bottom) with top >= bottom (Y-up coordinates).
             raw_bbox: Rect::new(0.0, 100.0, 200.0, 0.0),
@@ -584,6 +584,7 @@ fn figure_info_caption_description() {
             width_px: 400,
             height_px: 300,
             format: ImageFormat::Png,
+            bbox_known: true,
         },
         context_text: "See figure 1 for details.".to_string(),
         insertion_point: InsertionPoint {

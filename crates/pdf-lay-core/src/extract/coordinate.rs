@@ -42,13 +42,17 @@ impl CoordinateNormalizer {
         _text_lines: &[TextLine],
         page_dims: &PageDimensions,
     ) -> (Self, Option<PdfLayWarning>) {
-        if images.is_empty() {
+        // Images with an unknown bbox (P4-3: pdf_oxide reported none, or a
+        // degenerate one) carry a zero-size placeholder rect that must not
+        // feed into scale estimation — it is not a real measurement.
+        let known_images: Vec<&ImageInfo> = images.iter().filter(|i| i.bbox_known).collect();
+        if known_images.is_empty() {
             return (Self::with_scale(1.0), None);
         }
 
         let page_width = page_dims.width;
 
-        let max_raw_width = images
+        let max_raw_width = known_images
             .iter()
             .map(|img| img.raw_bbox.width())
             .fold(0.0_f64, f64::max);
@@ -111,13 +115,14 @@ mod tests {
 
     fn make_image_with_raw_bbox(raw: Rect) -> ImageInfo {
         ImageInfo {
-            path: PathBuf::from("test.png"),
+            path: Some(PathBuf::from("test.png")),
             page: 0,
             raw_bbox: raw.clone(),
             normalized_bbox: raw,
             width_px: 100,
             height_px: 100,
             format: ImageFormat::Png,
+            bbox_known: true,
         }
     }
 
@@ -160,6 +165,23 @@ mod tests {
         let (norm, warn) = CoordinateNormalizer::estimate(&[], &[], &page);
         assert_eq!(norm.scale_factor, 1.0);
         assert!(warn.is_none(), "No images → no warning expected");
+    }
+
+    #[test]
+    fn unknown_bbox_images_are_ignored_not_treated_as_a_scale_measurement() {
+        // P4-3: an image with `bbox_known == false` carries a zero-size
+        // placeholder rect. If it were treated like real data it would corrupt
+        // (or, worse, spuriously trigger `CoordinateFallback` for) a page
+        // whose only images have an unknown bbox.
+        let mut img = make_image_with_raw_bbox(Rect::new(0.0, 0.0, 0.0, 0.0));
+        img.bbox_known = false;
+        let page = make_page(612.0, 792.0);
+        let (norm, warn) = CoordinateNormalizer::estimate(&[img], &[], &page);
+        assert_eq!(norm.scale_factor, 1.0);
+        assert!(
+            warn.is_none(),
+            "an unknown-bbox-only page must not report a coordinate fallback"
+        );
     }
 
     #[test]

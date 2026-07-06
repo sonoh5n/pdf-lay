@@ -197,26 +197,31 @@ impl MarkdownGenerator {
     }
 
     fn write_figure(&self, md: &mut String, fig: &FigureInfo) {
-        let filename = fig
-            .image
-            .path
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| fig.image.path.display().to_string());
-        // When both the on-disk image directory and the output directory are
-        // known, write the link as a path relative to the output file so it
-        // resolves correctly regardless of where the .md is written. Otherwise
-        // fall back to prefixing image_base_path (the legacy behavior).
-        let path = match (&self.config.image_dir, &self.config.output_dir) {
-            (Some(image_dir), Some(output_dir)) => {
-                relative_image_path(image_dir, output_dir, &filename)
-            }
-            _ if self.config.image_base_path.is_empty() => filename,
-            _ => format!("{}/{}", self.config.image_base_path, filename),
-        };
-
         let safe_id = escape_for_markdown_text(&fig.figure_id);
-        md.push_str(&format!("![{}]({})\n\n", safe_id, path));
+        match fig.image.filename() {
+            Some(filename) => {
+                // When both the on-disk image directory and the output
+                // directory are known, write the link as a path relative to
+                // the output file so it resolves correctly regardless of
+                // where the .md is written. Otherwise fall back to
+                // prefixing image_base_path (the legacy behavior).
+                let path = match (&self.config.image_dir, &self.config.output_dir) {
+                    (Some(image_dir), Some(output_dir)) => {
+                        relative_image_path(image_dir, output_dir, &filename)
+                    }
+                    _ if self.config.image_base_path.is_empty() => filename,
+                    _ => format!("{}/{}", self.config.image_base_path, filename),
+                };
+                md.push_str(&format!("![{}]({})\n\n", safe_id, path));
+            }
+            None => {
+                // Vector figure: no raster image was extracted (caption
+                // matched to a cluster of vector-graphic paths — see
+                // `crate::figure::VectorFigureClusterer`). Never fabricate an
+                // `![]()` link to a nonexistent file; state the gap plainly.
+                md.push_str("*(vector figure — no extracted image)*\n\n");
+            }
+        }
 
         match self.config.figure_caption_style {
             CaptionStyle::Italic => {
@@ -360,13 +365,14 @@ mod tests {
             figure_number: Some(1),
             caption_text: "Fig. 1: A diagram.".to_string(),
             image: ImageInfo {
-                path: PathBuf::from("images/p000_img000.png"),
+                path: Some(PathBuf::from("images/p000_img000.png")),
                 page: 0,
                 raw_bbox: Rect::new(0.0, 0.0, 0.0, 0.0),
                 normalized_bbox: Rect::new(0.0, 0.0, 0.0, 0.0),
                 width_px: 100,
                 height_px: 100,
                 format: ImageFormat::Png,
+                bbox_known: true,
             },
             context_text: String::new(),
             insertion_point: InsertionPoint {
@@ -393,13 +399,14 @@ mod tests {
                 figure_number: Some(1),
                 caption_text: "Fig. 1: X.".to_string(),
                 image: ImageInfo {
-                    path: PathBuf::from("out/images/p000_img000.png"),
+                    path: Some(PathBuf::from("out/images/p000_img000.png")),
                     page: 0,
                     raw_bbox: Rect::new(0.0, 0.0, 0.0, 0.0),
                     normalized_bbox: Rect::new(0.0, 0.0, 0.0, 0.0),
                     width_px: 10,
                     height_px: 10,
                     format: ImageFormat::Png,
+                    bbox_known: true,
                 },
                 context_text: String::new(),
                 insertion_point: InsertionPoint {
@@ -473,13 +480,14 @@ mod tests {
                 figure_number: Some(1),
                 caption_text: "Fig. 1: Cap".to_string(),
                 image: ImageInfo {
-                    path: PathBuf::from("images/p000_img000.png"),
+                    path: Some(PathBuf::from("images/p000_img000.png")),
                     page: 0,
                     raw_bbox: Rect::new(0.0, 0.0, 0.0, 0.0),
                     normalized_bbox: Rect::new(0.0, 0.0, 0.0, 0.0),
                     width_px: 10,
                     height_px: 10,
                     format: ImageFormat::Png,
+                    bbox_known: true,
                 },
                 context_text: String::new(),
                 insertion_point: InsertionPoint {

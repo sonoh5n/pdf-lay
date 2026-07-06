@@ -48,6 +48,18 @@ pub struct Config {
     /// toggles). See [`CaptionConfig`].
     #[serde(default)]
     pub caption: CaptionConfig,
+    /// When `true`, always save extracted images as PNG, re-encoding
+    /// JPEG-source images instead of passing them through losslessly as
+    /// `.jpg`. Default `false` (P4-3: honor the image's real source format).
+    /// Set `true` to restore the pre-P4-3 behavior of always producing PNG
+    /// files.
+    #[serde(default)]
+    pub force_png: bool,
+    /// Configuration for vector-figure detection (P4-3): clustering
+    /// vector-graphic paths near an unmatched Figure/Scheme/Chart caption
+    /// into a figure record when no raster image was extracted.
+    #[serde(default)]
+    pub figure_vector: VectorFigureConfig,
 }
 
 /// Default value for [`Config::caption_max_chars`].
@@ -83,6 +95,63 @@ impl Default for Config {
             running_header_max_chars: default_running_header_max_chars(),
             min_coverage_ratio: default_min_coverage_ratio(),
             caption: CaptionConfig::default(),
+            force_png: false,
+            figure_vector: VectorFigureConfig::default(),
+        }
+    }
+}
+
+/// Configuration for vector-figure detection ([`crate::figure::VectorFigureClusterer`]).
+///
+/// A vector figure (line art / a diagram drawn with PDF path operators
+/// rather than embedded as a raster image) has no image XObject at all, so
+/// [`crate::extract::ImageExtractor`] never sees it. Without this feature its
+/// caption would be reported as `PdfLayWarning::UnmatchedCaption` even though
+/// the figure is visibly present in the PDF. When enabled, captions left
+/// unmatched after raster image matching are matched instead to a nearby
+/// spatial cluster of `PathObject`s (see `extract_all_paths`), recorded as a
+/// `FigureInfo` with a region bounding box but no raster file
+/// (`ImageInfo::path == None`). Rendering the vector graphic itself (as an
+/// image) is out of scope — see `docs/refactor/phase4_extraction.md` P4-3.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VectorFigureConfig {
+    /// Whether to attempt vector-figure clustering at all. Default `true`;
+    /// set `false` to restore the pre-P4-3 behavior (such captions become
+    /// `UnmatchedCaption`).
+    #[serde(default = "default_figure_vector_enabled")]
+    pub enabled: bool,
+    /// Maximum gap (points) between two path bounding boxes for them to be
+    /// merged into the same cluster.
+    #[serde(default = "default_cluster_gap_pt")]
+    pub cluster_gap_pt: f64,
+    /// Minimum number of paths a cluster must contain to be considered a
+    /// candidate vector figure (filters out stray rule/border lines that
+    /// belong to running text or tables, not a diagram).
+    #[serde(default = "default_min_paths")]
+    pub min_paths: usize,
+}
+
+/// Default value for [`VectorFigureConfig::enabled`].
+fn default_figure_vector_enabled() -> bool {
+    true
+}
+
+/// Default value for [`VectorFigureConfig::cluster_gap_pt`].
+fn default_cluster_gap_pt() -> f64 {
+    15.0
+}
+
+/// Default value for [`VectorFigureConfig::min_paths`].
+fn default_min_paths() -> usize {
+    4
+}
+
+impl Default for VectorFigureConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_figure_vector_enabled(),
+            cluster_gap_pt: default_cluster_gap_pt(),
+            min_paths: default_min_paths(),
         }
     }
 }
@@ -633,5 +702,17 @@ mod tests {
         assert!(cc.extra_figure_patterns.is_empty());
         assert!(cc.extra_table_patterns.is_empty());
         assert!(Config::default().caption.enable_japanese);
+    }
+
+    /// P4-3: real-format image saving is on by default (no `force_png`
+    /// back-compat opt-out needed), and vector-figure clustering defaults to
+    /// enabled with the documented thresholds.
+    #[test]
+    fn image_and_vector_figure_defaults() {
+        let cfg = Config::default();
+        assert!(!cfg.force_png);
+        assert!(cfg.figure_vector.enabled);
+        assert_eq!(cfg.figure_vector.cluster_gap_pt, 15.0);
+        assert_eq!(cfg.figure_vector.min_paths, 4);
     }
 }
