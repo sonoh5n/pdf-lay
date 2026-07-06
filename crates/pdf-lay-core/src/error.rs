@@ -168,6 +168,17 @@ pub enum PdfLayWarning {
         /// Human-readable description of why no text is available.
         reason: String,
     },
+    /// Header detection found too few confident headers
+    /// (`< HeaderDetectionConfig::min_confident_headers`), so `SectionBuilder`
+    /// used the no-confident-header fallback (font-shift / bold-shift
+    /// segmentation) instead of collapsing the document into a single
+    /// section (P1-6). Only emitted when the fallback actually split the
+    /// document into more than one section; a uniform-font document that the
+    /// fallback could not split further is not warned about.
+    HeaderlessSegmentation {
+        /// Number of sections produced by the fallback segmenter.
+        segments: usize,
+    },
 }
 
 /// The kind of section-numbering anomaly detected during hierarchy validation.
@@ -247,6 +258,13 @@ impl std::fmt::Display for PdfLayWarning {
             }
             Self::PageTextMissing { page, reason } => {
                 write!(f, "page {page} has no usable text: {reason}")
+            }
+            Self::HeaderlessSegmentation { segments } => {
+                write!(
+                    f,
+                    "too few confident headers detected; fell back to font-shift \
+                     segmentation, producing {segments} section(s)"
+                )
             }
         }
     }

@@ -402,7 +402,16 @@ pub fn analyze_pdf(path: &Path, config: &Config) -> Result<AnalysisResult, PdfLa
         })
         .count();
 
-    let sections = SectionBuilder::build(blocks, &headers, figures, tables, &layouts);
+    let (sections, section_warnings) = SectionBuilder::build(
+        blocks,
+        &headers,
+        figures,
+        tables,
+        &layouts,
+        classifier.body_font_size,
+        &config.header_detection,
+    );
+    warnings.extend(section_warnings);
 
     // ---- Assembly ----
 

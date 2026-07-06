@@ -502,6 +502,22 @@ pub struct HeaderDetectionConfig {
     /// Maximum heading level assigned by font clustering / numbering depth.
     #[serde(default = "default_max_level")]
     pub max_level: u8,
+    /// Minimum number of confident (scored) headers required for
+    /// `SectionBuilder` to use ordinary header-based splitting. When
+    /// `headers.len()` falls below this count, the document is instead
+    /// segmented by the no-confident-header fallback (font-shift / bold-shift
+    /// boundaries), so it never collapses into a single opaque section
+    /// (P1-6). Set to `0` to always use header-based splitting, restoring the
+    /// pre-P1-6 behavior of a single section when zero headers are detected.
+    #[serde(default = "default_min_confident_headers")]
+    pub min_confident_headers: usize,
+    /// Font-size ratio (relative to body text) a block must reach, coming
+    /// from a block below that ratio, to be treated as a pseudo-heading
+    /// font-shift boundary by the no-confident-header fallback segmenter
+    /// (P1-6). Mirrors the spirit of the (now-removed) isolated `1.15`
+    /// level-assignment threshold, but only used for fallback segmentation.
+    #[serde(default = "default_fallback_font_shift_ratio")]
+    pub fallback_font_shift_ratio: f64,
 }
 
 /// Default value for [`HeaderDetectionConfig::respect_classification`].
@@ -532,6 +548,16 @@ fn default_cluster_merge_gap() -> f64 {
 /// Default value for [`HeaderDetectionConfig::max_level`].
 fn default_max_level() -> u8 {
     6
+}
+
+/// Default value for [`HeaderDetectionConfig::min_confident_headers`].
+fn default_min_confident_headers() -> usize {
+    1
+}
+
+/// Default value for [`HeaderDetectionConfig::fallback_font_shift_ratio`].
+fn default_fallback_font_shift_ratio() -> f64 {
+    1.15
 }
 
 /// Default known section-name keywords (English + Japanese).
@@ -600,6 +626,8 @@ impl Default for HeaderDetectionConfig {
             cluster_bin_width: default_cluster_bin_width(),
             cluster_merge_gap: default_cluster_merge_gap(),
             max_level: default_max_level(),
+            min_confident_headers: default_min_confident_headers(),
+            fallback_font_shift_ratio: default_fallback_font_shift_ratio(),
         }
     }
 }
@@ -761,6 +789,16 @@ mod tests {
         assert_eq!(hd.min_score, 4);
         assert_eq!(hd.max_chars, 120);
         assert_eq!(hd.max_lines, 3);
+    }
+
+    /// P1-6: the no-confident-header fallback defaults to engaging when zero
+    /// headers are detected (min_confident_headers=1), with the documented
+    /// font-shift ratio.
+    #[test]
+    fn header_detection_fallback_defaults() {
+        let hd = HeaderDetectionConfig::default();
+        assert_eq!(hd.min_confident_headers, 1);
+        assert_eq!(hd.fallback_font_shift_ratio, 1.15);
     }
 
     #[test]
