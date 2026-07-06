@@ -3,7 +3,38 @@
 use crate::config::{ChunkConfig, FigureTextFormat, SplitStrategy};
 use crate::output::render_core::{self, EscapeMode, RenderOptions};
 use crate::output::tokenizer::{HeuristicTokenizer, Tokenizer};
-use crate::types::{Chunk, PaperDocument, Section};
+use crate::types::{Chunk, FigureInfo, PaperDocument, Section, TableInfo};
+
+/// One section's worth of pre-rendered chunk material, produced by
+/// [`Chunker::flatten_render_units`].
+///
+/// `TokenCount` and `Paragraph` used to lose all section attribution because
+/// they flattened every section into one giant string before splitting
+/// (`section.full_text()`-style concatenation, pre-P2-1) or via an
+/// `empty_section` placeholder (pre-P2-4). A `RenderUnit` keeps each
+/// section's rich text bundled with the section name/breadcrumb prefix and
+/// the figures/tables that belong to it, so every downstream chunk — even
+/// one assembled by `TokenCount`/`Paragraph` — can carry that context
+/// forward instead of dropping it (see `chunk_by_tokens`/`chunk_by_paragraph`
+/// below).
+struct RenderUnit {
+    /// This section's own clean heading text (empty for headerless sections).
+    section_name: String,
+    /// The `[Context: ...]` breadcrumb + heading prefix for this section
+    /// (empty when `include_section_context` is disabled or there is no
+    /// heading path to show), computed the same way as
+    /// `chunk_section_recursive`'s prefix for the `SectionBoundary` strategy.
+    prefix: String,
+    /// This section's own rendered body text (via `render_opts()`), not
+    /// including child sections.
+    text: String,
+    /// Figures belonging to this section.
+    figures: Vec<FigureInfo>,
+    /// Tables belonging to this section.
+    tables: Vec<TableInfo>,
+    /// This section's own page range.
+    page_range: (u32, u32),
+}
 
 /// Splits a [`PaperDocument`] into [`Chunk`] records for LLM consumption.
 pub struct Chunker {
@@ -107,7 +138,8 @@ impl Chunker {
                     "",
                     section.header_text(),
                     section.page_range,
-                    section,
+                    &section.figures,
+                    &section.tables,
                     &mut chunk_id,
                     "",
                 );
@@ -177,7 +209,8 @@ impl Chunker {
                 paper_id,
                 own.clone(),
                 section.page_range,
-                section,
+                &section.figures,
+                &section.tables,
                 chunk_id,
                 &prefix,
             );
@@ -193,6 +226,60 @@ impl Chunker {
         }
         for child in &section.children {
             self.chunk_section_recursive(child, paper_id, &child_breadcrumb, chunk_id, out);
+        }
+    }
+
+    // ---- Shared section flattening (P2-4): TokenCount/Paragraph attribution ----
+
+    /// Flatten the section tree into one [`RenderUnit`] per section (depth
+    /// first, parent before children — the same order
+    /// [`Self::chunk_section_recursive`] visits sections in), so
+    /// `TokenCount`/`Paragraph` can process sections individually instead of
+    /// concatenating everything into one untraceable string.
+    fn flatten_render_units(&self, doc: &PaperDocument) -> Vec<RenderUnit> {
+        let mut units = Vec::new();
+        for section in &doc.sections {
+            self.flatten_section_recursive(section, &[], &mut units);
+        }
+        units
+    }
+
+    /// Recursive helper for [`Self::flatten_render_units`]. Builds each
+    /// section's `RenderUnit` (rich text via `render_opts()`, breadcrumb
+    /// prefix via [`Self::build_context_prefix`] — identical logic to
+    /// [`Self::chunk_section_recursive`], kept as a separate traversal since
+    /// that method produces `Chunk`s directly per section rather than a flat
+    /// list `TokenCount`/`Paragraph` can consume).
+    fn flatten_section_recursive(
+        &self,
+        section: &Section,
+        breadcrumb: &[&str],
+        units: &mut Vec<RenderUnit>,
+    ) {
+        let opts = self.render_opts();
+        let text = render_core::render_section_content(section, &opts);
+        let own = section.header_text();
+        let prefix = if self.config.include_section_context {
+            Self::build_context_prefix(breadcrumb, &own)
+        } else {
+            String::new()
+        };
+
+        units.push(RenderUnit {
+            section_name: own.clone(),
+            prefix,
+            text,
+            figures: section.figures.clone(),
+            tables: section.tables.clone(),
+            page_range: section.page_range,
+        });
+
+        let mut child_breadcrumb = breadcrumb.to_vec();
+        if !own.is_empty() {
+            child_breadcrumb.push(own.as_str());
+        }
+        for child in &section.children {
+            self.flatten_section_recursive(child, &child_breadcrumb, units);
         }
     }
 
@@ -226,9 +313,10 @@ impl Chunker {
         }
     }
 
-    // `prefix` (P2-2's breadcrumb/heading text) pushed this past clippy's
-    // 7-argument default; a dedicated params struct would be overkill for a
-    // single private helper with three call sites.
+    // `prefix` (P2-2's breadcrumb/heading text) and `figures`/`tables` (P2-4,
+    // replacing a `&Section` borrow so callers can pass a `RenderUnit`'s
+    // owned asset lists too) pushed this past clippy's 7-argument default; a
+    // dedicated params struct would be overkill for a single private helper.
     #[allow(clippy::too_many_arguments)]
     fn split_section_text(
         &self,
@@ -236,7 +324,8 @@ impl Chunker {
         paper_id: &str,
         section_name: String,
         page_range: (u32, u32),
-        section: &Section,
+        figures: &[FigureInfo],
+        tables: &[TableInfo],
         chunk_id: &mut usize,
         prefix: &str,
     ) -> Vec<Chunk> {
@@ -244,12 +333,29 @@ impl Chunker {
             .split("\n\n")
             .filter(|p| !p.trim().is_empty())
             .collect();
+
+        // Expand any paragraph whose token count alone exceeds max_tokens
+        // into several within-budget pieces (P2-4: previously such a
+        // paragraph was emitted as a single over-budget chunk — see
+        // `split_oversized_paragraph`). Every resulting piece then flows
+        // through the ordinary accumulate-and-flush loop below exactly like
+        // a normal paragraph, so it still gets the same context prefix and
+        // token-budgeted overlap as any other sub-chunk.
+        let mut expanded: Vec<String> = Vec::with_capacity(paragraphs.len());
+        for para in &paragraphs {
+            if self.count_tokens(para) > self.config.max_tokens {
+                expanded.extend(self.split_oversized_paragraph(para));
+            } else {
+                expanded.push((*para).to_string());
+            }
+        }
+
         let mut chunks = Vec::new();
         let mut current_text = String::new();
         let mut current_tokens = 0usize;
         let mut is_first = true;
 
-        for para in &paragraphs {
+        for para in &expanded {
             let para_tokens = self.count_tokens(para);
 
             if current_tokens + para_tokens > self.config.max_tokens && !current_text.is_empty() {
@@ -264,16 +370,14 @@ impl Chunker {
                     page_range,
                     estimated_tokens: self.count_tokens(&prefixed_text),
                     text: prefixed_text,
-                    figures: if is_first {
-                        section.figures.clone()
-                    } else {
-                        vec![]
-                    },
-                    tables: if is_first {
-                        section.tables.clone()
-                    } else {
-                        vec![]
-                    },
+                    // Figures/tables are attached to the first sub-chunk
+                    // rather than the (harder to determine, post text-split)
+                    // sub-chunk whose span actually covers their insertion
+                    // point — a documented judgment call (see P2-4 report);
+                    // every asset still lands in exactly one chunk, so
+                    // nothing is silently dropped.
+                    figures: if is_first { figures.to_vec() } else { vec![] },
+                    tables: if is_first { tables.to_vec() } else { vec![] },
                     has_continuation: true,
                 });
                 *chunk_id += 1;
@@ -303,16 +407,8 @@ impl Chunker {
                 page_range,
                 estimated_tokens: self.count_tokens(&prefixed_text),
                 text: prefixed_text,
-                figures: if is_first {
-                    section.figures.clone()
-                } else {
-                    vec![]
-                },
-                tables: if is_first {
-                    section.tables.clone()
-                } else {
-                    vec![]
-                },
+                figures: if is_first { figures.to_vec() } else { vec![] },
+                tables: if is_first { tables.to_vec() } else { vec![] },
                 has_continuation: false,
             });
             *chunk_id += 1;
@@ -324,6 +420,109 @@ impl Chunker {
         }
 
         chunks
+    }
+
+    /// Split a single paragraph whose token count exceeds `max_tokens` into
+    /// several pieces that (with the possible exception noted below) each
+    /// fit the budget.
+    ///
+    /// Splits at sentence boundaries first, greedily packing consecutive
+    /// sentences up to the budget so pieces stay as readable as possible. If
+    /// a single sentence is itself still oversized, falls back to the same
+    /// token-budgeted character window `chunk_by_tokens` uses
+    /// ([`Self::token_budget_end`]). No text is ever dropped (No Silent
+    /// Drop): concatenating the returned pieces in order reproduces `para`
+    /// exactly. The only case that can still exceed `max_tokens` is a single
+    /// indivisible run with no sentence boundary and no cuttable prefix
+    /// shorter than the whole run's token count under the configured
+    /// tokenizer — unavoidable without dropping characters.
+    fn split_oversized_paragraph(&self, para: &str) -> Vec<String> {
+        let effective_max_tokens = self.config.max_tokens.max(1);
+        let mut pieces = Vec::new();
+        let mut current = String::new();
+
+        for sentence in Self::split_into_sentences(para) {
+            let sentence_tokens = self.count_tokens(sentence);
+
+            if sentence_tokens > effective_max_tokens {
+                if !current.is_empty() {
+                    pieces.push(std::mem::take(&mut current));
+                }
+                pieces.extend(self.split_by_char_window(sentence, effective_max_tokens));
+                continue;
+            }
+
+            // Re-count the actual combined candidate rather than summing
+            // per-sentence counts: per-character-class token counts use
+            // integer division (see `HeuristicTokenizer`), so
+            // `count("a") + count("b")` can under-count relative to
+            // `count("ab")` (e.g. two lone CJK punctuation marks each round
+            // down to 0 "other" tokens individually, but together round up
+            // to 1) — summing would silently let a packed piece exceed
+            // `effective_max_tokens`.
+            let candidate = format!("{current}{sentence}");
+            if self.count_tokens(&candidate) > effective_max_tokens && !current.is_empty() {
+                pieces.push(std::mem::take(&mut current));
+                current.push_str(sentence);
+            } else {
+                current = candidate;
+            }
+        }
+
+        if !current.is_empty() {
+            pieces.push(current);
+        }
+
+        pieces
+    }
+
+    /// Split `text` into sentences, keeping each sentence's terminating
+    /// punctuation attached to it. Recognizes ASCII `.`/`!`/`?` followed by
+    /// whitespace, and full-width Japanese `。`/`！`/`？` (which need no
+    /// following whitespace, matching Japanese typographic convention), as
+    /// sentence boundaries.
+    ///
+    /// Concatenating the returned sentences in order reproduces `text`
+    /// exactly (no character is consumed or dropped by the boundary scan).
+    fn split_into_sentences(text: &str) -> Vec<&str> {
+        let chars: Vec<(usize, char)> = text.char_indices().collect();
+        let mut sentences = Vec::new();
+        let mut start = 0usize;
+
+        for (i, (byte_idx, ch)) in chars.iter().enumerate() {
+            let is_boundary = matches!(ch, '。' | '！' | '？')
+                || (matches!(ch, '.' | '!' | '?')
+                    && chars
+                        .get(i + 1)
+                        .is_some_and(|(_, next)| next.is_whitespace()));
+            if is_boundary {
+                let end = byte_idx + ch.len_utf8();
+                sentences.push(&text[start..end]);
+                start = end;
+            }
+        }
+        if start < text.len() {
+            sentences.push(&text[start..]);
+        }
+
+        sentences
+    }
+
+    /// Token-budgeted character-window split of a single indivisible run of
+    /// text, reusing [`Self::token_budget_end`] (the same forward-advancing
+    /// window `chunk_by_tokens` uses) so a sentence with no further internal
+    /// boundary still lands within `max_tokens` per piece. Always makes
+    /// forward progress and never drops a character.
+    fn split_by_char_window(&self, text: &str, max_tokens: usize) -> Vec<String> {
+        let chars: Vec<char> = text.chars().collect();
+        let mut pieces = Vec::new();
+        let mut start = 0;
+        while start < chars.len() {
+            let end = self.token_budget_end(&chars, start, max_tokens);
+            pieces.push(chars[start..end].iter().collect());
+            start = end;
+        }
+        pieces
     }
 
     /// Take a suffix of `text` whose token count (per `self.tokenizer`) fits
@@ -406,21 +605,33 @@ impl Chunker {
 
     // ---- Strategy: TokenCount ----
 
+    /// Pack whole [`RenderUnit`]s (sections) into chunks up to the token
+    /// budget, splitting only a section whose own text alone exceeds the
+    /// budget (via [`Self::split_section_text`]/[`Self::split_oversized_paragraph`]).
+    ///
+    /// Before P2-4 this flattened every section into one giant string and
+    /// windowed it with [`Self::token_budget_end`], which packed tokens as
+    /// tightly as possible but dropped section attribution and every
+    /// figure/table (`section: String::new()`, `figures: vec![]`,
+    /// `tables: vec![]`). Chunking at section granularity instead means each
+    /// chunk's `section` names the section its content actually came from
+    /// (the leading section's name, when several small sections are packed
+    /// together — see the loop below) and carries that section's figures/
+    /// tables, with **no asset ever silently dropped**: every unit's
+    /// figures/tables are attached exactly once, either to the chunk holding
+    /// its full text or (if the unit itself had to be split) to the first
+    /// resulting sub-chunk.
+    ///
+    /// A consequence of chunking at section granularity: unlike the old
+    /// char-level window, there is no token-based overlap between two chunks
+    /// that both hold whole, unsplit sections (overlap only still applies
+    /// *within* an oversized section's sub-chunks, via `split_section_text`).
+    /// This matches how the `SectionBoundary` strategy already treats
+    /// section-to-section boundaries (no overlap there either), rather than
+    /// smearing context across semantically distinct sections.
     fn chunk_by_tokens(&self, doc: &PaperDocument) -> Vec<Chunk> {
-        // Concatenate all section rich text (render-core: math-converted,
-        // with inline table markdown and figure placeholders) then split
-        // mechanically. Section attribution for these chunks is not yet
-        // preserved (see P2-4); this task only fixes the text fidelity and
-        // the char-budget vs token-budget inconsistency.
-        let opts = self.render_opts();
-        let all_text: String = doc
-            .sections
-            .iter()
-            .map(|s| render_core::render_section_content(s, &opts))
-            .collect::<Vec<_>>()
-            .join("\n\n");
-
-        if all_text.is_empty() {
+        let units = self.flatten_render_units(doc);
+        if units.is_empty() {
             return vec![];
         }
 
@@ -428,38 +639,76 @@ impl Chunker {
         let effective_max_tokens = self.config.max_tokens.max(1);
 
         let mut chunks = Vec::new();
-        let mut chunk_id = 0;
-        let chars: Vec<char> = all_text.chars().collect();
-        let mut start = 0;
+        let mut chunk_id = 0usize;
+        let mut idx = 0usize;
 
-        while start < chars.len() {
-            let end = self.token_budget_end(&chars, start, effective_max_tokens);
-            let text: String = chars[start..end].iter().collect();
+        while idx < units.len() {
+            let unit = &units[idx];
+            let own_tokens = self.count_tokens(&format!("{}{}", unit.prefix, unit.text));
+
+            if own_tokens > effective_max_tokens {
+                // This section alone is too large for one chunk: sub-split
+                // it (paragraph, then sentence/char-window for an oversized
+                // paragraph) instead of emitting a single over-budget chunk.
+                let sub = self.split_section_text(
+                    &unit.text,
+                    &doc.paper_id,
+                    unit.section_name.clone(),
+                    unit.page_range,
+                    &unit.figures,
+                    &unit.tables,
+                    &mut chunk_id,
+                    &unit.prefix,
+                );
+                chunks.extend(sub);
+                idx += 1;
+                continue;
+            }
+
+            // Greedily pack whole subsequent sections into the same chunk
+            // while staying within budget.
+            let mut group_end = idx + 1;
+            let mut acc_tokens = own_tokens;
+            while group_end < units.len() {
+                let candidate = &units[group_end];
+                let candidate_tokens = self.count_tokens(&candidate.text);
+                if candidate_tokens > effective_max_tokens
+                    || acc_tokens + candidate_tokens > effective_max_tokens
+                {
+                    break;
+                }
+                acc_tokens += candidate_tokens;
+                group_end += 1;
+            }
+
+            let mut text = format!("{}{}", unit.prefix, unit.text);
+            let mut figures = unit.figures.clone();
+            let mut tables = unit.tables.clone();
+            let mut page_start = unit.page_range.0;
+            let mut page_end = unit.page_range.1;
+            for other in &units[idx + 1..group_end] {
+                text.push_str("\n\n");
+                text.push_str(&other.text);
+                figures.extend(other.figures.iter().cloned());
+                tables.extend(other.tables.iter().cloned());
+                page_start = page_start.min(other.page_range.0);
+                page_end = page_end.max(other.page_range.1);
+            }
             let estimated_tokens = self.count_tokens(&text);
 
             chunks.push(Chunk {
                 chunk_id,
                 paper_id: doc.paper_id.clone(),
-                section: String::new(),
-                page_range: (0, doc.metadata.pages.saturating_sub(1)),
+                section: unit.section_name.clone(),
+                page_range: (page_start, page_end),
                 text,
-                figures: vec![],
-                tables: vec![],
+                figures,
+                tables,
                 estimated_tokens,
-                has_continuation: end < chars.len(),
+                has_continuation: false,
             });
             chunk_id += 1;
-
-            if end >= chars.len() {
-                break;
-            }
-
-            // Overlap is measured in tokens, not a fixed char multiplier
-            // (see `token_overlap_start`). Always advance past the previous
-            // start so the loop terminates even when the overlap window
-            // would otherwise reproduce the whole chunk.
-            let overlap_start = self.token_overlap_start(&chars, end, self.config.overlap_tokens);
-            start = overlap_start.max(start + 1);
+            idx = group_end;
         }
 
         chunks
@@ -467,37 +716,35 @@ impl Chunker {
 
     // ---- Strategy: Paragraph ----
 
+    /// Split each section independently by paragraph/token budget (via
+    /// [`Self::split_section_text`]), carrying its own name, breadcrumb
+    /// prefix, figures, and tables onto every resulting chunk.
+    ///
+    /// Unlike [`Self::chunk_by_tokens`], sections are never merged into one
+    /// chunk here — every chunk always traces back to exactly one section.
+    /// Before P2-4 this instead concatenated every section into one string
+    /// and split it via a placeholder `empty_section` (`section:
+    /// String::new()`, no figures/tables), losing attribution entirely.
     fn chunk_by_paragraph(&self, doc: &PaperDocument) -> Vec<Chunk> {
-        let opts = self.render_opts();
-        let all_text: String = doc
-            .sections
-            .iter()
-            .map(|s| render_core::render_section_content(s, &opts))
-            .collect::<Vec<_>>()
-            .join("\n\n");
+        let units = self.flatten_render_units(doc);
+        let mut chunks = Vec::new();
+        let mut chunk_id = 0usize;
 
-        let empty_section = Section {
-            header: None,
-            level: 1,
-            blocks: vec![],
-            figures: vec![],
-            tables: vec![],
-            children: vec![],
-            page_range: (0, doc.metadata.pages.saturating_sub(1)),
-        };
+        for unit in &units {
+            let sub = self.split_section_text(
+                &unit.text,
+                &doc.paper_id,
+                unit.section_name.clone(),
+                unit.page_range,
+                &unit.figures,
+                &unit.tables,
+                &mut chunk_id,
+                &unit.prefix,
+            );
+            chunks.extend(sub);
+        }
 
-        // No per-chunk section attribution exists yet for this strategy (see
-        // P2-4), so there is no section path to build a breadcrumb from; no
-        // context prefix is applied here (non-scope for P2-2).
-        self.split_section_text(
-            &all_text,
-            &doc.paper_id,
-            String::new(),
-            (0, doc.metadata.pages.saturating_sub(1)),
-            &empty_section,
-            &mut 0,
-            "",
-        )
+        chunks
     }
 
     // ---- Token estimation ----
@@ -1094,6 +1341,242 @@ mod tests {
                 chunk.text.starts_with("[Context: BIG]\n# BIG\n\n"),
                 "every sub-chunk must carry the same section prefix: {}",
                 chunk.text
+            );
+        }
+    }
+
+    // ---- P2-4: TokenCount/Paragraph section+figure/table attribution,
+    // oversized single-paragraph sub-splitting ----
+
+    fn make_figure(id: &str, after_block_index: Option<usize>) -> crate::types::FigureInfo {
+        use crate::types::{ImageFormat, ImageInfo, InsertionPoint};
+        use std::path::PathBuf;
+
+        crate::types::FigureInfo {
+            figure_id: id.to_string(),
+            figure_number: Some(1),
+            caption_text: format!("{id}: A diagram."),
+            image: ImageInfo {
+                path: PathBuf::from(format!("images/{id}.png")),
+                page: 0,
+                raw_bbox: Rect::new(0.0, 0.0, 0.0, 0.0),
+                normalized_bbox: Rect::new(0.0, 0.0, 0.0, 0.0),
+                width_px: 10,
+                height_px: 10,
+                format: ImageFormat::Png,
+            },
+            context_text: String::new(),
+            insertion_point: InsertionPoint {
+                page: 0,
+                after_block_index,
+                y_position: 0.0,
+            },
+        }
+    }
+
+    fn make_table(id: &str, after_block_index: Option<usize>) -> crate::types::TableInfo {
+        use crate::types::{InsertionPoint, TableRepresentation};
+
+        crate::types::TableInfo {
+            table_id: id.to_string(),
+            table_number: Some(1),
+            caption: None,
+            representation: TableRepresentation::Markdown {
+                header: vec!["A".to_string()],
+                rows: vec![vec!["1".to_string()]],
+                caption: None,
+                markdown_text: "| A |\n| --- |\n| 1 |\n".to_string(),
+            },
+            insertion_point: InsertionPoint {
+                page: 0,
+                after_block_index,
+                y_position: 0.0,
+            },
+            page: 0,
+        }
+    }
+
+    /// A section with a header, one body block, and one figure + one table
+    /// anchored to that block.
+    fn make_section_with_assets(header: &str, text: &str, id_suffix: &str) -> Section {
+        let mut section = make_section(header, text, 1);
+        section
+            .figures
+            .push(make_figure(&format!("Fig. {id_suffix}"), Some(0)));
+        section
+            .tables
+            .push(make_table(&format!("Table {id_suffix}"), Some(0)));
+        section
+    }
+
+    #[test]
+    fn token_strategy_preserves_section_and_figures() {
+        // Two sections, each with its own figure/table, packed generously so
+        // `TokenCount` doesn't need to split anything — before P2-4 this
+        // strategy always produced `section: String::new()`, `figures:
+        // vec![]`, `tables: vec![]` regardless of budget.
+        let config = ChunkConfig {
+            max_tokens: 4000,
+            overlap_tokens: 0,
+            split_strategy: SplitStrategy::TokenCount,
+            include_section_context: false,
+            math_config: None,
+        };
+        let chunker = Chunker::new(config);
+        let doc = make_doc_with_sections(vec![
+            make_section_with_assets("INTRO", "Introduction body text.", "1"),
+            make_section_with_assets("METHODS", "Methods body text.", "2"),
+        ]);
+
+        let chunks = chunker.chunk(&doc);
+
+        assert!(!chunks.is_empty());
+        for chunk in &chunks {
+            assert!(
+                !chunk.section.is_empty(),
+                "TokenCount chunk must carry a non-empty section name: {chunk:?}"
+            );
+        }
+        let total_figures: usize = chunks.iter().map(|c| c.figures.len()).sum();
+        let total_tables: usize = chunks.iter().map(|c| c.tables.len()).sum();
+        assert_eq!(
+            total_figures, 2,
+            "both sections' figures must appear across the produced chunks"
+        );
+        assert_eq!(
+            total_tables, 2,
+            "both sections' tables must appear across the produced chunks"
+        );
+    }
+
+    #[test]
+    fn paragraph_strategy_has_section_name() {
+        // Before P2-4, `Paragraph` concatenated every section into one
+        // string via an `empty_section` placeholder, so `chunk.section` was
+        // always empty. Each section must now name the heading it came from.
+        let config = ChunkConfig {
+            max_tokens: 4000,
+            overlap_tokens: 0,
+            split_strategy: SplitStrategy::Paragraph,
+            include_section_context: false,
+            math_config: None,
+        };
+        let chunker = Chunker::new(config);
+        let doc = make_doc_with_sections(vec![
+            make_section("INTRO", "Introduction body text.", 1),
+            make_section("METHODS", "Methods body text.", 1),
+        ]);
+
+        let chunks = chunker.chunk(&doc);
+
+        assert_eq!(chunks.len(), 2, "one chunk per section at this budget");
+        for chunk in &chunks {
+            assert!(
+                !chunk.section.is_empty(),
+                "Paragraph strategy chunk must carry a non-empty section name: {chunk:?}"
+            );
+        }
+        assert_eq!(chunks[0].section, "INTRO");
+        assert_eq!(chunks[1].section, "METHODS");
+    }
+
+    #[test]
+    fn oversized_single_paragraph_is_subsplit() {
+        // A single paragraph (one block, so `split_section_text` sees it as
+        // one "\n\n"-delimited paragraph) whose token count is several times
+        // `max_tokens`. Before P2-4's fix, `split_section_text` only ever
+        // flushed on paragraph boundaries (`!current_text.is_empty()`
+        // guards the flush check), so a lone oversized paragraph was never
+        // split and became a single over-budget chunk.
+        let config = ChunkConfig {
+            max_tokens: 20,
+            overlap_tokens: 0,
+            split_strategy: SplitStrategy::SectionBoundary,
+            include_section_context: false,
+            math_config: None,
+        };
+        let chunker = Chunker::new(config);
+        // No sentence punctuation, so this exercises the char-window
+        // fallback tier of `split_oversized_paragraph` (~75 tokens' worth of
+        // ASCII text against a 20-token budget).
+        let text = "word ".repeat(60);
+        let doc = make_doc_with_sections(vec![make_section("SEC", &text, 1)]);
+
+        let chunks = chunker.chunk(&doc);
+
+        assert!(
+            chunks.len() >= 2,
+            "an oversized single paragraph must be sub-split into multiple chunks, got {}",
+            chunks.len()
+        );
+        for chunk in &chunks {
+            let tokens = chunker.count_tokens(&chunk.text);
+            assert!(
+                tokens <= 20,
+                "every sub-chunk of an oversized paragraph must stay within max_tokens: {tokens} tokens in {:?}",
+                chunk.text
+            );
+        }
+        // No Silent Drop: the char-window fallback tier cuts on raw
+        // character boundaries (not word boundaries), so a naive substring
+        // count of "word" across chunks would under-count whenever a cut
+        // lands mid-word without any character actually being lost. Count
+        // the single-character 'w' that starts every occurrence instead —
+        // it can never be partially retained, so this exactly verifies no
+        // character was dropped by the split.
+        let w_count: usize = chunks.iter().map(|c| c.text.matches('w').count()).sum();
+        assert_eq!(
+            w_count, 60,
+            "every 'w' from the 60 \"word \" occurrences must survive the oversized-paragraph sub-split"
+        );
+    }
+
+    #[test]
+    fn all_figures_and_tables_present_across_chunks_for_every_strategy() {
+        // No Silent Drop: for every split strategy, the total figure/table
+        // count across all produced chunks must equal the input count, even
+        // when a small budget forces heavy splitting.
+        for strategy in [
+            SplitStrategy::SectionBoundary,
+            SplitStrategy::TokenCount,
+            SplitStrategy::Paragraph,
+        ] {
+            let config = ChunkConfig {
+                max_tokens: 12,
+                overlap_tokens: 0,
+                split_strategy: strategy,
+                include_section_context: false,
+                math_config: None,
+            };
+            let chunker = Chunker::new(config);
+            let doc = make_doc_with_sections(vec![
+                make_section_with_assets(
+                    "INTRO",
+                    "Introduction padding text goes here for this test.",
+                    "1",
+                ),
+                make_section_with_assets(
+                    "METHODS",
+                    "Methods padding text goes here for this test too.",
+                    "2",
+                ),
+                make_section_with_assets(
+                    "RESULTS",
+                    "Results padding text goes here for this test also.",
+                    "3",
+                ),
+            ]);
+
+            let chunks = chunker.chunk(&doc);
+            let total_figures: usize = chunks.iter().map(|c| c.figures.len()).sum();
+            let total_tables: usize = chunks.iter().map(|c| c.tables.len()).sum();
+            assert_eq!(
+                total_figures, 3,
+                "all 3 figures must survive splitting under {chunks:?}"
+            );
+            assert_eq!(
+                total_tables, 3,
+                "all 3 tables must survive splitting under {chunks:?}"
             );
         }
     }
