@@ -1,6 +1,6 @@
 ---
 description: Analyze academic paper PDF to extract structured content using pdf-lay
-argument-hint: "<pdf-path> [--format markdown|json|toc] [--section NAME]"
+argument-hint: "<pdf-path> [--section NAME]"
 ---
 
 # PDF Structure Analysis
@@ -11,24 +11,26 @@ Analyze an academic paper PDF using pdf-lay and return structured content.
 
 ```
 /pdf paper.pdf                          # Full Markdown output (default)
-/pdf paper.pdf --format toc             # Table of contents with token estimates
-/pdf paper.pdf --format json            # Full JSON output
 /pdf paper.pdf --section "Introduction" # Extract specific section only
 ```
+
+There is no `--format` flag — the output kind is chosen by the pdf-lay *subcommand*
+(`toc`, `markdown`, or `json`), not by a flag.
 
 ## Detect pdf-lay availability
 
 Try in order:
 1. `pdf-lay --version` (CLI in PATH)
 2. `cargo run -p pdf-lay-cli -- --version` (from pdf-lay repo)
-3. `python -c "import pdflay"` (Python package)
+3. `python3 -c "import pdflay"` (Python package)
 
 ## Run analysis
 
 **TOC**: `pdf-lay toc "$1"`
 **Markdown** (default): `pdf-lay markdown "$1" --no-page-numbers`
 **Markdown + section**: `pdf-lay markdown "$1" --section "NAME" --no-page-numbers`
-**JSON** (Python): `python -c "import pdflay; print(pdflay.analyze('$1', extract_images=False).to_json())"`
+**JSON** (CLI): `pdf-lay json "$1" --content-only`
+**JSON** (Python, if CLI unavailable): `python3 -c "import pdflay; print(pdflay.analyze('$1', extract_images=False).to_json())"`
 
 ## Section name matching
 

@@ -32,10 +32,16 @@ chunks = sel.to_chunks(max_tokens=4000, overlap=200)
 text = sel.to_llm_text(include_figures=True, include_tables=True)
 ```
 
-## CLI fallback
+## CLI (JSONL chunks)
 
 ```bash
-pdf-lay markdown "$1" --section "Introduction" --no-page-numbers
+pdf-lay chunks "$1" --max-tokens 4000 --overlap 200 --strategy section
+```
+
+## CLI fallback (plain LLM text, no JSONL splitting)
+
+```bash
+pdf-lay llm-text "$1" --section "Introduction" --section "Methods" --section "Results"
 ```
 
 ## For each chunk show

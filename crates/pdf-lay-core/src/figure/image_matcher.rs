@@ -47,8 +47,11 @@ impl ImageMatcher {
 
     /// Match figure captions to images and return [`FigureInfo`] records.
     ///
-    /// Only captions of type [`CaptionType::Figure`] are matched. Table captions
-    /// are silently ignored (they are handled by the table module).
+    /// Captions of type [`CaptionType::Figure`], [`CaptionType::Scheme`], and
+    /// [`CaptionType::Chart`] are all treated as image-matchable (P4-4: a
+    /// chemistry "Scheme N" or "Chart N" caption is matched the same way a
+    /// "Figure N" caption is). [`CaptionType::Table`] captions are ignored
+    /// here (they are handled by the table module).
     pub fn match_all(
         &self,
         captions: &[CaptionInfo],
@@ -58,10 +61,12 @@ impl ImageMatcher {
         let mut used_images: HashSet<usize> = HashSet::new();
         let mut results = Vec::new();
 
-        for caption in captions
-            .iter()
-            .filter(|c| c.caption_type == CaptionType::Figure)
-        {
+        for caption in captions.iter().filter(|c| {
+            matches!(
+                c.caption_type,
+                CaptionType::Figure | CaptionType::Scheme | CaptionType::Chart
+            )
+        }) {
             if let Some((img_idx, image)) = self.find_nearest(caption, images, &used_images) {
                 used_images.insert(img_idx);
 
@@ -93,7 +98,12 @@ impl ImageMatcher {
         images
             .iter()
             .enumerate()
-            .filter(|(idx, img)| img.page == caption.page && !used.contains(idx))
+            // `bbox_known == false` means pdf_oxide reported no usable
+            // position for this image (P4-3): matching it anyway would risk
+            // pairing a caption with the wrong image based on a fabricated
+            // bbox, so it is excluded here (a `PdfLayWarning::ImageBboxUnknown`
+            // is emitted where the image was extracted instead).
+            .filter(|(idx, img)| img.page == caption.page && !used.contains(idx) && img.bbox_known)
             .filter_map(|(idx, img)| {
                 let v_dist = self.vertical_distance(caption, img);
                 if v_dist > self.max_gap_pt {
@@ -192,13 +202,14 @@ mod tests {
     fn make_image(page: u32, top: f64, bottom: f64, left: f64, right: f64) -> ImageInfo {
         let bbox = Rect::new(left, top, right, bottom);
         ImageInfo {
-            path: PathBuf::from("p000_img000.png"),
+            path: Some(PathBuf::from("p000_img000.png")),
             page,
             raw_bbox: bbox.clone(),
             normalized_bbox: bbox,
             width_px: 300,
             height_px: 200,
             format: ImageFormat::Png,
+            bbox_known: true,
         }
     }
 
@@ -264,6 +275,30 @@ mod tests {
     }
 
     #[test]
+    fn scheme_and_chart_captions_are_image_matchable() {
+        // P4-4: Scheme/Chart captions are treated the same as Figure captions
+        // for image matching, not silently dropped like Table captions.
+        let matcher = ImageMatcher::new();
+        let mut scheme_caption = make_caption(0, 0, 200.0);
+        scheme_caption.caption_type = CaptionType::Scheme;
+        scheme_caption.prefix = "Scheme".to_string();
+        let images = vec![make_image(0, 220.0, 210.0, 72.0, 540.0)];
+        let figures = matcher.match_all(&[scheme_caption], &images, &[]);
+        assert_eq!(figures.len(), 1);
+        assert_eq!(figures[0].figure_id, "Scheme 1");
+    }
+
+    #[test]
+    fn table_captions_are_not_image_matched() {
+        let matcher = ImageMatcher::new();
+        let mut table_caption = make_caption(0, 0, 200.0);
+        table_caption.caption_type = CaptionType::Table;
+        let images = vec![make_image(0, 220.0, 210.0, 72.0, 540.0)];
+        let figures = matcher.match_all(&[table_caption], &images, &[]);
+        assert!(figures.is_empty());
+    }
+
+    #[test]
     fn each_image_matched_at_most_once() {
         let matcher = ImageMatcher::new();
         // Two captions close to the same image.
@@ -274,6 +309,19 @@ mod tests {
         let figures = matcher.match_all(&captions, &images, &[]);
         // At most one figure should be produced (the image can only be used once).
         assert!(figures.len() <= 1);
+    }
+
+    #[test]
+    fn image_with_unknown_bbox_is_not_matched() {
+        // P4-3: an image whose bbox pdf_oxide could not determine
+        // (`bbox_known == false`) must never be matched to a caption — doing
+        // so would fabricate a position from a placeholder rect.
+        let matcher = ImageMatcher::new();
+        let caption = make_caption(0, 0, 200.0);
+        let mut image = make_image(0, 220.0, 210.0, 72.0, 540.0);
+        image.bbox_known = false;
+        let figures = matcher.match_all(&[caption], &[image], &[]);
+        assert!(figures.is_empty());
     }
 
     #[test]

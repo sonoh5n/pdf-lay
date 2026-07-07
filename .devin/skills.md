@@ -7,7 +7,9 @@ This document defines reusable skills for AI agents (Devin, Claude Code, Codex, 
 pdf-lay must be available via one of:
 - **CLI**: `pdf-lay` binary in PATH
 - **Cargo**: `cargo run -p pdf-lay-cli --` from the pdf-lay repository
-- **Python**: `import pdflay` (install via `pip install pdflay` or `maturin develop`)
+- **Python**: `import pdflay` (install via `python3 -m venv .venv && source .venv/bin/activate && \
+  maturin develop -m crates/pdflay-python/Cargo.toml`; `pdflay` is not published on PyPI, so
+  `pip install pdflay` does not work)
 
 ---
 
@@ -41,13 +43,33 @@ for entry in doc.toc():                 # TOC entries
     print(f"[L{entry.level}] {entry.header}  ~{entry.estimated_tokens} tokens")
 ```
 
+### JSON (CLI, no Python required)
+
+```bash
+pdf-lay json paper.pdf                    # Full geometry-carrying dump
+pdf-lay json paper.pdf --content-only     # Lightweight, LLM-facing projection
+```
+
 ---
 
 ## Skill: pdf-to-llm — PDF to LLM Chunks
 
 **Trigger**: User needs PDF content chunked for RAG, LLM context windows, or embeddings.
 
-### Python Usage (preferred)
+### CLI Usage (JSONL chunks, no Python required)
+
+```bash
+pdf-lay chunks paper.pdf --max-tokens 4000 --overlap 200 --strategy section
+pdf-lay chunks paper.pdf --section "Methods" --section "Results" -o chunks.jsonl
+```
+
+### CLI Usage (plain LLM text, single context-window injection)
+
+```bash
+pdf-lay llm-text paper.pdf --section "Methods" --section "Results"
+```
+
+### Python Usage (preferred for programmatic chunk objects)
 
 ```python
 import pdflay
@@ -75,7 +97,7 @@ text = sel.to_llm_text(include_figures=True, include_tables=True)
 | overlap | 200 | Tokens shared between chunks |
 | strategy | "section" | "section", "paragraph", "token" |
 
-### CLI Fallback
+### CLI Fallback (Markdown, then chunk manually)
 
 ```bash
 # Extract specific section as text (then chunk manually)

@@ -16,8 +16,8 @@ use clap::{Args, Parser, Subcommand};
 use pdf_lay::{
     CaptionStyle, Chunk, ChunkConfig, Chunker, Config, FigureInfo, FigureTextFormat, JsonGenerator,
     LlmTextConfig, LlmTextGenerator, MarkdownConfig, MarkdownGenerator, MathConfig,
-    MathRepresentationPreference, SplitStrategy, TableInfo, TableRepresentation, TocGenerator,
-    Tokenizer, analyze_pdf,
+    MathRepresentationPreference, OcrConfig, SplitStrategy, TableInfo, TableRepresentation,
+    TocGenerator, Tokenizer, analyze_pdf,
 };
 use serde::Serialize;
 
@@ -411,6 +411,33 @@ image files written to disk. Figure references may still be detected from text, 
 but no embedded image assets are exported."
     )]
     no_extract_images: bool,
+
+    /// Attempt OCR recovery for scanned/image-only pages.
+    #[arg(
+        long,
+        action = clap::ArgAction::SetTrue,
+        help = "Attempt OCR recovery for pages with little/no native text.",
+        long_help = "Attempt OCR recovery for pages that have an embedded image but little or \
+no native (embedded) text — the shape of a scanned page.\n\n\
+Regardless of this flag, such pages are always reported as a warning (`PageTextMissing` or \
+`PageTextRecovered`) so a fully-scanned document never analyzes silently with no signal. This \
+flag only controls whether pdf-lay actually attempts recovery.\n\n\
+Requires a `tesseract` binary on PATH, and this binary to have been built with the `ocr` cargo \
+feature; otherwise pdf-lay reports a `PageTextMissing` warning for the affected pages and \
+continues without recovering their text (never a hard error or a panic)."
+    )]
+    ocr: bool,
+
+    /// Language(s) passed to the OCR engine.
+    #[arg(
+        long,
+        default_value = "jpn+eng",
+        value_name = "LANG",
+        help = "Language(s) for OCR recognition (tesseract -l syntax).",
+        long_help = "Language(s) passed to the OCR engine's `-l` option, e.g. `eng`, `jpn`, or \
+`jpn+eng` (default). Only consulted when `--ocr` is set."
+    )]
+    ocr_lang: String,
 }
 
 impl CommonArgs {
@@ -805,6 +832,11 @@ fn build_config(common: &CommonArgs) -> Config {
     Config {
         image_output_dir: common.image_dir.clone(),
         extract_images: common.extract_images_enabled(),
+        ocr: OcrConfig {
+            enabled: common.ocr,
+            lang: common.ocr_lang.clone(),
+            ..Default::default()
+        },
         ..Default::default()
     }
 }
@@ -982,7 +1014,7 @@ fn cmd_json(args: &JsonArgs) {
 struct ChunkFigureView {
     figure_id: String,
     caption: String,
-    image_path: String,
+    image_path: Option<String>,
     page: u32,
 }
 
@@ -1057,13 +1089,9 @@ fn table_view(table: &TableInfo) -> ChunkTableView {
 /// Reduce a figure's image reference to its filename, never the raw on-disk
 /// path (which may be absolute) — same fallback as `render_core::write_figure`
 /// and `output::content_ir::project_figure` when the path has no file name
-/// component.
-fn figure_image_filename(fig: &FigureInfo) -> String {
-    fig.image
-        .path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| fig.image.path.display().to_string())
+/// component. `None` for a vector figure (no raster image was extracted).
+fn figure_image_filename(fig: &FigureInfo) -> Option<String> {
+    fig.image.filename()
 }
 
 /// Flatten whichever `TableRepresentation` tier a table resolved to into a
@@ -1354,6 +1382,35 @@ mod tests {
 
         assert!(args.common.no_extract_images);
         assert!(!args.common.extract_images_enabled());
+    }
+
+    #[test]
+    fn ocr_flag_defaults_to_disabled() {
+        let cli =
+            Cli::try_parse_from(["pdf-lay", "toc", "paper.pdf"]).expect("expected default parse");
+        let super::Commands::Toc(args) = cli.command else {
+            panic!("expected toc command");
+        };
+        assert!(!args.common.ocr);
+        assert_eq!(args.common.ocr_lang, "jpn+eng");
+        let config = super::build_config(&args.common);
+        assert!(!config.ocr.enabled);
+        assert_eq!(config.ocr.lang, "jpn+eng");
+    }
+
+    #[test]
+    fn ocr_flag_and_lang_are_accepted_and_mapped_to_config() {
+        let cli =
+            Cli::try_parse_from(["pdf-lay", "toc", "paper.pdf", "--ocr", "--ocr-lang", "eng"])
+                .expect("expected --ocr/--ocr-lang to parse");
+        let super::Commands::Toc(args) = cli.command else {
+            panic!("expected toc command");
+        };
+        assert!(args.common.ocr);
+        assert_eq!(args.common.ocr_lang, "eng");
+        let config = super::build_config(&args.common);
+        assert!(config.ocr.enabled);
+        assert_eq!(config.ocr.lang, "eng");
     }
 
     // ---- json ----

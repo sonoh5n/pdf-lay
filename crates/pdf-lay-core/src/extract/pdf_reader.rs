@@ -228,6 +228,128 @@ impl PdfReader {
     pub(super) fn inner_doc(&mut self) -> &mut PdfDocument {
         &mut self.inner
     }
+
+    /// Scan a page's `/Resources /XObject` dictionary directly (not the
+    /// content stream) for Image XObject features that `pdf_oxide::extract_images`
+    /// does not surface on its own.
+    ///
+    /// `pdf_oxide::PdfDocument::extract_images` silently omits any image it
+    /// fails to decode from its `Ok(Vec<PdfImage>)` result — an XObject whose
+    /// `/Filter` it cannot decode (e.g. `JPXDecode`, which pdf_oxide 0.3.8 has
+    /// no decoder for — see `docs/refactor/phase4_findings.md` P4-1) never
+    /// appears as an `Err`, it just vanishes with no signal at all. Likewise,
+    /// `PdfImage` never exposes whether the image had an `/SMask` (pdf_oxide
+    /// does not apply the soft mask, so a transparent image may render with a
+    /// solid background — again with no indication in the returned
+    /// `PdfImage`). This method reads the dictionary itself (the same
+    /// non-rendering dictionary-walk pattern as [`Self::page_media_box`]) so
+    /// `ImageExtractor` can at least warn when either gap is present on a
+    /// page, even though it cannot recover the specific lost image.
+    ///
+    /// Best-effort: only inspects Image XObjects referenced directly from the
+    /// page's own `/Resources` dictionary. Does not recurse into Form
+    /// XObjects or parse inline images (`BI`/`ID`/`EI`) in the content
+    /// stream — see `phase4_findings.md` P4-3 for what was and was not
+    /// verified. Returns all-`false` hints (rather than an error) when the
+    /// page/resources/XObject dictionary cannot be read, since this is a
+    /// best-effort diagnostic, not a required extraction step.
+    ///
+    /// `pub(crate)` (not `pub(super)`): in addition to `ImageExtractor`
+    /// (within this module's parent, `extract`), `pipeline.rs` also calls
+    /// this directly to detect scanned/image-only pages for P4-2 (a page
+    /// with an image but no/little native text), which needs the
+    /// [`ImageXObjectHints::has_any_image`] flag below.
+    pub(crate) fn image_xobject_hints(&mut self, page: u32) -> ImageXObjectHints {
+        let mut hints = ImageXObjectHints::default();
+
+        let Ok(page_obj) = self.inner.get_page_for_debug(page as usize) else {
+            return hints;
+        };
+        let Some(page_dict) = page_obj.as_dict() else {
+            return hints;
+        };
+        let Some(resources) = Self::resolve_dict_entry(&mut self.inner, page_dict, "Resources")
+        else {
+            return hints;
+        };
+        let Some(res_dict) = resources.as_dict() else {
+            return hints;
+        };
+        let Some(xobjects) = Self::resolve_dict_entry(&mut self.inner, res_dict, "XObject") else {
+            return hints;
+        };
+        let Some(xobj_dict) = xobjects.as_dict() else {
+            return hints;
+        };
+
+        for entry in xobj_dict.values() {
+            let resolved = if let Some(r) = entry.as_reference() {
+                match self.inner.load_object(r) {
+                    Ok(o) => o,
+                    Err(_) => continue,
+                }
+            } else {
+                entry.clone()
+            };
+            let Some(dict) = resolved.as_dict() else {
+                continue;
+            };
+            if dict.get("Subtype").and_then(|o| o.as_name()) != Some("Image") {
+                continue;
+            }
+            hints.has_any_image = true;
+            if dict.contains_key("SMask") {
+                hints.has_smask = true;
+            }
+            if let Some(filter) = dict.get("Filter") {
+                let is_jpx = filter.as_name() == Some("JPXDecode")
+                    || filter
+                        .as_array()
+                        .map(|arr| arr.iter().any(|o| o.as_name() == Some("JPXDecode")))
+                        .unwrap_or(false);
+                if is_jpx {
+                    hints.has_unsupported_filter = true;
+                }
+            }
+        }
+
+        hints
+    }
+
+    /// Resolve a dictionary entry that may be a direct object or an indirect
+    /// reference, returning the loaded `Object` in either case.
+    fn resolve_dict_entry(
+        inner: &mut PdfDocument,
+        dict: &std::collections::HashMap<String, Object>,
+        key: &str,
+    ) -> Option<Object> {
+        let entry = dict.get(key)?;
+        if let Some(r) = entry.as_reference() {
+            inner.load_object(r).ok()
+        } else {
+            Some(entry.clone())
+        }
+    }
+}
+
+/// Hints about a page's Image XObjects gathered by [`PdfReader::image_xobject_hints`].
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ImageXObjectHints {
+    /// At least one Image XObject on the page has an `/SMask` entry.
+    /// pdf_oxide does not apply soft masks, so the extracted raster may be
+    /// missing the intended transparency/alpha.
+    pub(crate) has_smask: bool,
+    /// At least one Image XObject on the page uses a `/Filter` pdf_oxide
+    /// cannot decode (currently: `JPXDecode`/JPEG2000). That image is silently
+    /// absent from `extract_images`'s result — this is the only way pdf-lay
+    /// can detect that a page had an image it lost.
+    pub(crate) has_unsupported_filter: bool,
+    /// At least one Image XObject is declared in the page's own
+    /// `/Resources`, regardless of whether pdf_oxide could decode it. Used
+    /// by `pipeline.rs` (P4-2) to tell "a page with no native text and no
+    /// image at all" (nothing lost) apart from "a page with no native text
+    /// but an image" (the shape of a scanned page).
+    pub(crate) has_any_image: bool,
 }
 
 // ---- Private conversion helpers ------------------------------------------------
@@ -695,5 +817,718 @@ mod tests {
         assert_eq!(obj.bbox.top, obj.bbox.bottom); // degenerate
         // width=50 > 5.0 and height=0 < 2.0 → Horizontal
         assert!(matches!(obj.path_type, PathType::Horizontal));
+    }
+
+    // ---- P4-1 investigation: synthetic-PDF observation of pdf_oxide 0.3.8 ----
+    //
+    // See docs/refactor/phase4_findings.md for the write-up these tests support.
+    // The repo has no real Japanese/scanned/vertical-text PDF fixtures, so these
+    // build minimal hand-crafted PDFs (xref-correct, following `build_minimal_pdf`
+    // above) to observe pdf_oxide behavior that IS reachable without a real
+    // embedded CJK font: ToUnicode-only CID text, an image-only ("scanned-like")
+    // page, and page /Rotate handling. Building an actual vertical-writing-mode
+    // rendering test is out of reach offline (would need real vertical metrics /
+    // a real font), but Identity-V *decoding* can be probed the same way as
+    // Identity-H because pdf_oxide treats both through the same CID→ToUnicode path.
+
+    /// Minimal xref-correct multi-object PDF builder for the investigation tests
+    /// below. Objects are added in call order (object numbers are 1-based);
+    /// `finish()` emits the xref table + trailer. Mirrors `build_minimal_pdf`'s
+    /// approach but supports multiple objects and stream objects with a
+    /// `/Length` computed from the actual payload.
+    struct TestPdfBuilder {
+        buf: Vec<u8>,
+        offsets: Vec<usize>,
+    }
+
+    impl TestPdfBuilder {
+        fn new() -> Self {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(b"%PDF-1.4\n");
+            Self {
+                buf,
+                offsets: Vec::new(),
+            }
+        }
+
+        fn next_obj_num(&self) -> usize {
+            self.offsets.len() + 1
+        }
+
+        /// Add a non-stream object (dictionary/array body only, no `N 0 obj` wrapper).
+        fn add_obj(&mut self, body: &[u8]) -> usize {
+            let num = self.next_obj_num();
+            self.offsets.push(self.buf.len());
+            self.buf
+                .extend_from_slice(format!("{num} 0 obj\n").as_bytes());
+            self.buf.extend_from_slice(body);
+            self.buf.extend_from_slice(b"\nendobj\n");
+            num
+        }
+
+        /// Add a stream object. `dict_body` is the dictionary entries (no
+        /// surrounding `<<`/`>>`, no `/Length` — that is computed here).
+        fn add_stream_obj(&mut self, dict_body: &str, data: &[u8]) -> usize {
+            let num = self.next_obj_num();
+            self.offsets.push(self.buf.len());
+            self.buf
+                .extend_from_slice(format!("{num} 0 obj\n").as_bytes());
+            self.buf.extend_from_slice(
+                format!("<< {dict_body} /Length {} >>\nstream\n", data.len()).as_bytes(),
+            );
+            self.buf.extend_from_slice(data);
+            self.buf.extend_from_slice(b"\nendstream\nendobj\n");
+            num
+        }
+
+        fn finish(mut self, root_obj: usize) -> Vec<u8> {
+            let xref_offset = self.buf.len();
+            let size = self.offsets.len() + 1;
+            self.buf
+                .extend_from_slice(format!("xref\n0 {size}\n").as_bytes());
+            self.buf.extend_from_slice(b"0000000000 65535 f \n");
+            for off in &self.offsets {
+                self.buf
+                    .extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+            }
+            self.buf.extend_from_slice(
+                format!(
+                    "trailer\n<< /Size {size} /Root {root_obj} 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n"
+                )
+                .as_bytes(),
+            );
+            self.buf
+        }
+    }
+
+    /// A page with a standard (non-embedded) Type1 font and one `Tj` text
+    /// operator. Sanity-checks the harness itself (not a pdf_oxide limitation
+    /// probe): confirms `TestPdfBuilder`-produced PDFs open and extract cleanly.
+    fn build_text_sanity_pdf() -> Vec<u8> {
+        let mut b = TestPdfBuilder::new();
+        let catalog = b.add_obj(b"<< /Type /Catalog /Pages 2 0 R >>");
+        assert_eq!(catalog, 1);
+        b.add_obj(b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.add_obj(
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.add_stream_obj("", b"BT /F1 12 Tf 72 700 Td (Hello World) Tj ET");
+        b.add_obj(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
+        b.finish(1)
+    }
+
+    /// A page with **no text operators**, only a single Image XObject drawn via
+    /// `Do` — the minimal shape of a "scanned page" (no embedded text at all).
+    /// 2x2 DeviceGray, 8 bits/component, unfiltered raw data (no JPEG/CCITT
+    /// decoder needed).
+    fn build_image_only_pdf() -> Vec<u8> {
+        let mut b = TestPdfBuilder::new();
+        let catalog = b.add_obj(b"<< /Type /Catalog /Pages 2 0 R >>");
+        assert_eq!(catalog, 1);
+        b.add_obj(b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.add_obj(
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.add_stream_obj("", b"q 500 0 0 700 50 50 cm /Im0 Do Q");
+        let img_data = [0xFFu8, 0x00, 0xFF, 0x00];
+        b.add_stream_obj(
+            "/Type /XObject /Subtype /Image /Width 2 /Height 2 \
+             /BitsPerComponent 8 /ColorSpace /DeviceGray",
+            &img_data,
+        );
+        b.finish(1)
+    }
+
+    /// A page whose only text is two CID codes (`<0001>`, `<0002>`) run through
+    /// a synthetic `/ToUnicode` CMap mapping them to U+65E5 ("日") and U+672C
+    /// ("本"). The descendant `CIDFontType2` has **no embedded `FontFile2`** —
+    /// this tests whether pdf_oxide can recover correct Unicode text from the
+    /// ToUnicode CMap alone (as claimed in `phase4_extraction.md`'s capability
+    /// table), without requiring a real embedded CJK font (infeasible offline).
+    ///
+    /// `writing_mode` selects `/Identity-H` or `/Identity-V` in `/Encoding` —
+    /// used to compare horizontal vs. vertical decoding (see
+    /// `identity_v_bbox_matches_identity_h_bbox_ignore` below).
+    fn build_cjk_tounicode_pdf(writing_mode: &str) -> Vec<u8> {
+        let mut b = TestPdfBuilder::new();
+        let catalog = b.add_obj(b"<< /Type /Catalog /Pages 2 0 R >>");
+        assert_eq!(catalog, 1);
+        b.add_obj(b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.add_obj(
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.add_stream_obj("", b"BT /F1 24 Tf 72 700 Td <00010002> Tj ET");
+        let font_dict = format!(
+            "<< /Type /Font /Subtype /Type0 /BaseFont /FakeCJK /Encoding /{writing_mode} \
+             /DescendantFonts [6 0 R] /ToUnicode 8 0 R >>"
+        );
+        b.add_obj(font_dict.as_bytes());
+        b.add_obj(
+            b"<< /Type /Font /Subtype /CIDFontType2 /BaseFont /FakeCJK \
+              /CIDSystemInfo << /Registry (Adobe) /Ordering (Identity) /Supplement 0 >> \
+              /FontDescriptor 7 0 R /DW 1000 /CIDToGIDMap /Identity >>",
+        );
+        b.add_obj(
+            b"<< /Type /FontDescriptor /FontName /FakeCJK /Flags 4 \
+              /FontBBox [0 0 1000 1000] /ItalicAngle 0 /Ascent 1000 /Descent 0 \
+              /CapHeight 1000 /StemV 80 >>",
+        );
+        let cmap = "/CIDInit /ProcSet findresource begin\n\
+                    12 dict begin\n\
+                    begincmap\n\
+                    1 begincodespacerange\n\
+                    <0000> <FFFF>\n\
+                    endcodespacerange\n\
+                    2 beginbfchar\n\
+                    <0001> <65E5>\n\
+                    <0002> <672C>\n\
+                    endbfchar\n\
+                    endcmap\n\
+                    CMapName currentdict /CMapName put\n\
+                    end\nend\n";
+        b.add_stream_obj("", cmap.as_bytes());
+        b.finish(1)
+    }
+
+    /// A page with `/Rotate 90` and a single text span, used to check whether
+    /// `extract_spans`'s bbox coordinates are adjusted for page rotation.
+    fn build_rotated_text_pdf() -> Vec<u8> {
+        let mut b = TestPdfBuilder::new();
+        let catalog = b.add_obj(b"<< /Type /Catalog /Pages 2 0 R >>");
+        assert_eq!(catalog, 1);
+        b.add_obj(b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.add_obj(
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Rotate 90 \
+              /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.add_stream_obj("", b"BT /F1 12 Tf 72 700 Td (Rotated) Tj ET");
+        b.add_obj(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
+        b.finish(1)
+    }
+
+    #[test]
+    fn text_sanity_pdf_extracts_via_pdf_lay_wrapper() {
+        // Harness sanity check: TestPdfBuilder output opens and extracts through
+        // pdf-lay's own PdfReader wrapper (not just raw pdf_oxide).
+        let pdf = build_text_sanity_pdf();
+        let mut reader = PdfReader::from_bytes(&pdf).expect("sanity PDF should open");
+        let spans = reader
+            .extract_text_spans(0)
+            .expect("extract_text_spans should succeed");
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].text, "Hello World");
+    }
+
+    #[test]
+    fn cjk_tounicode_only_text_decodes_through_pdf_lay_wrapper() {
+        // Verifies (via pdf-lay's own PdfReader, not raw pdf_oxide) that CID
+        // text with only a ToUnicode CMap — no embedded font program — decodes
+        // to correct Unicode. Confirms the capability-table claim "ToUnicode
+        // CMap: 対応" end-to-end through the pdf-lay wrapper.
+        let pdf = build_cjk_tounicode_pdf("Identity-H");
+        let mut reader = PdfReader::from_bytes(&pdf).expect("CJK PDF should open");
+        let spans = reader
+            .extract_text_spans(0)
+            .expect("extract_text_spans should succeed");
+        assert_eq!(spans.len(), 1, "expected a single merged CJK span");
+        assert_eq!(spans[0].text, "日本");
+        assert!(spans[0].bbox.width() > 0.0);
+        assert!(spans[0].bbox.height() > 0.0);
+    }
+
+    #[test]
+    fn identity_v_decodes_text_but_bbox_matches_identity_h_shape() {
+        // OBSERVED pdf_oxide 0.3.8 LIMITATION (see phase4_findings.md item 3):
+        // Identity-V (vertical writing mode) correctly decodes the same
+        // Unicode text as Identity-H via the same ToUnicode/CID path, but the
+        // returned bbox has the *same wide/short shape* as the horizontal
+        // case — pdf_oxide does not transpose the span geometry for vertical
+        // writing mode. `pdf_oxide::layout::TextSpan` has no rotation/writing
+        // -mode field pdf-lay could use to detect this itself (per the
+        // capability table). This test locks in the current (horizontal-
+        // shaped) bbox so a future pdf_oxide upgrade that starts rotating
+        // vertical spans will be caught by a test failure here, not silently.
+        let h_pdf = build_cjk_tounicode_pdf("Identity-H");
+        let v_pdf = build_cjk_tounicode_pdf("Identity-V");
+
+        let mut h_reader = PdfReader::from_bytes(&h_pdf).expect("H PDF should open");
+        let h_spans = h_reader.extract_text_spans(0).unwrap();
+        let mut v_reader = PdfReader::from_bytes(&v_pdf).expect("V PDF should open");
+        let v_spans = v_reader.extract_text_spans(0).unwrap();
+
+        assert_eq!(h_spans.len(), 1);
+        assert_eq!(v_spans.len(), 1);
+        assert_eq!(
+            v_spans[0].text, "日本",
+            "Identity-V should still decode text"
+        );
+        // Same bbox width/height as Identity-H: wide (multiple wide CJK glyphs
+        // side-by-side), not tall/narrow as true vertical layout would be.
+        assert!(
+            v_spans[0].bbox.width() > v_spans[0].bbox.height(),
+            "Identity-V span bbox is horizontal-shaped (width {} > height {}), \
+             confirming pdf_oxide does not lay out vertical writing mode",
+            v_spans[0].bbox.width(),
+            v_spans[0].bbox.height()
+        );
+        assert_eq!(h_spans[0].bbox.width(), v_spans[0].bbox.width());
+        assert_eq!(h_spans[0].bbox.height(), v_spans[0].bbox.height());
+    }
+
+    #[test]
+    fn image_only_page_yields_no_spans_and_no_panic() {
+        // Regression guard: a page with zero text operators (the minimal shape
+        // of a scanned/image-only page) must not panic anywhere in the
+        // pdf_reader extraction path, and must yield zero spans (not garbage).
+        // See phase4_findings.md item 5: pdf-lay currently reports NO warning
+        // for this case at the pipeline level (tracked for P4-2), so this test
+        // only asserts the pdf_reader-level contract (no panic, empty result).
+        let pdf = build_image_only_pdf();
+        let mut reader = PdfReader::from_bytes(&pdf).expect("image-only PDF should open");
+        let spans = reader
+            .extract_text_spans(0)
+            .expect("extract_text_spans should succeed even with zero text");
+        assert!(spans.is_empty(), "image-only page should yield zero spans");
+    }
+
+    #[test]
+    fn image_only_page_image_is_still_extracted() {
+        // Companion to the above: the page's image XObject IS visible via
+        // pdf_oxide's extract_images (used by ImageExtractor), even though no
+        // text spans exist. Confirms "no text" != "no content" for a
+        // scanned-like page, which matters for the OCR-candidate heuristic
+        // P4-2 will need (page has images but ~0 native text chars).
+        let pdf = build_image_only_pdf();
+        let mut reader = PdfReader::from_bytes(&pdf).expect("image-only PDF should open");
+        let images = reader
+            .inner_doc()
+            .extract_images(0)
+            .expect("extract_images should succeed");
+        assert_eq!(
+            images.len(),
+            1,
+            "the page's single image XObject should be found"
+        );
+    }
+
+    #[test]
+    fn rotated_page_span_bbox_is_not_adjusted_for_rotate_entry() {
+        // OBSERVED pdf_oxide 0.3.8 LIMITATION (see phase4_findings.md item 4):
+        // `page_media_box` correctly swaps width/height for a /Rotate 90 page
+        // (P0-1 behavior), but `extract_spans`'s bbox coordinates are returned
+        // in the page's *original* (pre-rotation) coordinate frame. A span
+        // whose un-rotated Y-coordinate (700pt) fits inside the un-rotated
+        // page height (792pt) therefore ends up *outside* the swapped
+        // (rotated) page height (612pt) pdf-lay now reports for that page.
+        // This is a real geometric mismatch a downstream layout step would
+        // need to correct (out of scope for P4-1 — see findings for options).
+        let pdf = build_rotated_text_pdf();
+        let mut reader = PdfReader::from_bytes(&pdf).expect("rotated PDF should open");
+
+        let (_w, swapped_height, rotation) = reader
+            .page_media_box(0)
+            .expect("MediaBox should be readable");
+        assert_eq!(rotation, 90);
+        assert!((swapped_height - 612.0).abs() < 1.0);
+
+        let spans = reader.extract_text_spans(0).expect("spans should extract");
+        assert_eq!(spans.len(), 1);
+        // The span's bbox is still expressed in the *un-rotated* frame (top
+        // near the original MediaBox's 792pt height), which exceeds the
+        // rotated page's reported height (612pt) — the mismatch this test
+        // documents.
+        assert!(
+            spans[0].bbox.top > swapped_height,
+            "expected the un-rotated span bbox.top ({}) to exceed the \
+             swapped rotated page height ({swapped_height}), demonstrating \
+             the coordinate-frame mismatch",
+            spans[0].bbox.top
+        );
+    }
+
+    // ---- P4-3 investigation: synthetic-PDF observation of pdf_oxide 0.3.8's
+    // inline-image / Form-XObject / SMask / JPX handling ----
+    //
+    // See docs/refactor/phase4_findings.md's "P4-3" section for the write-up
+    // these tests support. Builds on the same `TestPdfBuilder` used by P4-1.
+
+    /// A page with a single Image XObject (drawn via `Do`) whose stream has
+    /// `/Filter /DCTDecode`. `DctDecoder` (pdf_oxide `src/decoders/dct.rs`) is
+    /// a pure byte passthrough — it does not validate JPEG magic bytes — so
+    /// arbitrary bytes are sufficient to observe that pdf_oxide tags the
+    /// resulting `PdfImage` as `ImageData::Jpeg` end-to-end through a real PDF
+    /// (not just via a hand-built `PdfImage`, which `image_extractor.rs`'s own
+    /// unit tests already cover for the save/format-selection logic).
+    fn build_dct_image_pdf() -> Vec<u8> {
+        let mut b = TestPdfBuilder::new();
+        let catalog = b.add_obj(b"<< /Type /Catalog /Pages 2 0 R >>");
+        assert_eq!(catalog, 1);
+        b.add_obj(b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.add_obj(
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.add_stream_obj("", b"q 100 0 0 100 50 50 cm /Im0 Do Q");
+        // Not a real decodable JPEG — DctDecoder passes bytes through
+        // unchanged, and this test only checks that pdf_oxide *tags* the
+        // image as `ImageData::Jpeg`, not that it can be decoded/rendered.
+        let dummy_jpeg = b"not-a-real-jpeg-but-DCTDecode-is-a-byte-passthrough";
+        b.add_stream_obj(
+            "/Type /XObject /Subtype /Image /Width 4 /Height 4 \
+             /BitsPerComponent 8 /ColorSpace /DeviceRGB /Filter /DCTDecode",
+            dummy_jpeg,
+        );
+        b.finish(1)
+    }
+
+    #[test]
+    fn dct_filtered_xobject_image_is_tagged_as_jpeg_source() {
+        let pdf = build_dct_image_pdf();
+        let mut reader = PdfReader::from_bytes(&pdf).expect("DCT PDF should open");
+        let images = reader
+            .inner_doc()
+            .extract_images(0)
+            .expect("extract_images should succeed");
+        assert_eq!(images.len(), 1);
+        assert!(
+            matches!(images[0].data(), pdf_oxide::extractors::ImageData::Jpeg(_)),
+            "an Image XObject with /Filter /DCTDecode must be tagged ImageData::Jpeg"
+        );
+    }
+
+    #[test]
+    fn dct_filtered_xobject_image_saves_as_jpg_through_image_extractor() {
+        // End-to-end: pdf-lay's own `ImageExtractor` (not just raw pdf_oxide)
+        // must save this as `.jpg` losslessly (no re-encode), per P4-3's
+        // format-honoring behavior.
+        use crate::extract::ImageExtractor;
+        let pdf = build_dct_image_pdf();
+        let mut reader = PdfReader::from_bytes(&pdf).expect("DCT PDF should open");
+        let tmp = tempfile::TempDir::new().unwrap();
+        let extractor = ImageExtractor::new(tmp.path().to_path_buf());
+        let (images, warnings) = extractor
+            .extract_all(&mut reader)
+            .expect("extraction should succeed");
+        assert_eq!(images.len(), 1);
+        assert!(matches!(images[0].format, crate::types::ImageFormat::Jpeg));
+        let path = images[0].path.as_ref().unwrap();
+        assert_eq!(path.extension().unwrap(), "jpg");
+        assert!(warnings.is_empty(), "a clean DCT image should not warn");
+    }
+
+    /// 2x2 DeviceGray inline image (unfiltered, raw pixel bytes), in the
+    /// dictionary shape the PDF spec actually requires: no `/Subtype` key
+    /// inside the `BI`/`ID` dictionary (ISO 32000-1:2008 §8.9.7 — the
+    /// abbreviated keys are `W`/`H`/`CS`/`BPC`/…; `Subtype` is XObject
+    /// vocabulary, not inline-image vocabulary, and the `BI` operator itself
+    /// already says "this is an image"). Real PDF producers do not emit
+    /// `/Subtype` here.
+    fn build_spec_conformant_inline_image_pdf() -> Vec<u8> {
+        let mut b = TestPdfBuilder::new();
+        let catalog = b.add_obj(b"<< /Type /Catalog /Pages 2 0 R >>");
+        assert_eq!(catalog, 1);
+        b.add_obj(b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.add_obj(b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << >> /Contents 4 0 R >>");
+        let content =
+            b"q 100 0 0 100 50 50 cm BI /W 2 /H 2 /CS /DeviceGray /BPC 8 ID \xFF\x00\xFF\x00 EI Q";
+        b.add_stream_obj("", content);
+        b.finish(1)
+    }
+
+    /// Same image, but with a non-conformant `/Subtype /Image` key added
+    /// inside the `BI` dictionary (real producers do not write this, but the
+    /// PDF spec does not forbid extra keys either).
+    fn build_inline_image_pdf_with_redundant_subtype() -> Vec<u8> {
+        let mut b = TestPdfBuilder::new();
+        let catalog = b.add_obj(b"<< /Type /Catalog /Pages 2 0 R >>");
+        assert_eq!(catalog, 1);
+        b.add_obj(b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.add_obj(b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << >> /Contents 4 0 R >>");
+        let content = b"q 100 0 0 100 50 50 cm BI /Subtype /Image /W 2 /H 2 /CS /DeviceGray /BPC 8 ID \xFF\x00\xFF\x00 EI Q";
+        b.add_stream_obj("", content);
+        b.finish(1)
+    }
+
+    #[test]
+    fn spec_conformant_inline_image_is_silently_not_extracted() {
+        // KEY P4-3 FINDING (see docs/refactor/phase4_findings.md): pdf_oxide
+        // 0.3.8's `extract_image_from_inline` (`document.rs:5791`) reuses
+        // `extract_image_from_xobject`, which unconditionally requires a
+        // `/Subtype /Image` key (`extractors/images.rs` — "XObject missing
+        // /Subtype" otherwise). Inline image dictionaries never carry
+        // `/Subtype` in spec-conformant PDFs (confirmed by hand — see the
+        // sibling test below, which adds a non-conformant `/Subtype /Image`
+        // key and DOES get an image back). The failure inside
+        // `extract_image_from_inline` is swallowed by `extract_images`'s
+        // `if let Ok(image) = ... { images.push(image) }` (document.rs:5527),
+        // so a page with a perfectly ordinary inline image silently yields
+        // zero images for it — no error, no warning, indistinguishable from a
+        // page with no inline image at all. P4-1's source-reading claim
+        // ("inline images: 対応") is true only in the narrow, non-standard
+        // case; it does not hold for real-world inline images. Deferred (per
+        // the design's explicit "do not hand-roll a content-stream image
+        // parser" instruction) rather than worked around here.
+        let pdf = build_spec_conformant_inline_image_pdf();
+        let mut reader = PdfReader::from_bytes(&pdf).expect("inline-image PDF should open");
+        let images = reader
+            .inner_doc()
+            .extract_images(0)
+            .expect("extract_images must not error even though the inline image is lost");
+        assert!(
+            images.is_empty(),
+            "a spec-conformant inline image (no /Subtype key) is currently NOT extracted by \
+             pdf_oxide 0.3.8 — see the finding note above; if this starts passing, pdf_oxide has \
+             fixed the gap and P4-3's inline-image deferral should be revisited"
+        );
+    }
+
+    #[test]
+    fn inline_image_is_extracted_only_with_a_non_conformant_subtype_key() {
+        // Companion to the finding above: isolates exactly what makes
+        // `extract_image_from_inline` succeed (a redundant `/Subtype /Image`
+        // key no real producer writes), so the gap is pinned down precisely
+        // rather than asserted as "inline images don't work at all".
+        let pdf = build_inline_image_pdf_with_redundant_subtype();
+        let mut reader = PdfReader::from_bytes(&pdf).expect("inline-image PDF should open");
+        let images = reader
+            .inner_doc()
+            .extract_images(0)
+            .expect("extract_images should succeed");
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].width(), 2);
+        assert_eq!(images[0].height(), 2);
+    }
+
+    /// A page whose content stream draws a Form XObject (`/Fm0 Do`), and the
+    /// Form's *own* `/Resources` contains an Image XObject drawn via its own
+    /// nested `Do` operator — the minimal shape needed to observe whether
+    /// pdf_oxide's image extraction recurses into Form XObjects.
+    fn build_form_xobject_with_image_pdf() -> Vec<u8> {
+        let mut b = TestPdfBuilder::new();
+        let catalog = b.add_obj(b"<< /Type /Catalog /Pages 2 0 R >>");
+        assert_eq!(catalog, 1);
+        b.add_obj(b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.add_obj(
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Resources << /XObject << /Fm0 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.add_stream_obj("", b"q 1 0 0 1 0 0 cm /Fm0 Do Q");
+        // Form XObject: its content stream draws Im0 (object 6), declared in
+        // the Form's *own* /Resources (not the page's).
+        b.add_stream_obj(
+            "/Type /XObject /Subtype /Form /BBox [0 0 200 200] \
+             /Resources << /XObject << /Im0 6 0 R >> >>",
+            b"q 100 0 0 100 10 10 cm /Im0 Do Q",
+        );
+        let img_data = [0xFFu8, 0x00, 0xFF, 0x00];
+        b.add_stream_obj(
+            "/Type /XObject /Subtype /Image /Width 2 /Height 2 \
+             /BitsPerComponent 8 /ColorSpace /DeviceGray",
+            &img_data,
+        );
+        b.finish(1)
+    }
+
+    #[test]
+    fn image_inside_form_xobject_is_extracted_recursively_by_pdf_oxide() {
+        // P4-3 kickoff verification (per phase4_findings.md P4-1 §6 "条件付き
+        // GO"): confirms pdf_oxide 0.3.8 actually recurses into a Form
+        // XObject and finds the image nested in the *Form's own* /Resources
+        // (P4-1 only verified this by reading the `document.rs` source, not
+        // by running a synthetic PDF through it).
+        let pdf = build_form_xobject_with_image_pdf();
+        let mut reader = PdfReader::from_bytes(&pdf).expect("Form XObject PDF should open");
+        let images = reader
+            .inner_doc()
+            .extract_images(0)
+            .expect("extract_images should succeed");
+        assert_eq!(
+            images.len(),
+            1,
+            "an image nested inside a Form XObject's own /Resources should be found"
+        );
+    }
+
+    /// An Image XObject with `/SMask 6 0 R` pointing to a second (grayscale)
+    /// Image XObject used as its soft mask.
+    fn build_image_with_smask_pdf() -> Vec<u8> {
+        let mut b = TestPdfBuilder::new();
+        let catalog = b.add_obj(b"<< /Type /Catalog /Pages 2 0 R >>");
+        assert_eq!(catalog, 1);
+        b.add_obj(b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.add_obj(
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.add_stream_obj("", b"q 100 0 0 100 50 50 cm /Im0 Do Q");
+        let img_data = [
+            0x10u8, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0xA0, 0xB0, 0xC0,
+        ];
+        b.add_stream_obj(
+            "/Type /XObject /Subtype /Image /Width 2 /Height 2 \
+             /BitsPerComponent 8 /ColorSpace /DeviceRGB /SMask 6 0 R",
+            &img_data,
+        );
+        let mask_data = [0xFFu8, 0x80, 0x40, 0x00];
+        b.add_stream_obj(
+            "/Type /XObject /Subtype /Image /Width 2 /Height 2 \
+             /BitsPerComponent 8 /ColorSpace /DeviceGray",
+            &mask_data,
+        );
+        b.finish(1)
+    }
+
+    #[test]
+    fn image_xobject_hints_detects_smask() {
+        // P4-1 established (by reading source) that pdf_oxide never applies
+        // or surfaces `/SMask` on the returned `PdfImage`. This confirms, via
+        // a synthetic PDF, that `image_xobject_hints` (the dictionary-level
+        // workaround added in P4-3) detects its *presence* even though
+        // pdf_oxide's own `PdfImage` says nothing about it.
+        let pdf = build_image_with_smask_pdf();
+        let mut reader = PdfReader::from_bytes(&pdf).expect("SMask PDF should open");
+
+        // Confirm the base image itself still extracts fine (SMask presence
+        // does not break extraction, it is just silently unapplied).
+        let images = reader
+            .inner_doc()
+            .extract_images(0)
+            .expect("extract_images should succeed");
+        assert_eq!(images.len(), 1);
+
+        let hints = reader.image_xobject_hints(0);
+        assert!(hints.has_smask, "the SMask entry must be detected");
+        assert!(!hints.has_unsupported_filter);
+    }
+
+    /// An Image XObject whose sole filter is `/JPXDecode` (JPEG2000), which
+    /// pdf_oxide 0.3.8 has no decoder for (confirmed by P4-1: no `jpx`/
+    /// `jpeg2000` module under `src/decoders/`).
+    fn build_jpx_image_pdf() -> Vec<u8> {
+        let mut b = TestPdfBuilder::new();
+        let catalog = b.add_obj(b"<< /Type /Catalog /Pages 2 0 R >>");
+        assert_eq!(catalog, 1);
+        b.add_obj(b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
+        b.add_obj(
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.add_stream_obj("", b"q 100 0 0 100 50 50 cm /Im0 Do Q");
+        // Not real JPEG2000 codestream data — only the /Filter tag matters
+        // for this test (pdf_oxide has no JPX decoder to invoke regardless).
+        let jpx_data = b"not-a-real-jpx-codestream";
+        b.add_stream_obj(
+            "/Type /XObject /Subtype /Image /Width 4 /Height 4 \
+             /BitsPerComponent 8 /ColorSpace /DeviceRGB /Filter /JPXDecode",
+            jpx_data,
+        );
+        b.finish(1)
+    }
+
+    #[test]
+    fn jpx_filtered_image_is_silently_absent_from_extract_images_with_no_error() {
+        // KEY P4-3 FINDING: pdf_oxide's `extract_images` does not return an
+        // `Err` for a page containing an undecodable image — the image is
+        // just missing from the `Ok(Vec<PdfImage>)`, indistinguishable from a
+        // page that legitimately has zero images. This is *why*
+        // `image_xobject_hints` has to read the Resources/XObject dictionary
+        // itself instead of reacting to an error from `extract_images`.
+        let pdf = build_jpx_image_pdf();
+        let mut reader = PdfReader::from_bytes(&pdf).expect("JPX PDF should open");
+        let images = reader
+            .inner_doc()
+            .extract_images(0)
+            .expect("extract_images must not error even though the image is undecodable");
+        assert!(
+            images.is_empty(),
+            "the JPX-filtered image must be silently absent, not present or an Err"
+        );
+    }
+
+    #[test]
+    fn image_xobject_hints_detects_unsupported_jpx_filter() {
+        let pdf = build_jpx_image_pdf();
+        let mut reader = PdfReader::from_bytes(&pdf).expect("JPX PDF should open");
+        let hints = reader.image_xobject_hints(0);
+        assert!(
+            hints.has_unsupported_filter,
+            "a /Filter /JPXDecode Image XObject must be flagged as unsupported"
+        );
+        assert!(!hints.has_smask);
+    }
+
+    #[test]
+    fn image_xobject_hints_is_all_false_for_a_plain_image() {
+        // "all false" refers to the SMask/unsupported-filter *problem* hints;
+        // `has_any_image` is true (the page does contain a plain image) —
+        // see the dedicated P4-2 test below for the "no image at all" case.
+        let pdf = build_image_only_pdf();
+        let mut reader = PdfReader::from_bytes(&pdf).expect("plain image PDF should open");
+        let hints = reader.image_xobject_hints(0);
+        assert!(!hints.has_smask);
+        assert!(!hints.has_unsupported_filter);
+        assert!(hints.has_any_image);
+    }
+
+    #[test]
+    fn image_xobject_hints_has_any_image_is_false_with_no_xobjects() {
+        // P4-2: a page with only text operators (no /Resources/XObject at
+        // all) must not be flagged as having an image — this is what tells
+        // the pipeline's scanned-page detection apart a genuinely blank/
+        // text-only page (nothing lost) from a scanned one (image but no
+        // native text).
+        let pdf = build_text_sanity_pdf();
+        let mut reader = PdfReader::from_bytes(&pdf).expect("text-only PDF should open");
+        let hints = reader.image_xobject_hints(0);
+        assert!(!hints.has_any_image);
+    }
+
+    /// Two-page PDF whose `/Pages` dictionary claims `/Count 2`, but the
+    /// second `Kids` entry (`99 0 R`) references an object that does not
+    /// exist anywhere in the file. `PdfReader::page_count()` trusts `/Count`
+    /// (so callers see 2 pages), but `extract_text_spans(1)` genuinely fails
+    /// (pdf_oxide's page-tree walk and its scanning fallback both come up
+    /// empty for the dangling kid) while `extract_text_spans(0)` — a normal,
+    /// valid page — succeeds. This is pdf-lay's P4-2 partial-recovery
+    /// regression fixture: see `pipeline::tests::
+    /// single_page_extraction_failure_does_not_zero_the_whole_document`
+    /// (which duplicates this construction rather than importing it, since
+    /// `mod tests` is private to this module — same precedent as
+    /// `pipeline.rs`'s `build_image_only_pdf_bytes`).
+    fn build_pdf_with_one_dangling_page() -> Vec<u8> {
+        let mut b = TestPdfBuilder::new();
+        let catalog = b.add_obj(b"<< /Type /Catalog /Pages 2 0 R >>");
+        assert_eq!(catalog, 1);
+        b.add_obj(b"<< /Type /Pages /Kids [3 0 R 99 0 R] /Count 2 >>");
+        b.add_obj(
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        b.add_stream_obj("", b"BT /F1 12 Tf 72 700 Td (Good Page) Tj ET");
+        b.add_obj(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
+        b.finish(1)
+    }
+
+    #[test]
+    fn dangling_second_page_extracts_the_good_page_and_errors_on_the_missing_one() {
+        // Sanity-check for the fixture above: page 0 (real) succeeds, page 1
+        // (dangling Kids entry) genuinely errors rather than silently
+        // returning an empty Vec — the failure mode `pipeline.rs`'s
+        // per-page loop is meant to surface as `PdfLayWarning::PageSkipped`.
+        let pdf = build_pdf_with_one_dangling_page();
+        let mut reader = PdfReader::from_bytes(&pdf).expect("should open despite dangling kid");
+        assert_eq!(reader.page_count(), 2);
+        let page0 = reader
+            .extract_text_spans(0)
+            .expect("the real page must still extract");
+        assert_eq!(page0.len(), 1);
+        assert_eq!(page0[0].text, "Good Page");
+        assert!(
+            reader.extract_text_spans(1).is_err(),
+            "the dangling Kids entry must surface as an error, not an empty Vec"
+        );
     }
 }

@@ -88,8 +88,10 @@ pub struct ContentFigure {
     pub caption: String,
     /// Image file name only (e.g. `"p000_img000.png"`), never the raw on-disk
     /// path (which may be absolute) — mirrors `render_core::write_figure`'s
-    /// path handling.
-    pub image_path: String,
+    /// path handling. `None` for a vector figure (caption matched to a
+    /// cluster of vector-graphic paths, not a raster image — see
+    /// [`crate::figure::VectorFigureClusterer`]).
+    pub image_path: Option<String>,
     /// Zero-based page index where the figure appears.
     pub page: u32,
 }
@@ -210,12 +212,7 @@ fn project_section(
 /// absolute) — same fallback as `render_core::write_figure` when the path has
 /// no file name component.
 fn project_figure(fig: &FigureInfo) -> ContentFigure {
-    let image_path = fig
-        .image
-        .path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| fig.image.path.display().to_string());
+    let image_path = fig.image.filename();
 
     ContentFigure {
         figure_id: fig.figure_id.clone(),
@@ -429,13 +426,14 @@ mod tests {
             figure_number: Some(1),
             caption_text: "Fig. 1: A diagram.".to_string(),
             image: ImageInfo {
-                path: PathBuf::from("/abs/images/p000_img000.png"),
+                path: Some(PathBuf::from("/abs/images/p000_img000.png")),
                 page: 2,
                 raw_bbox: Rect::new(0.0, 0.0, 0.0, 0.0),
                 normalized_bbox: Rect::new(0.0, 0.0, 0.0, 0.0),
                 width_px: 10,
                 height_px: 10,
                 format: ImageFormat::Png,
+                bbox_known: true,
             },
             context_text: String::new(),
             insertion_point: InsertionPoint {
@@ -471,9 +469,9 @@ mod tests {
         assert_eq!(figures.len(), 1);
         assert_eq!(figures[0].figure_id, "Fig. 1");
         assert_eq!(figures[0].caption, "Fig. 1: A diagram.");
-        assert_eq!(figures[0].image_path, "p000_img000.png");
+        assert_eq!(figures[0].image_path.as_deref(), Some("p000_img000.png"));
         assert!(
-            !figures[0].image_path.contains('/'),
+            !figures[0].image_path.as_ref().unwrap().contains('/'),
             "must be basename only"
         );
         assert_eq!(figures[0].page, 2);

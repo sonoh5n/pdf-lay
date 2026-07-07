@@ -34,8 +34,9 @@ pub mod output;
 pub mod test_helpers;
 
 pub use config::{
-    CaptionStyle, ChunkConfig, Config, FigureTextFormat, LlmTextConfig, MarkdownConfig, MathConfig,
-    MathRepresentationPreference, ResourceLimits, SplitStrategy, TableConfig,
+    CaptionStyle, ChunkConfig, Config, FigureTextFormat, ImageOutputFormat, LlmTextConfig,
+    MarkdownConfig, MathConfig, MathRepresentationPreference, OcrConfig, OcrEngineKind,
+    ResourceLimits, SplitStrategy, TableConfig,
 };
 pub use error::{AnalysisResult, Coverage, NumberingAnomalyKind, PdfLayError, PdfLayWarning};
 pub use math::{
@@ -46,7 +47,7 @@ pub use math::{
 pub use output::HfTokenizer;
 pub use output::{HeuristicTokenizer, Tokenizer};
 pub use pipeline::{analyze_pdf, analyze_pdf_bytes};
-pub use selector::{LlmTextGenerator, SectionEntry, SectionSelector, TocGenerator};
+pub use selector::{LlmTextGenerator, MatchMode, SectionEntry, SectionSelector, TocGenerator};
 pub use table::{GridBuilder, TableDetector, TableGrid, TableTextConverter};
 pub use types::{
     BlockType, Chunk, DocumentMetadata, FigureInfo, ImageFormat, ImageInfo, InsertionPoint,

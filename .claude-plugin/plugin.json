@@ -1,0 +1,8 @@
+{
+  "name": "pdf-lay",
+  "description": "Academic-paper PDF analysis skills (structure, Q&A, summary, LLM chunking) powered by the pdf-lay CLI and pdflay Python bindings.",
+  "version": "0.1.0",
+  "author": { "name": "sonoh5n" },
+  "homepage": "https://github.com/sonoh5n/pdf-lay",
+  "keywords": ["pdf", "academic", "rag", "llm", "chunking"]
+}

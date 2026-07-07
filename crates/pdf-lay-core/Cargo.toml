@@ -25,4 +25,17 @@ tokenizers = { workspace = true, optional = true }
 # etc.) are heavy and unnecessary for the default HeuristicTokenizer path.
 real-tokenizer = ["dep:tokenizers"]
 
+# Opt-in OCR seam (P4-2) for scanned/image-only pages: compiles in
+# `extract::ocr`, which shells out to a `tesseract` binary on `PATH` at
+# runtime (see that module's docs for why a shell-out was chosen over
+# pdf_oxide's own `ocr` feature — the ONNX Runtime + PaddleOCR-model route).
+# Adds *zero* new Cargo dependencies (no `dep:` entries): the feature exists
+# purely to keep the OCR call path out of the default build, per
+# `docs/refactor/00_REVIEW_POLICY.md`'s "no unconditional heavy/optional
+# dependency" guidance, even though this particular seam has no heavy
+# dependency to gate. Detection of scanned pages and the corresponding
+# `PdfLayWarning`s are always on regardless of this feature (see
+# `pipeline.rs`); only the OCR attempt itself is gated.
+ocr = []
+
 [dev-dependencies]

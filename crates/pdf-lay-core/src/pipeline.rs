@@ -7,7 +7,7 @@ use crate::{
     config::Config,
     error::{AnalysisResult, PdfLayError, PdfLayWarning},
     extract::{CoordinateNormalizer, ImageExtractor, PdfReader, SpanBuilder},
-    figure::{CaptionDetector, CaptionInfo, CaptionType, ImageMatcher},
+    figure::{CaptionDetector, CaptionInfo, CaptionType, ImageMatcher, VectorFigureClusterer},
     layout::{ColumnDetector, LineReconstructor},
     structure::{BlockClassifier, BlockGrouper, HeaderDetector, MetadataExtractor, SectionBuilder},
     table::{GridBuilder, TableDetector, TableRegion, TableTextConverter},
@@ -54,11 +54,86 @@ pub fn analyze_pdf(path: &Path, config: &Config) -> Result<AnalysisResult, PdfLa
         });
     }
 
-    // Extract all text spans.
-    let raw_spans = reader.extract_all_text_spans()?;
+    // Extract text spans page-by-page (rather than the single-shot
+    // `extract_all_text_spans`, whose per-page failures are only
+    // `log::warn!`-ed and never reach `AnalysisResult.warnings`) so that a
+    // page that fails to extract is surfaced as a `PdfLayWarning::PageSkipped`
+    // — No Silent Drop (P4-2) — while every other page is still processed
+    // normally (partial recovery: one bad page never zeroes the document).
+    // `PdfReader::extract_all_text_spans` itself is unchanged and still
+    // public for callers that only want the aggregate (back-compat).
+    let mut raw_spans: Vec<crate::types::TextSpan> = Vec::new();
+    let mut native_chars_by_page: Vec<usize> = vec![0; page_count as usize];
+    for page in 0..page_count {
+        match reader.extract_text_spans(page) {
+            Ok(page_spans) => {
+                native_chars_by_page[page as usize] =
+                    page_spans.iter().map(|s| s.text.chars().count()).sum();
+                raw_spans.extend(page_spans);
+            }
+            Err(e) => {
+                warnings.push(PdfLayWarning::PageSkipped {
+                    page,
+                    reason: e.to_string(),
+                });
+            }
+        }
+    }
+
+    // Scanned/image-only page detection (P4-2): a page with an embedded
+    // image but little/no native text is the classic shape of a scanned
+    // page (see `docs/refactor/phase4_findings.md` P4-1 §2.5). Every such
+    // page is reported via a warning *regardless* of whether OCR is enabled
+    // — this is the fix for the "zero warning" gap where a fully-scanned
+    // document with `extracted_chars == 0` used to analyze "successfully"
+    // with no signal at all (the old `Coverage::ratio` short-circuit to
+    // 1.0, fixed below). A page with neither native text nor any image
+    // (e.g. a genuinely blank separator page) is left alone: nothing was
+    // lost, so nothing is warned about.
+    for page in 0..page_count {
+        if native_chars_by_page[page as usize] >= config.ocr.min_native_chars {
+            continue;
+        }
+        if !reader.image_xobject_hints(page).has_any_image {
+            continue;
+        }
+        if config.ocr.enabled {
+            match try_ocr_page(&mut reader, page, &config.ocr) {
+                Ok(recovered) if !recovered.is_empty() => {
+                    native_chars_by_page[page as usize] += recovered
+                        .iter()
+                        .map(|s| s.text.chars().count())
+                        .sum::<usize>();
+                    raw_spans.extend(recovered);
+                    warnings.push(PdfLayWarning::PageTextRecovered {
+                        page,
+                        method: "ocr:tesseract",
+                    });
+                }
+                Ok(_) => {
+                    warnings.push(PdfLayWarning::PageTextMissing {
+                        page,
+                        reason: "OCR ran but recovered no text".to_string(),
+                    });
+                }
+                Err(reason) => {
+                    warnings.push(PdfLayWarning::PageTextMissing { page, reason });
+                }
+            }
+        } else {
+            warnings.push(PdfLayWarning::PageTextMissing {
+                page,
+                reason: "page has an embedded image but little/no native text, and OCR is \
+                         disabled (set Config.ocr.enabled / pass --ocr to attempt recovery)"
+                    .to_string(),
+            });
+        }
+    }
+
     let spans = SpanBuilder::new().merge(raw_spans);
 
-    // Coverage baseline: total characters extracted from the PDF.
+    // Coverage baseline: total characters extracted from the PDF (including
+    // any OCR-recovered text merged in above).
     let extracted_chars: usize = spans.iter().map(|s| s.text.chars().count()).sum();
 
     // Collect page dimensions. Prefer the real MediaBox; when it cannot be read,
@@ -108,9 +183,14 @@ pub fn analyze_pdf(path: &Path, config: &Config) -> Result<AnalysisResult, PdfLa
     // Extract images (optional).
     let mut images = Vec::new();
     if config.extract_images {
-        let extractor = ImageExtractor::new(config.image_output_dir.clone());
+        let extractor = ImageExtractor::new(config.image_output_dir.clone())
+            .with_image_format(config.image_format.clone())
+            .with_force_png(config.force_png);
         match extractor.extract_all(&mut reader) {
-            Ok(imgs) => images = imgs,
+            Ok((imgs, image_warnings)) => {
+                images = imgs;
+                warnings.extend(image_warnings);
+            }
             Err(e) => {
                 warnings.push(PdfLayWarning::PageSkipped {
                     page: 0,
@@ -202,13 +282,49 @@ pub fn analyze_pdf(path: &Path, config: &Config) -> Result<AnalysisResult, PdfLa
 
     // ---- Phase 5: Figure Matching ----
 
-    let caption_detector = CaptionDetector::new();
+    let (caption_detector, caption_warnings) = CaptionDetector::from_config(&config.caption);
+    warnings.extend(caption_warnings);
     let captions = caption_detector.detect(&blocks);
 
     let image_matcher = ImageMatcher::new().with_max_gap(config.caption_max_gap_pt);
-    let figures = image_matcher.match_all(&captions, &images, &blocks);
+    let mut figures = image_matcher.match_all(&captions, &images, &blocks);
 
-    // Warn about unmatched figure captions.
+    // Path objects (vector graphics) feed both table rule detection (below)
+    // and vector-figure clustering (immediately below) — extract once and
+    // share, rather than parsing the page content streams twice.
+    let paths = if config.detect_tables || config.figure_vector.enabled {
+        reader.extract_all_paths()?
+    } else {
+        Vec::new()
+    };
+
+    // Vector figures (P4-3): a caption not matched to any raster image may
+    // still be matched to a nearby spatial cluster of vector-graphic paths
+    // (line art/diagrams drawn with path operators, not embedded as an Image
+    // XObject), so it is recorded as a figure with a region bbox instead of
+    // silently becoming an `UnmatchedCaption`.
+    if config.figure_vector.enabled {
+        let matched_so_far: std::collections::HashSet<String> =
+            figures.iter().map(|f| f.caption_text.clone()).collect();
+        let unmatched_image_captions: Vec<&CaptionInfo> = captions
+            .iter()
+            .filter(|c| {
+                matches!(
+                    c.caption_type,
+                    CaptionType::Figure | CaptionType::Scheme | CaptionType::Chart
+                ) && !matched_so_far.contains(&c.full_text)
+            })
+            .collect();
+        let clusterer = VectorFigureClusterer::new(
+            config.figure_vector.cluster_gap_pt,
+            config.figure_vector.min_paths,
+            config.caption_max_gap_pt,
+        );
+        figures.extend(clusterer.match_captions(&unmatched_image_captions, &paths, &blocks));
+    }
+
+    // Warn about unmatched figure captions (still unmatched after both
+    // raster image matching and vector-figure clustering).
     let matched_caption_texts: std::collections::HashSet<String> =
         figures.iter().map(|f| f.caption_text.clone()).collect();
 
@@ -227,7 +343,6 @@ pub fn analyze_pdf(path: &Path, config: &Config) -> Result<AnalysisResult, PdfLa
     // Must happen before Section Assembly because SectionBuilder::build consumes `blocks`.
 
     let tables = if config.detect_tables {
-        let paths = reader.extract_all_paths()?;
         let table_detector = TableDetector::new(config.table_config.clone());
         let table_captions: Vec<&CaptionInfo> = captions
             .iter()
@@ -287,7 +402,16 @@ pub fn analyze_pdf(path: &Path, config: &Config) -> Result<AnalysisResult, PdfLa
         })
         .count();
 
-    let sections = SectionBuilder::build(blocks, &headers, figures, tables, &layouts);
+    let (sections, section_warnings) = SectionBuilder::build(
+        blocks,
+        &headers,
+        figures,
+        tables,
+        &layouts,
+        classifier.body_font_size,
+        &config.header_detection,
+    );
+    warnings.extend(section_warnings);
 
     // ---- Assembly ----
 
@@ -312,8 +436,11 @@ pub fn analyze_pdf(path: &Path, config: &Config) -> Result<AnalysisResult, PdfLa
 
     // Coverage: characters that reached the output (section body + headers).
     let emitted_chars = emitted_char_count(&document.sections);
+    // `0.0` (not the old `1.0` short-circuit) when nothing was extracted at
+    // all — see the doc comment on `Coverage::ratio` for why this cannot be
+    // allowed to read as "full coverage".
     let ratio = if extracted_chars == 0 {
-        1.0
+        0.0
     } else {
         (emitted_chars as f64 / extracted_chars as f64).clamp(0.0, 1.0)
     };
@@ -332,6 +459,44 @@ pub fn analyze_pdf(path: &Path, config: &Config) -> Result<AnalysisResult, PdfLa
         warnings,
         coverage,
     })
+}
+
+/// Attempt OCR recovery for one page, returning the recovered spans or a
+/// human-readable reason nothing could be recovered. Never panics.
+///
+/// Under the `ocr` cargo feature, delegates to `extract::ocr` (which shells
+/// out to `tesseract`, checking [`crate::extract::engine_available`] first).
+/// Without the feature, OCR was requested (`Config.ocr.enabled`/`--ocr`) but
+/// this build does not include the seam at all — reported the same way as
+/// any other "OCR unavailable" reason, never a panic or a build error.
+#[cfg(feature = "ocr")]
+fn try_ocr_page(
+    reader: &mut PdfReader,
+    page: u32,
+    cfg: &crate::config::OcrConfig,
+) -> Result<Vec<crate::types::TextSpan>, String> {
+    if !crate::extract::engine_available(cfg) {
+        return Err(
+            "configured OCR engine is not available on this machine (e.g. the \"tesseract\" \
+             binary was not found on PATH)"
+                .to_string(),
+        );
+    }
+    crate::extract::ocr_page(reader, page, cfg)
+}
+
+/// See the `#[cfg(feature = "ocr")]` variant above.
+#[cfg(not(feature = "ocr"))]
+fn try_ocr_page(
+    _reader: &mut PdfReader,
+    _page: u32,
+    _cfg: &crate::config::OcrConfig,
+) -> Result<Vec<crate::types::TextSpan>, String> {
+    Err(
+        "OCR was requested (Config.ocr.enabled / --ocr) but this build was not compiled with \
+         the \"ocr\" cargo feature"
+            .to_string(),
+    )
 }
 
 /// Count blocks currently classified as a running header or footer.
@@ -585,13 +750,14 @@ mod tests {
             figure_number: Some(1),
             caption_text: "Fig. 1: X".to_string(), // 9 chars
             image: ImageInfo {
-                path: std::path::PathBuf::from("images/p000_img000.png"),
+                path: Some(std::path::PathBuf::from("images/p000_img000.png")),
                 page: 0,
                 raw_bbox: Rect::new(0.0, 0.0, 0.0, 0.0),
                 normalized_bbox: Rect::new(0.0, 0.0, 0.0, 0.0),
                 width_px: 1,
                 height_px: 1,
                 format: ImageFormat::Png,
+                bbox_known: true,
             },
             context_text: String::new(),
             insertion_point: InsertionPoint {
@@ -659,6 +825,321 @@ mod tests {
         assert!(
             matches!(result, Err(PdfLayError::ResourceLimitExceeded { .. })),
             "Expected ResourceLimitExceeded, got: {result:?}"
+        );
+    }
+
+    /// Minimal xref-correct single-page PDF with an Image XObject and **no
+    /// text operators** — the minimal shape of a scanned/image-only page.
+    /// Mirrors `extract::pdf_reader::tests::build_image_only_pdf` (duplicated
+    /// here rather than shared, since that helper is private to its module);
+    /// see `docs/refactor/phase4_findings.md` item 5 for the full observation
+    /// this test is a regression guard for.
+    fn build_image_only_pdf_bytes() -> Vec<u8> {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut offsets: Vec<usize> = Vec::new();
+        buf.extend_from_slice(b"%PDF-1.4\n");
+
+        let push_obj = |buf: &mut Vec<u8>, offsets: &mut Vec<usize>, body: &[u8]| {
+            offsets.push(buf.len());
+            let num = offsets.len();
+            buf.extend_from_slice(format!("{num} 0 obj\n").as_bytes());
+            buf.extend_from_slice(body);
+            buf.extend_from_slice(b"\nendobj\n");
+        };
+
+        push_obj(&mut buf, &mut offsets, b"<< /Type /Catalog /Pages 2 0 R >>");
+        push_obj(
+            &mut buf,
+            &mut offsets,
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        );
+        push_obj(
+            &mut buf,
+            &mut offsets,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        let content = b"q 500 0 0 700 50 50 cm /Im0 Do Q";
+        offsets.push(buf.len());
+        buf.extend_from_slice(b"4 0 obj\n");
+        buf.extend_from_slice(format!("<< /Length {} >>\nstream\n", content.len()).as_bytes());
+        buf.extend_from_slice(content);
+        buf.extend_from_slice(b"\nendstream\nendobj\n");
+        let img_data = [0xFFu8, 0x00, 0xFF, 0x00];
+        offsets.push(buf.len());
+        buf.extend_from_slice(b"5 0 obj\n");
+        buf.extend_from_slice(
+            format!(
+                "<< /Type /XObject /Subtype /Image /Width 2 /Height 2 \
+                 /BitsPerComponent 8 /ColorSpace /DeviceGray /Length {} >>\nstream\n",
+                img_data.len()
+            )
+            .as_bytes(),
+        );
+        buf.extend_from_slice(&img_data);
+        buf.extend_from_slice(b"\nendstream\nendobj\n");
+
+        let xref_offset = buf.len();
+        let size = offsets.len() + 1;
+        buf.extend_from_slice(format!("xref\n0 {size}\n").as_bytes());
+        buf.extend_from_slice(b"0000000000 65535 f \n");
+        for off in &offsets {
+            buf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        buf.extend_from_slice(
+            format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+        buf
+    }
+
+    #[test]
+    fn analyze_pdf_image_only_page_does_not_panic_and_yields_empty_document() {
+        // Regression guard for phase4_findings.md item 5 (P4-1) / P4-2: a page
+        // with zero text operators (minimal shape of a scanned/image-only
+        // page) must run through the full pipeline without panicking, and
+        // must produce an empty (not garbage) document.
+        //
+        // P4-2 closed the "zero warning" gap this test used to lock in: the
+        // coverage-ratio calculation no longer short-circuits to a misleading
+        // `1.0` ("full coverage") when `extracted_chars == 0` — it now
+        // reports `0.0`, which triggers `LowCoverage`. In addition, the page
+        // is individually flagged via `PageTextMissing` (OCR is disabled by
+        // default, so no text is recovered) rather than the document silently
+        // reporting no signal at all.
+        let pdf = build_image_only_pdf_bytes();
+        let config = Config {
+            extract_images: false, // avoid writing files to disk in this test
+            ..Default::default()
+        };
+        let result = analyze_pdf_bytes(&pdf, &config).expect("analysis should not panic or error");
+        assert_eq!(result.document.metadata.pages, 1);
+        // SectionBuilder always emits a trailing "final section" placeholder
+        // even with zero blocks/headers, so there is exactly one (empty) one.
+        assert_eq!(result.document.sections.len(), 1);
+        assert!(result.document.sections[0].header.is_none());
+        assert!(result.document.sections[0].blocks.is_empty());
+        assert_eq!(result.coverage.extracted_chars, 0);
+        assert_eq!(result.coverage.emitted_chars, 0);
+        assert_eq!(
+            result.coverage.ratio, 0.0,
+            "extracted_chars == 0 must report 0.0 coverage, not the old misleading 1.0"
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| matches!(w, PdfLayWarning::LowCoverage { ratio } if *ratio == 0.0)),
+            "a fully-scanned document (extracted_chars == 0) must raise LowCoverage now, \
+             not analyze silently with no warnings at all"
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| matches!(w, PdfLayWarning::PageTextMissing { page: 0, .. })),
+            "the scanned page (image present, no native text, OCR disabled by default) \
+             must be individually flagged via PageTextMissing"
+        );
+    }
+
+    #[test]
+    fn analyze_pdf_scanned_page_with_ocr_requested_but_unbuilt_still_warns_not_panics() {
+        // P4-2: `Config.ocr.enabled = true` without the `ocr` cargo feature
+        // compiled in (the default `cargo test --workspace` build) must not
+        // panic or error — it degrades to a `PageTextMissing` warning whose
+        // reason explains OCR was requested but this build lacks the seam,
+        // exactly like the acceptance criteria for "OCR requested but
+        // unavailable" in `docs/refactor/phase4_extraction.md` P4-2.
+        let pdf = build_image_only_pdf_bytes();
+        let config = Config {
+            extract_images: false,
+            ocr: crate::config::OcrConfig {
+                enabled: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let result = analyze_pdf_bytes(&pdf, &config).expect("analysis should not panic or error");
+        let missing = result.warnings.iter().find_map(|w| match w {
+            PdfLayWarning::PageTextMissing { page: 0, reason } => Some(reason.clone()),
+            _ => None,
+        });
+        let reason = missing.expect("expected a PageTextMissing warning for page 0");
+        assert!(
+            !reason.is_empty(),
+            "PageTextMissing reason should explain why OCR did not recover the page"
+        );
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|w| matches!(w, PdfLayWarning::PageTextRecovered { .. })),
+            "OCR must not be reported as having recovered anything when it never ran"
+        );
+    }
+
+    /// A genuinely blank page (no text operators, no XObjects at all) must
+    /// not be flagged as scanned — nothing was lost, so there is nothing to
+    /// warn about. Distinguishes "blank page" from "image-only/scanned page"
+    /// (see `analyze_pdf_image_only_page_...` above), both of which have
+    /// `extracted_chars == 0` on that page.
+    fn build_blank_page_pdf_bytes() -> Vec<u8> {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut offsets: Vec<usize> = Vec::new();
+        buf.extend_from_slice(b"%PDF-1.4\n");
+        let push_obj = |buf: &mut Vec<u8>, offsets: &mut Vec<usize>, body: &[u8]| {
+            offsets.push(buf.len());
+            let num = offsets.len();
+            buf.extend_from_slice(format!("{num} 0 obj\n").as_bytes());
+            buf.extend_from_slice(body);
+            buf.extend_from_slice(b"\nendobj\n");
+        };
+        push_obj(&mut buf, &mut offsets, b"<< /Type /Catalog /Pages 2 0 R >>");
+        push_obj(
+            &mut buf,
+            &mut offsets,
+            b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+        );
+        push_obj(
+            &mut buf,
+            &mut offsets,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R >>",
+        );
+        offsets.push(buf.len());
+        buf.extend_from_slice(b"4 0 obj\n<< /Length 0 >>\nstream\n\nendstream\nendobj\n");
+        let xref_offset = buf.len();
+        let size = offsets.len() + 1;
+        buf.extend_from_slice(format!("xref\n0 {size}\n").as_bytes());
+        buf.extend_from_slice(b"0000000000 65535 f \n");
+        for off in &offsets {
+            buf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        buf.extend_from_slice(
+            format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+        buf
+    }
+
+    #[test]
+    fn analyze_pdf_blank_page_is_not_flagged_as_scanned() {
+        let pdf = build_blank_page_pdf_bytes();
+        let config = Config {
+            extract_images: false,
+            ..Default::default()
+        };
+        let result = analyze_pdf_bytes(&pdf, &config).expect("analysis should not panic or error");
+        assert_eq!(result.coverage.extracted_chars, 0);
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|w| matches!(w, PdfLayWarning::PageTextMissing { .. })),
+            "a genuinely blank page (no text, no image) has nothing lost, so it must not be \
+             reported as a scanned/likely-scanned page"
+        );
+        // The document-level LowCoverage warning still fires (extracted_chars
+        // == 0 is still 0.0 coverage) — only the *per-page* scanned-page
+        // signal is specific to "page has an image".
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| matches!(w, PdfLayWarning::LowCoverage { .. }))
+        );
+    }
+
+    /// Mirrors `extract::pdf_reader::tests::build_pdf_with_one_dangling_page`
+    /// (duplicated here rather than imported, since that helper — and the
+    /// `mod tests` containing it — is private to its own module; see the
+    /// `build_image_only_pdf_bytes` doc comment above for the same
+    /// precedent). A two-page PDF whose `/Pages` dictionary claims
+    /// `/Count 2`, but the second `Kids` entry (`99 0 R`) references an
+    /// object absent from the file, so extracting page 1 genuinely errors
+    /// while page 0 (real, valid) succeeds.
+    fn build_pdf_with_one_dangling_page_bytes() -> Vec<u8> {
+        let mut buf: Vec<u8> = Vec::new();
+        let mut offsets: Vec<usize> = Vec::new();
+        buf.extend_from_slice(b"%PDF-1.4\n");
+        let push_obj = |buf: &mut Vec<u8>, offsets: &mut Vec<usize>, body: &[u8]| {
+            offsets.push(buf.len());
+            let num = offsets.len();
+            buf.extend_from_slice(format!("{num} 0 obj\n").as_bytes());
+            buf.extend_from_slice(body);
+            buf.extend_from_slice(b"\nendobj\n");
+        };
+        push_obj(&mut buf, &mut offsets, b"<< /Type /Catalog /Pages 2 0 R >>");
+        push_obj(
+            &mut buf,
+            &mut offsets,
+            b"<< /Type /Pages /Kids [3 0 R 99 0 R] /Count 2 >>",
+        );
+        push_obj(
+            &mut buf,
+            &mut offsets,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>",
+        );
+        let content = b"BT /F1 12 Tf 72 700 Td (Good Page) Tj ET";
+        offsets.push(buf.len());
+        buf.extend_from_slice(b"4 0 obj\n");
+        buf.extend_from_slice(format!("<< /Length {} >>\nstream\n", content.len()).as_bytes());
+        buf.extend_from_slice(content);
+        buf.extend_from_slice(b"\nendstream\nendobj\n");
+        offsets.push(buf.len());
+        buf.extend_from_slice(
+            b"5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+        );
+        let xref_offset = buf.len();
+        let size = offsets.len() + 1;
+        buf.extend_from_slice(format!("xref\n0 {size}\n").as_bytes());
+        buf.extend_from_slice(b"0000000000 65535 f \n");
+        for off in &offsets {
+            buf.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+        }
+        buf.extend_from_slice(
+            format!("trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n{xref_offset}\n%%EOF\n")
+                .as_bytes(),
+        );
+        buf
+    }
+
+    #[test]
+    fn single_page_extraction_failure_does_not_zero_the_whole_document() {
+        // P4-2 partial recovery: page 1's extraction genuinely fails (a
+        // dangling Kids entry — see the fixture doc comment), but page 0's
+        // real text must still make it all the way through the pipeline,
+        // and the failure must be surfaced as a `PageSkipped` warning
+        // (upgraded from the old silent `log::warn!`) rather than the whole
+        // document coming back empty.
+        let pdf = build_pdf_with_one_dangling_page_bytes();
+        let config = Config {
+            extract_images: false,
+            detect_tables: false,
+            ..Default::default()
+        };
+        let result = analyze_pdf_bytes(&pdf, &config).expect("analysis should not panic or error");
+        assert_eq!(result.document.metadata.pages, 2);
+        assert!(
+            result.coverage.extracted_chars > 0,
+            "page 0's real text must still reach the output despite page 1 failing"
+        );
+        assert!(
+            result
+                .document
+                .sections
+                .iter()
+                .any(|s| s.full_text().contains("Good Page")),
+            "page 0's text must be present in the analyzed document"
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| matches!(w, PdfLayWarning::PageSkipped { page: 1, .. })),
+            "the page 1 extraction failure must be surfaced as a PageSkipped warning, \
+             not just a silent log::warn!"
         );
     }
 }

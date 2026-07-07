@@ -44,6 +44,26 @@ pub struct Config {
     /// this value.
     #[serde(default = "default_min_coverage_ratio")]
     pub min_coverage_ratio: f64,
+    /// Configuration for figure/table caption detection (patterns, language
+    /// toggles). See [`CaptionConfig`].
+    #[serde(default)]
+    pub caption: CaptionConfig,
+    /// When `true`, always save extracted images as PNG, re-encoding
+    /// JPEG-source images instead of passing them through losslessly as
+    /// `.jpg`. Default `false` (P4-3: honor the image's real source format).
+    /// Set `true` to restore the pre-P4-3 behavior of always producing PNG
+    /// files.
+    #[serde(default)]
+    pub force_png: bool,
+    /// Configuration for vector-figure detection (P4-3): clustering
+    /// vector-graphic paths near an unmatched Figure/Scheme/Chart caption
+    /// into a figure record when no raster image was extracted.
+    #[serde(default)]
+    pub figure_vector: VectorFigureConfig,
+    /// Configuration for OCR recovery of scanned/image-only pages (P4-2).
+    /// See [`OcrConfig`].
+    #[serde(default)]
+    pub ocr: OcrConfig,
 }
 
 /// Default value for [`Config::caption_max_chars`].
@@ -78,6 +98,199 @@ impl Default for Config {
             caption_max_chars: default_caption_max_chars(),
             running_header_max_chars: default_running_header_max_chars(),
             min_coverage_ratio: default_min_coverage_ratio(),
+            caption: CaptionConfig::default(),
+            force_png: false,
+            figure_vector: VectorFigureConfig::default(),
+            ocr: OcrConfig::default(),
+        }
+    }
+}
+
+/// Configuration for OCR recovery of scanned/image-only pages (P4-2).
+///
+/// A page whose native (embedded) text falls below [`Self::min_native_chars`]
+/// *and* which contains at least one embedded image is the shape of a
+/// scanned page (see `docs/refactor/phase4_findings.md` P4-1 §2.5). Such a
+/// page is **always** reported via a `PdfLayWarning`
+/// (`PdfLayWarning::PageTextRecovered` on success,
+/// `PdfLayWarning::PageTextMissing` otherwise) regardless of
+/// [`Self::enabled`] — detection/reporting is not gated behind OCR being
+/// turned on. [`Self::enabled`] only controls whether pdf-lay actually
+/// *attempts* OCR for those pages.
+///
+/// OCR is opt-in and off by default, and enabling it does not by itself pull
+/// in any heavy build dependency: the default [`OcrEngineKind::Tesseract`]
+/// shells out to a `tesseract` binary that must already be installed and on
+/// `PATH` (and requires this crate to be built with the `ocr` cargo feature —
+/// see `crates/pdf-lay-core/Cargo.toml`). If the feature is not compiled in,
+/// or the binary is not found, or OCR itself fails, analysis still completes
+/// normally; the affected page is reported via `PageTextMissing` rather than
+/// causing an error or a panic.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OcrConfig {
+    /// Whether to actually attempt OCR for pages under the native-text
+    /// threshold. Default `false`. Detection/warnings fire either way (see
+    /// the struct docs); this flag only gates the OCR attempt itself.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Minimum number of native (non-OCR) characters a page must contain to
+    /// be considered to have "real" text rather than being likely-scanned.
+    /// Default `50`, matching pdf_oxide's own internal `needs_ocr` heuristic
+    /// (`ocr/mod.rs::needs_ocr`, gated behind pdf_oxide's own `ocr` feature —
+    /// see `docs/refactor/phase4_findings.md` P4-1 §1 for how this crate
+    /// confirmed that threshold from the pdf_oxide source).
+    #[serde(default = "default_min_native_chars")]
+    pub min_native_chars: usize,
+    /// Language(s) passed to the OCR engine (tesseract `-l` syntax, e.g.
+    /// `"eng"`, `"jpn"`, `"jpn+eng"`). Default `"jpn+eng"`.
+    #[serde(default = "default_ocr_lang")]
+    pub lang: String,
+    /// Which OCR engine to use when [`Self::enabled`] is `true`. See
+    /// [`OcrEngineKind`].
+    #[serde(default)]
+    pub engine: OcrEngineKind,
+}
+
+/// Default value for [`OcrConfig::min_native_chars`].
+fn default_min_native_chars() -> usize {
+    50
+}
+
+/// Default value for [`OcrConfig::lang`].
+fn default_ocr_lang() -> String {
+    "jpn+eng".to_string()
+}
+
+impl Default for OcrConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_native_chars: default_min_native_chars(),
+            lang: default_ocr_lang(),
+            engine: OcrEngineKind::default(),
+        }
+    }
+}
+
+/// Which OCR engine [`OcrConfig`] should use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum OcrEngineKind {
+    /// Shell out to a `tesseract` binary on `PATH` (default). Chosen over
+    /// pdf_oxide's built-in `ocr` feature (ONNX Runtime + PaddleOCR-style
+    /// models) because it adds no heavy build dependency or bundled model
+    /// files — see `docs/refactor/phase4_findings.md` P4-1 §6 and
+    /// `docs/refactor/phase4_extraction.md` P4-2 for the A/B decision.
+    #[default]
+    Tesseract,
+    /// Reserved for pdf_oxide's built-in OCR (its own `ocr` feature: ONNX
+    /// Runtime + PaddleOCR-style det/rec/dict models). **Not wired up** in
+    /// this crate — selecting it always behaves as "OCR engine unavailable"
+    /// (a `PdfLayWarning::PageTextMissing`, never a panic or a build-time
+    /// dependency on `ort`). Kept as an explicit, honest placeholder for a
+    /// future task rather than omitted silently.
+    Builtin,
+}
+
+/// Configuration for vector-figure detection ([`crate::figure::VectorFigureClusterer`]).
+///
+/// A vector figure (line art / a diagram drawn with PDF path operators
+/// rather than embedded as a raster image) has no image XObject at all, so
+/// [`crate::extract::ImageExtractor`] never sees it. Without this feature its
+/// caption would be reported as `PdfLayWarning::UnmatchedCaption` even though
+/// the figure is visibly present in the PDF. When enabled, captions left
+/// unmatched after raster image matching are matched instead to a nearby
+/// spatial cluster of `PathObject`s (see `extract_all_paths`), recorded as a
+/// `FigureInfo` with a region bounding box but no raster file
+/// (`ImageInfo::path == None`). Rendering the vector graphic itself (as an
+/// image) is out of scope — see `docs/refactor/phase4_extraction.md` P4-3.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VectorFigureConfig {
+    /// Whether to attempt vector-figure clustering at all. Default `true`;
+    /// set `false` to restore the pre-P4-3 behavior (such captions become
+    /// `UnmatchedCaption`).
+    #[serde(default = "default_figure_vector_enabled")]
+    pub enabled: bool,
+    /// Maximum gap (points) between two path bounding boxes for them to be
+    /// merged into the same cluster.
+    #[serde(default = "default_cluster_gap_pt")]
+    pub cluster_gap_pt: f64,
+    /// Minimum number of paths a cluster must contain to be considered a
+    /// candidate vector figure (filters out stray rule/border lines that
+    /// belong to running text or tables, not a diagram).
+    #[serde(default = "default_min_paths")]
+    pub min_paths: usize,
+}
+
+/// Default value for [`VectorFigureConfig::enabled`].
+fn default_figure_vector_enabled() -> bool {
+    true
+}
+
+/// Default value for [`VectorFigureConfig::cluster_gap_pt`].
+fn default_cluster_gap_pt() -> f64 {
+    15.0
+}
+
+/// Default value for [`VectorFigureConfig::min_paths`].
+fn default_min_paths() -> usize {
+    4
+}
+
+impl Default for VectorFigureConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_figure_vector_enabled(),
+            cluster_gap_pt: default_cluster_gap_pt(),
+            min_paths: default_min_paths(),
+        }
+    }
+}
+
+/// Configuration for figure/table caption detection ([`CaptionDetector`]).
+///
+/// [`CaptionDetector`]: crate::figure::CaptionDetector
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CaptionConfig {
+    /// Additional user-supplied regex patterns matched as `Figure` captions,
+    /// on top of the built-in patterns (`Fig.`/`Figure`/`FIG.`). A pattern
+    /// that fails to compile is skipped with a warning rather than causing a
+    /// panic; the remaining patterns (built-in and user-supplied) still apply.
+    #[serde(default)]
+    pub extra_figure_patterns: Vec<String>,
+    /// Additional user-supplied regex patterns matched as `Table` captions,
+    /// on top of the built-in patterns (`Table`/`Tab.`). Same failure handling
+    /// as [`Self::extra_figure_patterns`].
+    #[serde(default)]
+    pub extra_table_patterns: Vec<String>,
+    /// Whether to recognize Japanese caption prefixes ("図"/"表", full-width
+    /// digits included). Default `true`; set `false` to restore the
+    /// ASCII/English-only pre-P4-4 behavior.
+    #[serde(default = "default_enable_japanese")]
+    pub enable_japanese: bool,
+    /// Whether to recognize `Scheme N` / `Chart N` captions (matched as
+    /// image-matchable caption types alongside `Figure`). Default `true`; set
+    /// `false` to restore the pre-P4-4 behavior.
+    #[serde(default = "default_enable_scheme_chart")]
+    pub enable_scheme_chart: bool,
+}
+
+/// Default value for [`CaptionConfig::enable_japanese`].
+fn default_enable_japanese() -> bool {
+    true
+}
+
+/// Default value for [`CaptionConfig::enable_scheme_chart`].
+fn default_enable_scheme_chart() -> bool {
+    true
+}
+
+impl Default for CaptionConfig {
+    fn default() -> Self {
+        Self {
+            extra_figure_patterns: Vec::new(),
+            extra_table_patterns: Vec::new(),
+            enable_japanese: default_enable_japanese(),
+            enable_scheme_chart: default_enable_scheme_chart(),
         }
     }
 }
@@ -289,6 +502,22 @@ pub struct HeaderDetectionConfig {
     /// Maximum heading level assigned by font clustering / numbering depth.
     #[serde(default = "default_max_level")]
     pub max_level: u8,
+    /// Minimum number of confident (scored) headers required for
+    /// `SectionBuilder` to use ordinary header-based splitting. When
+    /// `headers.len()` falls below this count, the document is instead
+    /// segmented by the no-confident-header fallback (font-shift / bold-shift
+    /// boundaries), so it never collapses into a single opaque section
+    /// (P1-6). Set to `0` to always use header-based splitting, restoring the
+    /// pre-P1-6 behavior of a single section when zero headers are detected.
+    #[serde(default = "default_min_confident_headers")]
+    pub min_confident_headers: usize,
+    /// Font-size ratio (relative to body text) a block must reach, coming
+    /// from a block below that ratio, to be treated as a pseudo-heading
+    /// font-shift boundary by the no-confident-header fallback segmenter
+    /// (P1-6). Mirrors the spirit of the (now-removed) isolated `1.15`
+    /// level-assignment threshold, but only used for fallback segmentation.
+    #[serde(default = "default_fallback_font_shift_ratio")]
+    pub fallback_font_shift_ratio: f64,
 }
 
 /// Default value for [`HeaderDetectionConfig::respect_classification`].
@@ -319,6 +548,16 @@ fn default_cluster_merge_gap() -> f64 {
 /// Default value for [`HeaderDetectionConfig::max_level`].
 fn default_max_level() -> u8 {
     6
+}
+
+/// Default value for [`HeaderDetectionConfig::min_confident_headers`].
+fn default_min_confident_headers() -> usize {
+    1
+}
+
+/// Default value for [`HeaderDetectionConfig::fallback_font_shift_ratio`].
+fn default_fallback_font_shift_ratio() -> f64 {
+    1.15
 }
 
 /// Default known section-name keywords (English + Japanese).
@@ -387,6 +626,8 @@ impl Default for HeaderDetectionConfig {
             cluster_bin_width: default_cluster_bin_width(),
             cluster_merge_gap: default_cluster_merge_gap(),
             max_level: default_max_level(),
+            min_confident_headers: default_min_confident_headers(),
+            fallback_font_shift_ratio: default_fallback_font_shift_ratio(),
         }
     }
 }
@@ -550,6 +791,16 @@ mod tests {
         assert_eq!(hd.max_lines, 3);
     }
 
+    /// P1-6: the no-confident-header fallback defaults to engaging when zero
+    /// headers are detected (min_confident_headers=1), with the documented
+    /// font-shift ratio.
+    #[test]
+    fn header_detection_fallback_defaults() {
+        let hd = HeaderDetectionConfig::default();
+        assert_eq!(hd.min_confident_headers, 1);
+        assert_eq!(hd.fallback_font_shift_ratio, 1.15);
+    }
+
     #[test]
     fn math_config_defaults() {
         let mc = MathConfig::default();
@@ -567,5 +818,40 @@ mod tests {
         assert_eq!(cc.max_tokens, 4000);
         assert_eq!(cc.overlap_tokens, 200);
         assert!(cc.include_section_context);
+    }
+
+    /// P4-4: caption pattern broadening (Japanese, Scheme/Chart) defaults to
+    /// enabled, with no user-supplied extra patterns.
+    #[test]
+    fn caption_config_defaults() {
+        let cc = CaptionConfig::default();
+        assert!(cc.enable_japanese);
+        assert!(cc.enable_scheme_chart);
+        assert!(cc.extra_figure_patterns.is_empty());
+        assert!(cc.extra_table_patterns.is_empty());
+        assert!(Config::default().caption.enable_japanese);
+    }
+
+    /// P4-3: real-format image saving is on by default (no `force_png`
+    /// back-compat opt-out needed), and vector-figure clustering defaults to
+    /// enabled with the documented thresholds.
+    #[test]
+    fn image_and_vector_figure_defaults() {
+        let cfg = Config::default();
+        assert!(!cfg.force_png);
+        assert!(cfg.figure_vector.enabled);
+        assert_eq!(cfg.figure_vector.cluster_gap_pt, 15.0);
+        assert_eq!(cfg.figure_vector.min_paths, 4);
+    }
+
+    /// P4-2: OCR is off by default (no behavior change, no heavy dependency
+    /// pulled in), with the documented tesseract-matching threshold/lang.
+    #[test]
+    fn ocr_config_defaults() {
+        let cfg = Config::default();
+        assert!(!cfg.ocr.enabled);
+        assert_eq!(cfg.ocr.min_native_chars, 50);
+        assert_eq!(cfg.ocr.lang, "jpn+eng");
+        assert_eq!(cfg.ocr.engine, OcrEngineKind::Tesseract);
     }
 }

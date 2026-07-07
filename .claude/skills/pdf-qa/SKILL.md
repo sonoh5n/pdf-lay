@@ -1,28 +1,27 @@
 ---
 name: pdf-qa
-description: Answer questions about an academic paper PDF by extracting relevant sections with pdf-lay
-argument-hint: "<pdf-path> <question>"
-allowed-tools: Bash(pdf-lay *), Bash(cargo run *), Bash(python *), Read
+description: Answer a question about an academic-paper PDF by extracting the relevant sections with pdf-lay and grounding the answer in the paper. Use when the user gives a PDF path plus a question about the paper's method, results, background, limitations, etc. Derive the PDF path and the question from the request; no slash command, no variable substitution.
+allowed-tools: Bash(pdf-lay *), Bash(cargo run *), Bash(python3 *), Read
 ---
 
 # PDF Question & Answer
 
-Extract relevant content from an academic paper PDF using pdf-lay, then answer the user's question grounded in the paper's content.
+Extract relevant content from an academic paper PDF using pdf-lay, then answer the user's
+question grounded in the paper's content.
 
-## Usage
+## When to use
 
-```
-/pdf-qa paper.pdf "What method did the authors use?"
-/pdf-qa paper.pdf "What were the main results?"
-/pdf-qa paper.pdf "How does this compare to previous work?"
-/pdf-qa paper.pdf "What are the limitations?"
-```
+Invoke when the user supplies a PDF path together with a question about the paper (method,
+results, background, limitations, comparisons, contributions, etc.).
 
-## Instructions
+## How to derive arguments from the request
 
-### 1. Understand the question and map to sections
+- **PDF path**: the file the user names. Substitute it literally into the commands below
+  in place of `<PDF_PATH>`.
+- **Question**: the user's natural-language question. There is no `argument-hint` and no
+  positional-argument substitution — read the question directly out of the request.
 
-Analyze the user's question to determine which sections are most likely relevant:
+## 1. Understand the question and map it to sections
 
 | Question Type | Likely Sections |
 |--------------|-----------------|
@@ -35,35 +34,34 @@ Analyze the user's question to determine which sections are most likely relevant
 | Data/dataset | Methods, Experiments, Data |
 | General/overview | Abstract, Introduction, Conclusion |
 
-### 2. Get document structure
+## 2. Get document structure
 
-```bash
-pdf-lay toc "$PDF_PATH"
-```
+    pdf-lay toc <PDF_PATH>
 
 Use the TOC to identify exact section names matching the question type.
 
-### 3. Extract relevant sections
+## 3. Extract relevant sections
 
-```bash
-# Extract the sections most likely to contain the answer
-pdf-lay markdown "$PDF_PATH" --section "SECTION_NAME" --no-page-numbers
-```
+    pdf-lay markdown <PDF_PATH> --section "SECTION_NAME" --no-page-numbers
 
-Or via Python for multiple sections at once:
-```python
-import pdflay
-doc = pdflay.analyze("$PDF_PATH", extract_images=False)
-sel = doc.select_sections(["Section1", "Section2"])
-text = sel.to_llm_text(include_figures=True, include_tables=True)
-```
+`--section` is repeatable, so multiple candidate sections can be pulled in one call:
+
+    pdf-lay llm-text <PDF_PATH> --section "Methods" --section "Results"
 
 If the question is broad, extract the full document:
-```bash
-pdf-lay markdown "$PDF_PATH" --no-page-numbers
-```
 
-### 4. Answer the question
+    pdf-lay markdown <PDF_PATH> --no-page-numbers
+
+Via the Python bindings, for programmatic multi-section extraction in one call:
+
+    python3 -c "
+import pdflay
+doc = pdflay.analyze('<PDF_PATH>', extract_images=False)
+sel = doc.select_sections(['Methods', 'Results'])
+print(sel.to_llm_text(include_figures=True, include_tables=True))
+"
+
+## 4. Answer the question
 
 Based on the extracted content:
 
@@ -88,6 +86,7 @@ Format:
 [Any additional relevant information from the paper]
 ```
 
-### 5. Offer follow-up
+## 5. Offer follow-up
 
-After answering, suggest 2-3 related questions the user might want to ask about the paper, based on what was found in the content.
+After answering, suggest 2-3 related questions the user might want to ask about the paper,
+based on what was found in the content.

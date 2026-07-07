@@ -1,62 +1,65 @@
 ---
 name: pdf-summary
-description: Summarize an academic paper PDF by extracting and analyzing its key sections using pdf-lay
-argument-hint: "<pdf-path> [--lang ja|en] [--depth brief|standard|detailed]"
-allowed-tools: Bash(pdf-lay *), Bash(cargo run *), Bash(python *), Read
+description: Summarize an academic-paper PDF by extracting its key sections with pdf-lay and composing a structured summary. Use when the user gives a PDF path and wants a summary; honor any requested language (ja/en) and depth (brief/standard/detailed) expressed in natural language. No slash command, no variable substitution.
+allowed-tools: Bash(pdf-lay *), Bash(cargo run *), Bash(python3 *), Read
 ---
 
 # PDF Paper Summary
 
-Extract structured content from an academic paper PDF using pdf-lay, then generate a comprehensive summary.
+Extract structured content from an academic paper PDF using pdf-lay, then generate a
+comprehensive summary.
 
-## Usage
+## When to use
 
-```
-/pdf-summary paper.pdf                    # Standard summary in auto-detected language
-/pdf-summary paper.pdf --lang ja          # Summary in Japanese
-/pdf-summary paper.pdf --depth brief      # One-paragraph overview
-/pdf-summary paper.pdf --depth detailed   # Section-by-section detailed summary
-```
+Invoke when the user supplies a PDF path and asks for a summary, overview, or TL;DR of the
+paper. There is no `--lang`/`--depth` flag: read the desired language and depth out of the
+user's natural-language request (e.g. "summarize this in Japanese" → Japanese output;
+"give me a one-paragraph summary" → brief depth).
 
-## Instructions
+## How to derive arguments from the request
 
-### 1. Extract document structure
+- **PDF path**: the file the user names. Substitute it literally into the commands below
+  in place of `<PDF_PATH>`.
+- **Language**: if the user asks for Japanese (or writes in Japanese), respond in Japanese;
+  if English, respond in English; otherwise match the primary language of the paper content.
+- **Depth**: "brief"/"quick" → one paragraph; unspecified → standard structured summary;
+  "detailed"/"in depth" → section-by-section detail.
 
-```bash
-# Get TOC to understand paper structure
-pdf-lay toc "$PDF_PATH"
-```
+## 1. Extract document structure
 
-### 2. Extract key sections
+    pdf-lay toc <PDF_PATH>
 
-Use pdf-lay to extract content section by section:
+## 2. Extract key sections
 
-```bash
-# Extract the most important sections for summarization
-pdf-lay markdown "$PDF_PATH" --section "Abstract" --no-page-numbers
-pdf-lay markdown "$PDF_PATH" --section "Introduction" --no-page-numbers
-pdf-lay markdown "$PDF_PATH" --section "Methods" --no-page-numbers
-pdf-lay markdown "$PDF_PATH" --section "Results" --no-page-numbers
-pdf-lay markdown "$PDF_PATH" --section "Discussion" --no-page-numbers
-pdf-lay markdown "$PDF_PATH" --section "Conclusion" --no-page-numbers
-```
+    pdf-lay markdown <PDF_PATH> --section "Abstract" --no-page-numbers
+    pdf-lay markdown <PDF_PATH> --section "Introduction" --no-page-numbers
+    pdf-lay markdown <PDF_PATH> --section "Methods" --no-page-numbers
+    pdf-lay markdown <PDF_PATH> --section "Results" --no-page-numbers
+    pdf-lay markdown <PDF_PATH> --section "Discussion" --no-page-numbers
+    pdf-lay markdown <PDF_PATH> --section "Conclusion" --no-page-numbers
 
-Or via Python for efficiency:
-```python
+Or in a single call with the repeatable `--section` flag:
+
+    pdf-lay llm-text <PDF_PATH> --section "Abstract" --section "Introduction" \
+      --section "Methods" --section "Results" --section "Discussion" --section "Conclusion"
+
+Or via the Python bindings for the same result:
+
+    python3 -c "
 import pdflay
-doc = pdflay.analyze("$PDF_PATH", extract_images=False)
-sel = doc.select_sections(["Abstract", "Introduction", "Methods", "Results", "Discussion", "Conclusion"])
-text = sel.to_llm_text()
-```
+doc = pdflay.analyze('<PDF_PATH>', extract_images=False)
+sel = doc.select_sections(['Abstract', 'Introduction', 'Methods', 'Results', 'Discussion', 'Conclusion'])
+print(sel.to_llm_text())
+"
 
-### 3. Generate summary
+## 3. Generate summary
 
 Based on the extracted content, produce a structured summary:
 
-#### Brief (`--depth brief`)
+### Brief depth
 Single paragraph (3-5 sentences): what the paper does, key method, main finding.
 
-#### Standard (default)
+### Standard depth (default)
 ```markdown
 ## Paper Summary
 
@@ -82,7 +85,7 @@ Single paragraph (3-5 sentences): what the paper does, key method, main finding.
 [Summary of N figures and M tables, highlighting key visual results]
 ```
 
-#### Detailed (`--depth detailed`)
+### Detailed depth
 Include all of the Standard format plus:
 - Section-by-section summaries for every top-level section
 - Methodology details
@@ -90,8 +93,8 @@ Include all of the Standard format plus:
 - Limitations mentioned by authors
 - Future work directions
 
-### 4. Language handling
+## 4. Language handling
 
-- If `--lang ja`: output the summary in Japanese
-- If `--lang en`: output in English
-- If not specified: match the primary language of the paper content
+- If the user asked for Japanese: output the summary in Japanese.
+- If the user asked for English: output in English.
+- If not specified: match the primary language of the paper content.

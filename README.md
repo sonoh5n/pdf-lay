@@ -120,6 +120,39 @@ If you already have `maturin` installed:
 maturin develop -m crates/pdflay-python/Cargo.toml
 ```
 
+> Note: `pdflay` is not yet published on PyPI (`pip install pdflay` does not work). Use
+> `maturin develop` above instead.
+
+### Claude Code Skills
+
+This repository ships four Agent Skills (`pdf`, `pdf-qa`, `pdf-summary`, `pdf-to-llm`) under
+`.claude/skills/`. They are model-invoked (no `/slash` command) — Claude Code reads each
+skill's `description` and decides when to use it based on your request.
+
+**Path A (plugin, recommended):** register this repository as a Claude Code plugin
+marketplace, then install the `pdf-lay` plugin so the skills load in any project:
+
+```
+/plugin marketplace add sonoh5n/pdf-lay
+/plugin install pdf-lay@pdf-lay-marketplace
+```
+
+**Path B (manual, global install):** copy the skills into your global Claude Code
+skills directory so they load in any project without a plugin:
+
+```bash
+mkdir -p ~/.claude/skills
+cp -R .claude/skills/pdf ~/.claude/skills/
+cp -R .claude/skills/pdf-qa ~/.claude/skills/
+cp -R .claude/skills/pdf-summary ~/.claude/skills/
+cp -R .claude/skills/pdf-to-llm ~/.claude/skills/
+# From now on, pdf / pdf-qa / pdf-summary / pdf-to-llm are available in any cwd.
+```
+
+Either path is only a wrapper around the `pdf-lay` CLI or the `pdflay` Python bindings —
+install one of those first (see above), since the skills' `allowed-tools` invoke
+`pdf-lay`, `cargo run`, and `python3` directly.
+
 ## Usage
 
 ### CLI

@@ -38,11 +38,13 @@ pub use pdf_lay_core::{
     HeuristicTokenizer,
     ImageFormat,
     ImageInfo,
+    ImageOutputFormat,
     InsertionPoint,
     LlmTextConfig,
     // Selector types
     LlmTextGenerator,
     MarkdownConfig,
+    MatchMode,
     MathConfig,
     // Math processing types
     MathContext,
@@ -54,6 +56,9 @@ pub use pdf_lay_core::{
     NumberComponent,
     NumberingAnomalyKind,
     NumberingKey,
+    // OCR config (P4-2)
+    OcrConfig,
+    OcrEngineKind,
     PaperDocument,
     PdfLayError,
     PdfLayWarning,
